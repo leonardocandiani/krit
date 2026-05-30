@@ -228,6 +228,15 @@ pub fn run() {
         ])
         .setup(|app| {
             build_tray(app.handle())?;
+            // Warm the permission check on startup so the helper is registered
+            // with TCC early — the first capture shouldn't be the first time
+            // macOS sees the process. Runs off-thread so setup never blocks.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Some(helper) = helper_binary(&handle) {
+                    let _ = Command::new(&helper).arg("check-permission").output();
+                }
+            });
             Ok(())
         })
         .run(tauri::generate_context!())

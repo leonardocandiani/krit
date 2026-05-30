@@ -6,7 +6,9 @@
 # permission to an app with a stable Info.plist and bundle identifier — a bare
 # binary does not appear correctly in System Settings.
 #
-# Does NOT sign the app (no codesign). For distribution, sign it afterwards.
+# Ad-hoc signs the bundle with a stable identifier (required for Screen
+# Recording / TCC to persist). For public distribution, re-sign with a
+# Developer ID and notarize afterwards.
 #
 # Usage:
 #   ./scripts/make-app.sh [build-path]
@@ -91,6 +93,23 @@ PKG
 # Remove AppleDouble files (._*) created by the volume filesystem on copy.
 find "$APP_DIR" -name '._*' -delete 2>/dev/null || true
 dot_clean "$APP_DIR" 2>/dev/null || true
+
+# Ad-hoc sign with an EXPLICIT designated requirement keyed only on the bundle
+# identifier. This is what makes Screen Recording (TCC) persist: by default an
+# ad-hoc signature's DR is a raw cdhash that changes every recompile, so each
+# grant is orphaned and CGPreflightScreenCaptureAccess stays false forever. With
+# `-r='designated => identifier "com.krit.helper"'` the DR is the identifier
+# alone, stable across rebuilds — grant once, keep it. No Apple account needed.
+# codesign must run on an APFS/HFS+ path; on exFAT the ._* AppleDouble files
+# break it (see scripts/macos-release.sh, which signs the final bundle in /tmp).
+SIGN_REQ='designated => identifier "com.krit.helper"'
+codesign --force --sign - \
+  --identifier "com.krit.helper" \
+  -r="$SIGN_REQ" \
+  --options runtime \
+  "$APP_DIR" 2>/dev/null \
+  && echo "Signed (ad-hoc, stable DR: identifier com.krit.helper)." \
+  || echo "WARN: codesign failed (exFAT? sign in /tmp via macos-release.sh)."
 
 echo "Done: $APP_DIR"
 echo
