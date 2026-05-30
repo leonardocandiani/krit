@@ -9,7 +9,7 @@ import {
   requestScreenPermission,
   isTauri,
 } from "../lib/tauri";
-import { playSound, unlockAudio } from "../lib/sounds";
+import { playSound, unlockAudio, audioReady } from "../lib/sounds";
 
 const ONBOARDED_KEY = "krit.onboarded";
 
@@ -36,21 +36,37 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<Step>("intro");
   const [perm, setPerm] = useState<PermState>("unknown");
   const pollRef = useRef<number | null>(null);
+  // Bumped each time the launch cue fires; used as a key to restart the intro
+  // animation so it stays in sync with the sound.
+  const [launchSeq, setLaunchSeq] = useState(0);
 
-  // The launch chime opens the sequence on the first gesture (audio is gated).
+  // Launch cue: sound + intro animation, fired together. We try on mount
+  // (Tauri's webview usually allows autoplay). If the audio was still gated,
+  // the first gesture re-fires both so they stay synced — the bumped key
+  // restarts the CSS timeline from zero.
   useEffect(() => {
-    function unlock() {
+    const fire = () => {
       unlockAudio();
       void playSound("launch");
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("keydown", unlock);
-    }
-    window.addEventListener("pointerdown", unlock);
-    window.addEventListener("keydown", unlock);
-    return () => {
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("keydown", unlock);
+      setLaunchSeq((s) => s + 1);
     };
+    fire();
+
+    let reinforced = false;
+    const onGesture = () => {
+      if (!reinforced && !audioReady()) {
+        reinforced = true;
+        fire();
+      }
+      cleanup();
+    };
+    function cleanup() {
+      window.removeEventListener("pointerdown", onGesture);
+      window.removeEventListener("keydown", onGesture);
+    }
+    window.addEventListener("pointerdown", onGesture);
+    window.addEventListener("keydown", onGesture);
+    return cleanup;
   }, []);
 
   const stopPolling = useCallback(() => {
@@ -116,16 +132,21 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   }, [onDone, stopPolling]);
 
   return (
-    <div className="ob" role="dialog" aria-label="Welcome to KRIT">
+    <div className="ob" role="dialog" aria-label="Welcome to KRIT" data-tauri-drag-region>
+      {/* invisible title bar so the frameless window can be dragged */}
+      <div className="ob-dragbar" data-tauri-drag-region aria-hidden />
       <div className="ob-grain" aria-hidden />
       <div className="ob-stage">
-        {step === "intro" && <Intro onNext={enterPermission} />}
+        {step === "intro" && (
+          <Intro key={launchSeq} launching={launchSeq > 0} onNext={enterPermission} />
+        )}
         {step === "permission" && (
           <Permission
             state={perm}
             tauri={isTauri()}
             onRequest={requestPermission}
             onContinue={goReady}
+            onSkip={finish}
           />
         )}
         {step === "ready" && <Ready onFinish={finish} />}
@@ -135,9 +156,17 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   );
 }
 
-function Intro({ onNext }: { onNext: () => void }) {
+function Intro({
+  launching,
+  onNext,
+}: {
+  launching: boolean;
+  onNext: () => void;
+}) {
+  // `ob-launch` runs the cinematic timeline keyed to the 6s launch sound:
+  // punch (0s) -> breathe -> build -> wordmark hit (~3.8s) -> tagline -> CTA.
   return (
-    <section className="ob-panel ob-intro">
+    <section className={`ob-panel ob-intro${launching ? " ob-launch" : ""}`}>
       <div className="ob-mark">
         <KritMark size={72} />
       </div>
@@ -147,7 +176,7 @@ function Intro({ onNext }: { onNext: () => void }) {
         A native screenshot and markup tool for macOS. Open source, no account,
         no upload.
       </p>
-      <button className="ob-cta" onClick={onNext} autoFocus>
+      <button className="ob-cta ob-intro-cta" onClick={onNext} autoFocus>
         Get started
       </button>
     </section>
@@ -159,11 +188,13 @@ function Permission({
   tauri,
   onRequest,
   onContinue,
+  onSkip,
 }: {
   state: PermState;
   tauri: boolean;
   onRequest: () => void;
   onContinue: () => void;
+  onSkip: () => void;
 }) {
   const granted = state === "granted";
   return (
@@ -196,11 +227,15 @@ function Permission({
           {state === "denied" && (
             <p className="ob-status ob-status-warn">
               Turn KRIT on in System Settings › Privacy &amp; Security › Screen
-              Recording, then come back.
+              Recording, then quit and reopen KRIT — macOS only applies it after
+              a restart.
             </p>
           )}
           <button className="ob-cta" onClick={onRequest} autoFocus>
             {state === "denied" ? "Check again" : "Grant access"}
+          </button>
+          <button className="ob-skip" onClick={onSkip}>
+            Skip for now
           </button>
         </>
       )}

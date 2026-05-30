@@ -95,6 +95,11 @@ export function unlockAudio(): void {
   if (audio && audio.state === "suspended") void audio.resume();
 }
 
+/** True when the audio context is live (sound is actually audible). */
+export function audioReady(): boolean {
+  return ctx?.state === "running";
+}
+
 export function isMuted(): boolean {
   return muted;
 }

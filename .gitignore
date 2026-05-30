@@ -49,3 +49,6 @@ packages/tokens/build/
 
 # stray root screenshots
 /krit-*.png
+
+# tauri icon also emits android assets (macOS-only project)
+apps/shell/src-tauri/icons/android/

@@ -19,6 +19,17 @@
   overflow: hidden;
 }
 
+/* Invisible drag strip across the top so the frameless window can move.
+   The window has no title bar; without this the onboarding traps the window. */
+.ob-dragbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 52px;
+  z-index: 3;
+}
+
 /* Faint film grain so the flat black has texture under motion. */
 .ob-grain {
   position: absolute;
@@ -102,6 +113,134 @@
   font-size: 11px;
   color: var(--color-text-lo);
   opacity: 0.7;
+}
+
+/* --- intro launch sequence (synced to the 6s launch sound) ---
+   Envelope of launch.wav: punch 0–0.4s, breathe 0.4–1.8s, pulse ~2.0s,
+   build 3.0–3.8s (peak 3.8s), decay 4–5s, tail to 6.6s. The timeline below
+   lands the symbol punch, a mid pulse, and the wordmark hit on those beats. */
+
+/* While launching, the panel itself doesn't slide — children own the timeline. */
+.ob-intro.ob-launch {
+  animation: none;
+}
+
+/* Before/while the cue plays, intro pieces wait hidden so nothing flashes. */
+.ob-intro .ob-mark,
+.ob-intro .ob-wordmark,
+.ob-intro .ob-tagline,
+.ob-intro .ob-sub,
+.ob-intro .ob-intro-cta {
+  opacity: 0;
+}
+.ob-intro .ob-mark {
+  animation: none; /* overrides the default ob-mark-in; timeline owns it */
+}
+
+.ob-intro.ob-launch .ob-mark {
+  animation: ob-mark-launch 6s var(--motion-ease) both;
+}
+.ob-intro.ob-launch .ob-wordmark {
+  animation: ob-word-launch 1.5s var(--motion-ease) 3.25s both;
+}
+.ob-intro.ob-launch .ob-tagline {
+  animation: ob-fade-up 0.7s var(--motion-ease) 4.2s both;
+}
+.ob-intro.ob-launch .ob-sub {
+  animation: ob-fade-up 0.7s var(--motion-ease) 4.7s both;
+}
+.ob-intro.ob-launch .ob-intro-cta {
+  animation: ob-fade-up 0.7s var(--motion-ease) 5.2s both;
+}
+
+@keyframes ob-mark-launch {
+  0% {
+    opacity: 0;
+    transform: scale(0.5) rotate(-8deg);
+    filter: drop-shadow(0 0 0 rgba(255, 120, 71, 0));
+  }
+  5% { /* ~0.3s — punch on the attack */
+    opacity: 1;
+    transform: scale(1.12) rotate(2deg);
+    filter: drop-shadow(0 0 42px rgba(255, 120, 71, 0.75));
+  }
+  9% { /* ~0.5s — settle */
+    transform: scale(1) rotate(0);
+    filter: drop-shadow(0 0 22px rgba(255, 120, 71, 0.4));
+  }
+  28% { /* ~1.7s — breathe */
+    filter: drop-shadow(0 0 16px rgba(255, 120, 71, 0.3));
+  }
+  33% { /* ~2.0s — mid pulse on the swell */
+    transform: scale(1.05);
+    filter: drop-shadow(0 0 32px rgba(255, 120, 71, 0.55));
+  }
+  38% {
+    transform: scale(1);
+    filter: drop-shadow(0 0 18px rgba(255, 120, 71, 0.3));
+  }
+  50% { /* ~3.0s — build begins */
+    filter: drop-shadow(0 0 24px rgba(255, 120, 71, 0.45));
+  }
+  63% { /* ~3.8s — climax */
+    transform: scale(1.09);
+    filter: drop-shadow(0 0 48px rgba(255, 120, 71, 0.85));
+  }
+  74% { /* ~4.4s — ease down */
+    transform: scale(1);
+    filter: drop-shadow(0 0 24px rgba(255, 120, 71, 0.45));
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+    filter: drop-shadow(0 0 24px rgba(255, 120, 71, 0.45));
+  }
+}
+
+@keyframes ob-word-launch {
+  0% {
+    opacity: 0;
+    transform: translateY(10px);
+    letter-spacing: 0.5em;
+    filter: blur(7px);
+  }
+  45% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    letter-spacing: 0.14em;
+    filter: blur(0);
+  }
+}
+
+@keyframes ob-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ob-intro .ob-mark,
+  .ob-intro .ob-wordmark,
+  .ob-intro .ob-tagline,
+  .ob-intro .ob-sub,
+  .ob-intro .ob-intro-cta {
+    opacity: 1;
+  }
+  .ob-intro.ob-launch .ob-mark,
+  .ob-intro.ob-launch .ob-wordmark,
+  .ob-intro.ob-launch .ob-tagline,
+  .ob-intro.ob-launch .ob-sub,
+  .ob-intro.ob-launch .ob-intro-cta {
+    animation: none;
+  }
 }
 
 /* --- permission / ready icon ring --- */
@@ -220,6 +359,21 @@
 
 .ob-cta:active {
   transform: translateY(0);
+}
+
+/* Secondary escape so the permission step never traps the user. */
+.ob-skip {
+  margin-top: 14px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--color-text-lo);
+  background: none;
+  border: none;
+  transition: color var(--motion-fast) var(--motion-ease);
+}
+
+.ob-skip:hover {
+  color: var(--color-text-hi);
 }
 
 /* --- progress dots --- */
