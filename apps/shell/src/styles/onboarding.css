@@ -1,0 +1,254 @@
+/* First-run onboarding. Full-bleed dark stage over the editor. The single
+   coral accent appears once, on the peak (the mark glow + the CTA). */
+
+.ob {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(
+      120% 90% at 50% 18%,
+      color-mix(in srgb, var(--color-signal-500) 7%, transparent),
+      transparent 60%
+    ),
+    var(--color-void);
+  overflow: hidden;
+}
+
+/* Faint film grain so the flat black has texture under motion. */
+.ob-grain {
+  position: absolute;
+  inset: -50%;
+  opacity: 0.025;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.ob-stage {
+  position: relative;
+  width: min(440px, 86vw);
+  text-align: center;
+}
+
+.ob-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  animation: ob-rise 520ms var(--motion-ease) both;
+}
+
+@keyframes ob-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* --- intro --- */
+
+.ob-mark {
+  color: var(--color-signal-500);
+  filter: drop-shadow(
+    0 0 24px color-mix(in srgb, var(--color-signal-500) 45%, transparent)
+  );
+  animation: ob-mark-in 800ms var(--motion-ease) both;
+}
+
+@keyframes ob-mark-in {
+  from {
+    opacity: 0;
+    transform: scale(0.82) rotate(-4deg);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) rotate(0);
+  }
+}
+
+.ob-wordmark {
+  margin: 22px 0 0;
+  font-size: 44px;
+  letter-spacing: 0.14em;
+  font-weight: 600;
+  color: var(--color-text-hi);
+}
+
+.ob-tagline {
+  margin: 8px 0 0;
+  font-family: var(--font-display);
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  color: var(--color-text-hi);
+}
+
+.ob-sub {
+  margin: 14px 0 0;
+  max-width: 34ch;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-text-lo);
+}
+
+.ob-note {
+  margin: 12px 0 0;
+  font-size: 11px;
+  color: var(--color-text-lo);
+  opacity: 0.7;
+}
+
+/* --- permission / ready icon ring --- */
+
+.ob-icon-ring {
+  display: grid;
+  place-items: center;
+  width: 76px;
+  height: 76px;
+  border-radius: var(--radius-pill);
+  color: var(--color-text-lo);
+  background: var(--color-surface);
+  box-shadow: var(--elevation-raised);
+  transition:
+    color var(--motion-base) var(--motion-ease),
+    box-shadow var(--motion-base) var(--motion-ease);
+}
+
+.ob-icon-ring[data-granted="true"] {
+  color: var(--color-signal-500);
+  box-shadow:
+    var(--elevation-raised),
+    0 0 0 1px color-mix(in srgb, var(--color-signal-500) 40%, transparent),
+    0 0 28px color-mix(in srgb, var(--color-signal-500) 30%, transparent);
+}
+
+.ob-h2 {
+  margin: 20px 0 0;
+  font-size: 22px;
+  letter-spacing: 0.01em;
+  color: var(--color-text-hi);
+}
+
+/* --- status lines --- */
+
+.ob-status {
+  margin: 14px 0 0;
+  font-size: 12px;
+  color: var(--color-text-lo);
+  max-width: 36ch;
+  line-height: 1.5;
+}
+
+.ob-status-ok {
+  font-family: var(--font-display);
+  color: var(--color-signal-500);
+  letter-spacing: 0.02em;
+}
+
+.ob-status-warn {
+  color: var(--color-text-hi);
+}
+
+/* --- shortcuts --- */
+
+.ob-keys {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 24px 0 4px;
+  width: 100%;
+  max-width: 280px;
+}
+
+.ob-key-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--elevation-ring);
+}
+
+.ob-key-combo {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.ob-key-combo kbd {
+  min-width: 24px;
+  height: 24px;
+  font-size: 13px;
+}
+
+.ob-key-label {
+  font-size: 12px;
+  color: var(--color-text-lo);
+}
+
+/* --- CTA --- */
+
+.ob-cta {
+  margin-top: 26px;
+  padding: 0 22px;
+  height: 40px;
+  font-family: var(--font-display);
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  color: var(--color-void);
+  background: var(--color-signal-500);
+  border: none;
+  border-radius: var(--radius-pill);
+  transition:
+    transform var(--motion-fast) var(--motion-ease),
+    background var(--motion-fast) var(--motion-ease),
+    box-shadow var(--motion-fast) var(--motion-ease);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-signal-500) 50%, transparent);
+}
+
+.ob-cta:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 22px
+    color-mix(in srgb, var(--color-signal-500) 35%, transparent);
+}
+
+.ob-cta:active {
+  transform: translateY(0);
+}
+
+/* --- progress dots --- */
+
+.ob-dots {
+  position: absolute;
+  bottom: 36px;
+  display: flex;
+  gap: 8px;
+}
+
+.ob-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-line);
+  transition:
+    background var(--motion-base) var(--motion-ease),
+    width var(--motion-base) var(--motion-ease);
+}
+
+.ob-dot[data-on="true"] {
+  width: 20px;
+  background: var(--color-signal-500);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ob-panel,
+  .ob-mark {
+    animation: none;
+  }
+}

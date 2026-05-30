@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>KRIT UI Sound Pack</title>
+<style>
+  :root {
+    --void: #07080a;
+    --paper: #0b0c0e;
+    --surface: #101111;
+    --line: #1c1e20;
+    --hi: #f4f5f6;
+    --lo: #8a9099;
+    --signal-300: #ffb199;
+    --signal-500: #ff7847;
+    --signal-700: #d8501e;
+    --border: rgba(255, 255, 255, 0.06);
+    --border-soft: rgba(255, 255, 255, 0.04);
+    --ease: cubic-bezier(0.2, 0, 0, 1);
+    --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --body: "Inter", -apple-system, system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--void);
+    color: var(--hi);
+    font-family: var(--body);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---- sunrise backdrop: animated, low and slow, matches the launch vibe ---- */
+  .sky {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    overflow: hidden;
+  }
+  .sun {
+    position: absolute;
+    left: 50%;
+    bottom: -42vmin;
+    width: 84vmin;
+    height: 84vmin;
+    transform: translateX(-50%) scale(0.6);
+    border-radius: 50%;
+    background: radial-gradient(
+      circle,
+      rgba(255, 120, 71, 0.55) 0%,
+      rgba(255, 120, 71, 0.22) 32%,
+      rgba(255, 120, 71, 0.06) 55%,
+      rgba(255, 120, 71, 0) 70%
+    );
+    filter: blur(8px);
+    opacity: 0.35;
+    transition: opacity 1.2s var(--ease), transform 1.2s var(--ease);
+  }
+  .sun.rise {
+    animation: sunrise 2.4s var(--ease) forwards;
+  }
+  @keyframes sunrise {
+    0%   { transform: translateX(-50%) translateY(20vmin) scale(0.55); opacity: 0.2; }
+    45%  { transform: translateX(-50%) translateY(-6vmin) scale(1.05); opacity: 0.95; }
+    100% { transform: translateX(-50%) translateY(0) scale(1); opacity: 0.5; }
+  }
+
+  .grain {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(circle at 50% 120%, rgba(255, 177, 153, 0.08), transparent 60%);
+    mix-blend-mode: screen;
+  }
+
+  /* ---- layout ---- */
+  .wrap {
+    position: relative;
+    z-index: 1;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 72px 24px 96px;
+  }
+
+  header { margin-bottom: 48px; }
+
+  .mark {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.18em;
+    color: var(--lo);
+    text-transform: uppercase;
+    margin-bottom: 20px;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--signal-500);
+    box-shadow: 0 0 12px var(--signal-500);
+  }
+
+  h1 {
+    font-size: clamp(34px, 6vw, 52px);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.04;
+    margin-bottom: 14px;
+  }
+  h1 .accent { color: var(--signal-500); }
+
+  .sub {
+    color: var(--lo);
+    font-size: 15px;
+    line-height: 1.6;
+    max-width: 52ch;
+  }
+
+  .hint {
+    margin-top: 18px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--lo);
+    opacity: 0.7;
+  }
+
+  /* ---- launch (hero) button ---- */
+  .launch-btn {
+    width: 100%;
+    margin: 36px 0 40px;
+    padding: 22px 24px;
+    background: linear-gradient(180deg, rgba(255,120,71,0.16), rgba(255,120,71,0.04));
+    border: 1px solid rgba(255, 120, 71, 0.28);
+    border-radius: 16px;
+    color: var(--hi);
+    cursor: pointer;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    transition: transform 0.2s var(--ease), border-color 0.2s var(--ease),
+                box-shadow 0.2s var(--ease);
+  }
+  .launch-btn:hover {
+    border-color: rgba(255, 120, 71, 0.55);
+    box-shadow: 0 0 0 3px rgba(255, 120, 71, 0.12);
+    transform: translateY(-1px);
+  }
+  .launch-btn:active { transform: translateY(0) scale(0.997); }
+  .launch-btn.playing { box-shadow: 0 0 40px rgba(255, 120, 71, 0.28); }
+
+  .launch-ico {
+    flex: 0 0 auto;
+    width: 44px; height: 44px;
+    border-radius: 12px;
+    background: radial-gradient(circle at 50% 70%, var(--signal-300), var(--signal-700));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 0 24px rgba(255,120,71,0.45);
+  }
+  .launch-text .name {
+    font-family: var(--mono);
+    font-size: 16px;
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
+  }
+  .launch-text .desc { color: var(--lo); font-size: 13px; line-height: 1.5; }
+
+  /* ---- grid of sound cards ---- */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+  }
+  @media (max-width: 520px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    appearance: none;
+    text-align: left;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 16px 15px;
+    color: var(--hi);
+    cursor: pointer;
+    transition: transform 0.18s var(--ease), border-color 0.18s var(--ease),
+                background 0.18s var(--ease);
+    position: relative;
+    overflow: hidden;
+  }
+  .card:hover {
+    border-color: rgba(255, 120, 71, 0.4);
+    transform: translateY(-2px);
+  }
+  .card:active { transform: translateY(0) scale(0.99); }
+
+  /* accent pulse when a card plays */
+  .card .pulse {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle at 18px 24px, rgba(255,120,71,0.22), transparent 60%);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .card.playing .pulse { animation: pulse 0.5s var(--ease); }
+  @keyframes pulse { 0% { opacity: 0.9; } 100% { opacity: 0; } }
+
+  .card .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .card .name {
+    font-family: var(--mono);
+    font-size: 14px;
+    letter-spacing: 0.03em;
+  }
+  .card .ms {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--lo);
+  }
+  .card .desc { color: var(--lo); font-size: 12.5px; line-height: 1.5; }
+  .card.signature .name::after {
+    content: "signature";
+    margin-left: 8px;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--signal-500);
+    vertical-align: middle;
+  }
+
+  footer {
+    margin-top: 56px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border-soft);
+    color: var(--lo);
+    font-size: 12.5px;
+    line-height: 1.7;
+  }
+  footer code {
+    font-family: var(--mono);
+    color: var(--signal-300);
+    background: rgba(255, 120, 71, 0.08);
+    padding: 1px 6px;
+    border-radius: 5px;
+  }
+
+  /* ---- mute toggle ---- */
+  .mute {
+    position: fixed;
+    top: 20px; right: 20px;
+    z-index: 2;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--lo);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 9999px;
+    padding: 7px 14px;
+    cursor: pointer;
+    text-transform: uppercase;
+  }
+  .mute[data-muted="true"] { color: var(--signal-500); border-color: rgba(255,120,71,0.4); }
+</style>
+</head>
+<body>
+  <div class="sky" aria-hidden="true">
+    <div class="sun" id="sun"></div>
+    <div class="grain"></div>
+  </div>
+
+  <button class="mute" id="mute" data-muted="false">sound on</button>
+
+  <div class="wrap">
+    <header>
+      <div class="mark"><span class="dot"></span>KRIT · UI Sound Pack</div>
+      <h1>Sounds that feel like <span class="accent">KRIT</span>.</h1>
+      <p class="sub">
+        Procedurally generated, 100% original. One warm, glassy, low-mid voice
+        tuned around A, mastered for body and spread in stereo, so every cue
+        reads as the same brand. Click any sound to hear it.
+      </p>
+      <p class="hint">generated by packages/sounds/generate.py · 48 kHz · 24-bit · stereo</p>
+    </header>
+
+    <button class="launch-btn" data-sound="launch">
+      <span class="launch-ico"></span>
+      <span class="launch-text">
+        <span class="name">launch</span>
+        <span class="desc">The startup theme — two rising "questions", then an A-major "answer" that resolves over a deep sub and rings out in stereo. Swells in gently. Watch the sun.</span>
+      </span>
+    </button>
+
+    <div class="grid" id="grid"></div>
+
+    <footer>
+      Play the generator with <code>python3 packages/sounds/generate.py</code>.
+      Native <code>.caf</code> files sit beside the <code>.wav</code> for the macOS
+      capture helper. Integration notes in <code>packages/sounds/README.md</code>.
+    </footer>
+  </div>
+
+<script>
+  // Sound metadata (durations are real, measured from the generated files).
+  const SOUNDS = [
+    { id: "capture",      ms: 240, sig: true,  desc: "The shutter. Heavy click + descending micro-swoosh. Fires on screenshot." },
+    { id: "copy",         ms: 110,            desc: "Soft bell tick (E4) — copied to clipboard." },
+    { id: "save",         ms: 1130,           desc: "Rising perfect fifth (A3→E4) with a room tail. File saved." },
+    { id: "record-start", ms: 520,            desc: "Ascending glide (C4→G4). Recording started." },
+    { id: "record-stop",  ms: 540,            desc: "Descending glide (G4→C4). Recording stopped." },
+    { id: "error",        ms: 720,            desc: "Low, soft falling pair. Subtle — never harsh." },
+    { id: "pin",          ms: 150,            desc: "Soft rounded tick. Screenshot pinned to screen." },
+    { id: "toggle",       ms: 90,             desc: "Neutral light click. Settings on/off." },
+  ];
+
+  let muted = false;
+  const muteBtn = document.getElementById("mute");
+  muteBtn.addEventListener("click", () => {
+    muted = !muted;
+    muteBtn.dataset.muted = String(muted);
+    muteBtn.textContent = muted ? "muted" : "sound on";
+  });
+
+  // Web Audio: decode each local .wav once, play on demand. Works over file://
+  // because we fetch relative paths and decode the ArrayBuffer ourselves.
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AC();
+  const cache = new Map();
+
+  async function buffer(id) {
+    if (cache.has(id)) return cache.get(id);
+    const res = await fetch(id + ".wav");
+    const arr = await res.arrayBuffer();
+    const buf = await ctx.decodeAudioData(arr);
+    cache.set(id, buf);
+    return buf;
+  }
+
+  async function play(id) {
+    if (muted) return;
+    if (ctx.state === "suspended") await ctx.resume();
+    try {
+      const buf = await buffer(id);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start();
+    } catch (e) {
+      // Fallback for environments that block fetch over file://
+      const a = new Audio(id + ".wav");
+      a.play().catch(() => {});
+    }
+  }
+
+  // Launch button: play + trigger the sunrise animation.
+  const sun = document.getElementById("sun");
+  const launchBtn = document.querySelector(".launch-btn");
+  launchBtn.addEventListener("click", () => {
+    play("launch");
+    launchBtn.classList.add("playing");
+    sun.classList.remove("rise");
+    void sun.offsetWidth; // restart animation
+    sun.classList.add("rise");
+    setTimeout(() => launchBtn.classList.remove("playing"), 1200);
+  });
+
+  // Build the grid of cards.
+  const grid = document.getElementById("grid");
+  for (const s of SOUNDS) {
+    const card = document.createElement("button");
+    card.className = "card" + (s.sig ? " signature" : "");
+    card.dataset.sound = s.id;
+    card.innerHTML = `
+      <span class="pulse"></span>
+      <span class="row">
+        <span class="name">${s.id}</span>
+        <span class="ms">${s.ms} ms</span>
+      </span>
+      <span class="desc">${s.desc}</span>`;
+    card.addEventListener("click", () => {
+      play(s.id);
+      card.classList.remove("playing");
+      void card.offsetWidth;
+      card.classList.add("playing");
+    });
+    grid.appendChild(card);
+  }
+</script>
+</body>
+</html>

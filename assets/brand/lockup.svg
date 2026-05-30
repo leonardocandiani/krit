@@ -1,0 +1,10 @@
+<svg width="220" height="56" viewBox="0 0 220 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- KRIT lockup: The Notch symbol + wordmark, horizontal. -->
+  <g transform="translate(6 8)">
+    <path d="M6 9 V6 H9" stroke="#FF7847" stroke-width="2.25" stroke-linecap="butt" stroke-linejoin="miter"/>
+    <path d="M18 15 V18 H15" stroke="#FF7847" stroke-width="2.25" stroke-linecap="butt" stroke-linejoin="miter"/>
+    <rect x="2" y="2" width="20" height="20" rx="0" stroke="#1C1E20" stroke-width="0" fill="none"/>
+  </g>
+  <text x="44" y="38" font-family="'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="30" font-weight="600" letter-spacing="5" fill="#F4F5F6">KRIT</text>
+</svg>

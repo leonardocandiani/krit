@@ -1,0 +1,51 @@
+# deps
+node_modules/
+.pnp.*
+# build
+dist/
+build/
+target/
+*.dmg
+*.app
+packages/tokens/build/*.generated.*
+# tauri
+apps/shell/src-tauri/target/
+apps/shell/src-tauri/gen/
+# swift
+apps/helper/.build/
+apps/helper/*.xcodeproj/xcuserdata/
+DerivedData/
+# os / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+!.vscode/extensions.json
+# env / secrets
+.env
+.env.*
+!.env.example
+# temp
+_temp/
+*.log
+
+# macOS AppleDouble (volume nao-APFS)
+._*
+.AppleDouble
+
+# helper build output
+apps/helper/dist/
+apps/helper/.build/
+packages/tokens/build/
+
+# playwright mcp scratch
+.playwright-mcp/
+
+# internal planning (kept local, not published)
+.planning/
+
+# claude code runtime (kept local)
+.claude/
+
+# stray root screenshots
+/krit-*.png

@@ -1,0 +1,943 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KRIT — First run</title>
+
+<!-- Fontes: Geist Mono (wordmark/headings/kbd) + Inter (corpo). CDN com fallback de sistema. -->
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+<style>
+/* ===== fontes via fontsource CDN (woff2). Se o CDN cair, cai pro stack de sistema ===== */
+@font-face{
+  font-family:"Inter var";
+  font-style:normal;font-weight:100 900;font-display:swap;
+  src:url("https://cdn.jsdelivr.net/fontsource/fonts/inter:vf@latest/latin-wght-normal.woff2") format("woff2");
+}
+@font-face{
+  font-family:"Geist Mono var";
+  font-style:normal;font-weight:100 900;font-display:swap;
+  src:url("https://cdn.jsdelivr.net/fontsource/fonts/geist-mono:vf@latest/latin-wght-normal.woff2") format("woff2");
+}
+
+/* ============================ tokens KRIT ============================ */
+:root{
+  --void:#07080a;
+  --paper:#0B0C0E;
+  --surface:#101111;
+  --line:#1C1E20;
+  --line-2:#26282b;
+  --text-hi:#F4F5F6;
+  --text-lo:#8A9099;
+  --signal:#FF7847;     /* coral — acento unico, escasso */
+  --signal-soft:rgba(255,120,71,.14);
+  --ice:#57B6FF;        /* foco */
+  --error:#FF6363;
+
+  --mono:"Geist Mono var", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans:"Inter var", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  --ease:cubic-bezier(0.2,0,0,1);
+  --ease-soft:cubic-bezier(0.33,1,0.68,1);
+
+  --win-w:720px;
+  --win-h:520px;
+  --radius:16px;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:var(--sans);
+  color:var(--text-hi);
+  background:#000;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  overflow:hidden;
+  display:grid;
+  place-items:center;
+  /* fundo desfocado simulando desktop atras do app */
+  background:
+    radial-gradient(120% 90% at 18% 12%, #15171b 0%, #0a0b0d 45%, #060708 100%);
+}
+/* "wallpaper" borrado com manchas de cor frias (NAO coral — coral so dentro do app) */
+.desktop-bg{
+  position:fixed; inset:-10%;
+  z-index:0;
+  filter:blur(60px) saturate(115%);
+  opacity:.6;
+  background:
+    radial-gradient(40% 50% at 25% 30%, rgba(87,182,255,.18), transparent 70%),
+    radial-gradient(45% 45% at 80% 70%, rgba(120,140,170,.16), transparent 70%),
+    radial-gradient(35% 40% at 65% 18%, rgba(70,80,100,.20), transparent 70%);
+  pointer-events:none;
+}
+/* grain global sutil sobre o fundo */
+.desktop-bg::after{
+  content:""; position:absolute; inset:0;
+  background-image:var(--noise);
+  opacity:.5; mix-blend-mode:overlay;
+}
+
+/* ===================== janela do app ===================== */
+.window{
+  position:relative; z-index:1;
+  width:var(--win-w); height:var(--win-h);
+  border-radius:var(--radius);
+  background:var(--void);
+  border:1px solid var(--line);
+  box-shadow:
+    0 0 0 0.5px rgba(255,255,255,.04),
+    0 40px 120px -20px rgba(0,0,0,.85),
+    0 18px 50px -25px rgba(0,0,0,.9);
+  overflow:hidden;
+  display:flex; flex-direction:column;
+  animation:winIn .7s var(--ease) both;
+}
+@keyframes winIn{
+  from{opacity:0; transform:translateY(14px) scale(.985)}
+  to{opacity:1; transform:none}
+}
+
+/* titlebar dark sutil com traffic lights */
+.titlebar{
+  height:38px; flex:0 0 38px;
+  display:flex; align-items:center;
+  padding:0 14px;
+  background:linear-gradient(180deg,#0c0d0f,#090a0c);
+  border-bottom:1px solid var(--line);
+  position:relative; z-index:5;
+}
+.lights{display:flex; gap:8px}
+.light{width:11px;height:11px;border-radius:50%;background:#2a2c2f}
+.light.r{background:#39312f}
+.titlebar .tb-title{
+  position:absolute; left:0; right:0; text-align:center;
+  font-family:var(--mono); font-size:11px; letter-spacing:.12em;
+  color:var(--text-lo); text-transform:uppercase; pointer-events:none;
+}
+/* botao de som discreto no canto direito da titlebar */
+.sound-toggle{
+  position:absolute; right:10px; top:50%; transform:translateY(-50%);
+  width:26px; height:26px; display:grid; place-items:center;
+  background:none; border:none; cursor:pointer; padding:0;
+  color:var(--text-lo); opacity:.6;
+  transition:opacity .18s var(--ease), color .18s var(--ease);
+}
+.sound-toggle:hover{opacity:1; color:var(--text-hi)}
+.sound-toggle:focus-visible{outline:none; opacity:1; box-shadow:0 0 0 2px var(--void),0 0 0 4px var(--ice); border-radius:6px}
+.sound-toggle svg{width:16px; height:16px}
+.sound-toggle .ic-off{display:none}
+.sound-toggle.muted .ic-on{display:none}
+.sound-toggle.muted .ic-off{display:block}
+
+/* viewport das telas */
+.stage{
+  position:relative; flex:1; overflow:hidden;
+}
+/* grain global sobre os gradientes do app (mata banding) */
+.stage::after{
+  content:""; position:absolute; inset:0; z-index:30; pointer-events:none;
+  background-image:var(--noise);
+  opacity:.035; mix-blend-mode:overlay;
+}
+
+.screen{
+  position:absolute; inset:0;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  padding:40px 56px 64px;
+  text-align:center;
+  opacity:0; visibility:hidden;
+  transform:translateY(10px) scale(.992);
+  transition:opacity .5s var(--ease), transform .55s var(--ease), filter .55s var(--ease), visibility 0s linear .55s;
+  filter:blur(6px);
+}
+.screen.active{
+  opacity:1; visibility:visible; transform:none; filter:none;
+  transition:opacity .55s var(--ease) .05s, transform .6s var(--ease) .05s, filter .6s var(--ease) .05s, visibility 0s;
+}
+.screen.exit-left{
+  transform:translateY(-8px) scale(.992); /* leve drift na saida */
+}
+
+/* spotlight coral radial — UMA fonte de luz, no topo */
+.spotlight{
+  position:absolute; left:50%; top:-12%;
+  width:560px; height:420px; transform:translateX(-50%);
+  background:radial-gradient(50% 50% at 50% 50%, var(--signal-soft), transparent 70%);
+  pointer-events:none; z-index:0;
+  opacity:.0;
+  transition:opacity 1.2s var(--ease);
+}
+.screen.active .spotlight{opacity:1}
+
+/* ===================== tipografia ===================== */
+.eyebrow{
+  font-family:var(--mono);
+  font-size:11px; letter-spacing:.22em; text-transform:uppercase;
+  color:var(--text-lo);
+  margin-bottom:18px;
+}
+h1.title{
+  font-family:var(--mono); font-weight:700;
+  font-size:30px; line-height:1.1; letter-spacing:-.01em;
+  color:var(--text-hi);
+}
+h2.title{
+  font-family:var(--mono); font-weight:700;
+  font-size:24px; line-height:1.15; letter-spacing:-.01em;
+  color:var(--text-hi);
+}
+.lede{
+  font-family:var(--sans); font-size:14.5px; line-height:1.55;
+  color:var(--text-lo);
+  max-width:42ch; margin:14px auto 0;
+}
+.coral{color:var(--signal)}
+
+/* ===================== botoes ===================== */
+.btn{
+  font-family:var(--mono); font-size:13px; letter-spacing:.02em; font-weight:600;
+  border:1px solid var(--line-2); background:var(--surface); color:var(--text-hi);
+  padding:11px 22px; border-radius:10px; cursor:pointer;
+  transition:transform .18s var(--ease), border-color .18s var(--ease), background .18s var(--ease), box-shadow .18s var(--ease);
+}
+.btn:hover{border-color:#3a3d40; transform:translateY(-1px)}
+.btn:active{transform:translateY(0) scale(.985)}
+.btn:focus-visible{outline:none; box-shadow:0 0 0 2px var(--void), 0 0 0 4px var(--ice)}
+.btn.primary{
+  background:var(--signal); color:#1a0d07; border-color:transparent;
+  box-shadow:0 8px 26px -10px rgba(255,120,71,.6);
+}
+.btn.primary:hover{box-shadow:0 12px 34px -10px rgba(255,120,71,.75)}
+.btn-row{display:flex; gap:12px; align-items:center; margin-top:30px}
+
+/* ===================== chrome de navegacao ===================== */
+.nav{
+  position:absolute; left:0; right:0; bottom:0; z-index:25;
+  height:54px; display:flex; align-items:center; justify-content:space-between;
+  padding:0 22px;
+}
+.skip{
+  font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--text-lo); background:none; border:none; cursor:pointer;
+  transition:color .18s var(--ease);
+}
+.skip:hover{color:var(--text-hi)}
+.dots{display:flex; gap:8px; align-items:center}
+.dot{
+  width:7px; height:7px; border-radius:50%;
+  background:var(--line-2); cursor:pointer;
+  transition:all .35s var(--ease);
+}
+.dot.on{background:var(--text-hi); width:20px; border-radius:4px}
+.dot.done{background:var(--text-lo)}
+.next{
+  width:34px; height:34px; border-radius:50%;
+  display:grid; place-items:center;
+  border:1px solid var(--line-2); background:var(--surface); color:var(--text-hi);
+  cursor:pointer; transition:transform .18s var(--ease), border-color .18s var(--ease);
+}
+.next:hover{border-color:#3a3d40; transform:translateX(2px)}
+.next:focus-visible{outline:none; box-shadow:0 0 0 2px var(--void),0 0 0 4px var(--ice)}
+.next svg{width:15px;height:15px}
+.nav-side{display:flex; align-items:center; gap:14px; min-width:120px}
+.nav-side.right{justify-content:flex-end}
+.nav-side.left{justify-content:flex-start}
+
+/* ===================== SIMBOLO "The Notch" ===================== */
+.notch{display:block}
+.notch .bracket{
+  stroke:var(--text-hi); stroke-width:2.25; fill:none;
+  stroke-linecap:butt; stroke-linejoin:miter;
+}
+.notch .dot-rec{ fill:var(--signal); }
+
+/* hero: montagem dos colchetes deslizando de fora pra dentro */
+.hero-symbol{ position:relative; z-index:2; }
+.hero-symbol svg{width:104px;height:104px}
+.screen#s-hero.active .br-tl{ animation:slideTL .55s var(--ease) .15s both; }
+.screen#s-hero.active .br-br{ animation:slideBR .55s var(--ease) .15s both; }
+.screen#s-hero.active .notch{ animation:snap .18s var(--ease) .72s both; }
+.screen#s-hero.active .dot-rec{ animation:critPulse 1s var(--ease) .95s both; }
+
+@keyframes slideTL{
+  from{transform:translate(-14px,-14px); opacity:0}
+  to{transform:none; opacity:1}
+}
+@keyframes slideBR{
+  from{transform:translate(14px,14px); opacity:0}
+  to{transform:none; opacity:1}
+}
+@keyframes snap{ /* micro-snap quando "trava" */
+  0%{transform:scale(1)} 45%{transform:scale(1.045)} 100%{transform:scale(1)}
+}
+@keyframes critPulse{ /* o "crit" — pulso coral 1x */
+  0%{transform:scale(.2); opacity:0}
+  35%{transform:scale(1.5); opacity:1}
+  100%{transform:scale(1); opacity:1}
+}
+
+/* wordmark hero */
+.wordmark{
+  font-family:var(--mono); font-weight:700; font-size:46px;
+  letter-spacing:.04em; margin-top:26px; color:var(--text-hi);
+}
+.screen#s-hero.active .wordmark{ animation:rise .6s var(--ease) .85s both; }
+@keyframes rise{ from{opacity:0; transform:translateY(14px)} to{opacity:1; transform:none} }
+
+/* tagline staccato — palavras entram em sequencia */
+.tagline{ margin-top:14px; font-family:var(--mono); font-size:13.5px; letter-spacing:.06em; color:var(--text-lo); }
+.tagline span{ display:inline-block; opacity:0; }
+.tagline span.shot{ color:var(--signal); }
+.screen#s-hero.active .tagline span{ animation:word .42s var(--ease) both; }
+.screen#s-hero.active .tagline span:nth-child(1){animation-delay:1.15s}
+.screen#s-hero.active .tagline span:nth-child(2){animation-delay:1.30s}
+.screen#s-hero.active .tagline span:nth-child(3){animation-delay:1.45s}
+.screen#s-hero.active .tagline span:nth-child(4){animation-delay:1.60s}
+@keyframes word{ from{opacity:0; transform:translateY(6px)} to{opacity:1; transform:none} }
+.screen#s-hero .btn-row{ opacity:0; }
+.screen#s-hero.active .btn-row{ animation:rise .55s var(--ease) 1.85s both; }
+
+/* ===================== TELA 2 — 3 pilares ===================== */
+.pillars{
+  display:grid; grid-template-columns:repeat(3,1fr); gap:14px;
+  width:100%; max-width:560px; margin-top:28px; position:relative; z-index:2;
+}
+.pillar{
+  background:linear-gradient(180deg,var(--surface),#0c0d0f);
+  border:1px solid var(--line);
+  border-radius:13px; padding:18px 16px 16px;
+  text-align:left;
+  opacity:0; transform:translateY(12px);
+}
+.screen#s-pillars.active .pillar{ animation:rise .5s var(--ease) both; }
+.screen#s-pillars.active .pillar:nth-child(1){animation-delay:.18s}
+.screen#s-pillars.active .pillar:nth-child(2){animation-delay:.30s}
+.screen#s-pillars.active .pillar:nth-child(3){animation-delay:.42s}
+.pillar .viz{
+  height:64px; border-radius:8px; margin-bottom:14px;
+  background:var(--void); border:1px solid var(--line);
+  position:relative; overflow:hidden;
+}
+.pillar h3{ font-family:var(--mono); font-weight:700; font-size:14px; letter-spacing:.02em; }
+.pillar p{ font-family:var(--sans); font-size:12px; line-height:1.5; color:var(--text-lo); margin-top:5px; }
+
+/* viz 1 — Snap: retangulo de selecao se desenhando + dimensoes */
+.snap-rect{
+  position:absolute; left:14px; top:13px;
+  border:1.5px solid var(--ice);
+  background:rgba(87,182,255,.06);
+  width:0; height:0;
+}
+.snap-dims{
+  position:absolute; font-family:var(--mono); font-size:8px; color:var(--ice);
+  opacity:0;
+}
+.snap-handle{position:absolute;width:4px;height:4px;background:var(--ice);border-radius:1px;opacity:0}
+.screen#s-pillars.active .snap-rect{ animation:drawRect 1.6s var(--ease) .8s infinite; }
+.screen#s-pillars.active .snap-dims{ animation:dimsBlink 1.6s var(--ease) .8s infinite; }
+.screen#s-pillars.active .snap-handle{ animation:dimsBlink 1.6s var(--ease) .8s infinite; }
+@keyframes drawRect{
+  0%{width:0;height:0} 40%{width:62px;height:38px} 80%{width:62px;height:38px}
+  100%{width:62px;height:38px;opacity:0}
+}
+@keyframes dimsBlink{ 0%,38%{opacity:0} 45%,80%{opacity:1} 100%{opacity:0} }
+
+/* viz 2 — Markup: traco de anotacao coral (seta) sendo desenhado */
+.mk-line{ position:absolute; left:0; top:0; width:100%; height:100%; }
+.mk-path{ stroke:var(--signal); stroke-width:2.2; fill:none; stroke-linecap:round;
+  stroke-dasharray:120; stroke-dashoffset:120; }
+.mk-head{ fill:var(--signal); opacity:0; }
+.screen#s-pillars.active .mk-path{ animation:draw 1.4s var(--ease) 1s infinite; }
+.screen#s-pillars.active .mk-head{ animation:headIn 1.4s var(--ease) 1s infinite; }
+@keyframes draw{ 0%{stroke-dashoffset:120} 55%,85%{stroke-dashoffset:0} 100%{stroke-dashoffset:0;opacity:0} }
+@keyframes headIn{ 0%,50%{opacity:0} 60%,85%{opacity:1} 100%{opacity:0} }
+
+/* viz 3 — Roll: ponto rec pulsando + timecode */
+.roll-dot{ position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+  width:12px;height:12px;border-radius:50%;background:var(--signal); }
+.roll-ring{ position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+  width:12px;height:12px;border-radius:50%; border:1.5px solid var(--signal); opacity:0; }
+.roll-tc{ position:absolute; right:8px; bottom:7px; font-family:var(--mono); font-size:8px; color:var(--text-lo); }
+.screen#s-pillars.active .roll-dot{ animation:recDot 1.4s var(--ease) infinite; }
+.screen#s-pillars.active .roll-ring{ animation:recRing 1.4s var(--ease) infinite; }
+@keyframes recDot{ 0%,100%{opacity:1} 50%{opacity:.45} }
+@keyframes recRing{ 0%{transform:translate(-50%,-50%) scale(1);opacity:.7} 80%,100%{transform:translate(-50%,-50%) scale(3.2);opacity:0} }
+
+.foot-note{
+  margin-top:26px; font-family:var(--mono); font-size:11px; letter-spacing:.04em;
+  color:var(--text-lo); position:relative; z-index:2;
+}
+.foot-note .coral{font-weight:600}
+
+/* ===================== TELA 3 — permissao ===================== */
+.perm-grid{ display:grid; grid-template-columns:1fr 1fr; gap:26px; align-items:center;
+  width:100%; max-width:580px; margin-top:8px; position:relative; z-index:2; text-align:left; }
+.perm-copy h2{margin-bottom:0}
+.perm-copy .lede{margin-left:0; text-align:left}
+.local-badge{
+  display:inline-flex; align-items:center; gap:7px; margin-top:16px;
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--ice); border:1px solid rgba(87,182,255,.3); background:rgba(87,182,255,.06);
+  padding:6px 11px; border-radius:7px;
+}
+.local-badge .lock{width:11px;height:11px}
+
+/* mock de System Settings */
+.settings-mock{
+  background:var(--surface); border:1px solid var(--line); border-radius:11px;
+  overflow:hidden; box-shadow:0 18px 40px -22px rgba(0,0,0,.9);
+  opacity:0; transform:translateY(14px) scale(.97);
+}
+.screen#s-perm.active .settings-mock{ animation:rise .55s var(--ease) .25s both; }
+.sm-bar{ display:flex; align-items:center; gap:6px; padding:9px 11px; background:#0c0d0f; border-bottom:1px solid var(--line); }
+.sm-bar .sm-dot{width:8px;height:8px;border-radius:50%;background:#2a2c2f}
+.sm-crumb{ font-family:var(--mono); font-size:9px; color:var(--text-lo); padding:9px 12px 3px; letter-spacing:.02em; }
+.sm-row{ display:flex; align-items:center; gap:10px; padding:11px 12px; }
+.sm-icon{ width:26px; height:26px; border-radius:6px; background:var(--void); border:1px solid var(--line-2);
+  display:grid; place-items:center; flex:0 0 26px; }
+.sm-icon svg{width:15px;height:15px}
+.sm-app{ font-family:var(--sans); font-size:12.5px; color:var(--text-hi); flex:1; }
+.sm-app small{display:block; font-family:var(--mono); font-size:9px; color:var(--text-lo); margin-top:1px}
+/* toggle estilo macOS que liga sozinho */
+.toggle{ width:38px; height:22px; border-radius:11px; background:#3a3d40; position:relative;
+  transition:background .4s var(--ease); flex:0 0 38px; }
+.toggle::after{ content:""; position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%;
+  background:#fff; transition:left .4s var(--ease); box-shadow:0 1px 2px rgba(0,0,0,.4); }
+.screen#s-perm.active .toggle{ animation:toggleOn .5s var(--ease) 1.1s forwards; }
+@keyframes toggleOn{ to{background:var(--signal)} }
+.screen#s-perm.active .toggle::after{ animation:knob .5s var(--ease) 1.1s forwards; }
+@keyframes knob{ to{left:18px} }
+
+/* ===================== TELA 4 — atalho ===================== */
+.kbd-row{ display:flex; gap:12px; align-items:center; margin-top:36px; position:relative; z-index:2; }
+.kbd{
+  font-family:var(--mono); font-weight:700; font-size:26px;
+  min-width:62px; height:62px; padding:0 8px;
+  display:grid; place-items:center;
+  background:linear-gradient(180deg,#16181b,#0d0e10);
+  border:1px solid var(--line-2);
+  border-bottom:3px solid #050607;
+  border-radius:11px; color:var(--text-hi);
+  box-shadow:0 3px 0 #050607, 0 10px 22px -12px rgba(0,0,0,.8);
+  transition:transform .09s var(--ease), box-shadow .09s var(--ease), border-color .09s var(--ease);
+}
+.kbd.press{
+  transform:translateY(3px);
+  box-shadow:0 0 0 #050607, 0 4px 14px -8px rgba(0,0,0,.8);
+  border-bottom-width:1px; border-color:var(--signal);
+}
+.kbd-plus{font-family:var(--mono); font-size:18px; color:var(--text-lo)}
+/* flash de captura ao "disparar" */
+.capture-flash{
+  position:absolute; inset:0; background:#fff; opacity:0; z-index:28; pointer-events:none;
+}
+.capture-flash.fire{ animation:flash .42s var(--ease); }
+@keyframes flash{ 0%{opacity:0} 12%{opacity:.85} 100%{opacity:0} }
+/* retangulo de captura que "cai" no flash */
+.capture-frame{
+  position:absolute; left:50%; top:42%; transform:translate(-50%,-50%) scale(.6);
+  width:180px; height:108px; border:1.5px solid var(--ice); border-radius:6px;
+  background:rgba(87,182,255,.05); opacity:0; z-index:27;
+}
+.capture-frame.fire{ animation:frameDrop .5s var(--ease); }
+@keyframes frameDrop{ 0%{opacity:0; transform:translate(-50%,-50%) scale(.6)}
+  30%{opacity:1; transform:translate(-50%,-50%) scale(1)}
+  100%{opacity:0; transform:translate(-50%,-46%) scale(1.02)} }
+.shortcut-hint{ margin-top:28px; position:relative; z-index:2; }
+
+/* ===================== TELA 5 — pronto ===================== */
+.done-symbol svg{width:80px;height:80px}
+.screen#s-done.active .done-symbol{ animation:rise .6s var(--ease) .1s both; }
+.screen#s-done.active .done-symbol .dot-rec{ animation:loopPulse 2.6s var(--ease) 1s infinite; }
+@keyframes loopPulse{ 0%,100%{opacity:.85; transform:scale(1)} 50%{opacity:1; transform:scale(1.18)} }
+.screen#s-done .title{margin-top:24px}
+
+/* reduced motion: corta animacao, mantem legibilidade */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{ animation-duration:.001s!important; animation-delay:0s!important; transition-duration:.12s!important; }
+  .screen{filter:none!important}
+  .tagline span,.pillar,.btn-row,.wordmark,.settings-mock,.snap-rect{opacity:1!important; transform:none!important}
+  .toggle{background:var(--signal)!important} .toggle::after{left:18px!important}
+}
+</style>
+</head>
+<body>
+<div class="desktop-bg" aria-hidden="true"></div>
+
+<main class="window" role="dialog" aria-label="KRIT first run">
+  <div class="titlebar">
+    <div class="lights"><span class="light r"></span><span class="light"></span><span class="light"></span></div>
+    <span class="tb-title">krit</span>
+    <button class="sound-toggle" id="sound-toggle" aria-label="Toggle sound" aria-pressed="true" title="Sound on">
+      <svg class="ic-on" viewBox="0 0 24 24" fill="none"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path d="M16.5 8.5a4 4 0 0 1 0 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M18.8 6a7 7 0 0 1 0 12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <svg class="ic-off" viewBox="0 0 24 24" fill="none"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path d="M16 9l5 6M21 9l-5 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
+  <div class="stage" id="stage">
+
+    <!-- ============ 1. HERO ============ -->
+    <section class="screen active" id="s-hero" data-screen="0">
+      <div class="spotlight"></div>
+      <div class="hero-symbol">
+        <svg viewBox="0 0 24 24" class="notch" aria-hidden="true">
+          <path class="bracket br-tl" d="M6 9 V6 H9"/>
+          <path class="bracket br-br" d="M18 15 V18 H15"/>
+          <circle class="dot-rec" cx="12" cy="12" r="1.6"/>
+        </svg>
+      </div>
+      <div class="wordmark">KRIT</div>
+      <p class="tagline">
+        <span>Capture.</span> <span>Annotate.</span> <span>Record.</span> <span>One shortcut.</span>
+      </p>
+      <div class="btn-row">
+        <button class="btn primary" data-go="next">Get started</button>
+      </div>
+    </section>
+
+    <!-- ============ 2. PILARES ============ -->
+    <section class="screen" id="s-pillars" data-screen="1">
+      <div class="eyebrow">what you'll do</div>
+      <h2 class="title">Three gestures. One shortcut each.</h2>
+      <div class="pillars">
+        <div class="pillar">
+          <div class="viz">
+            <div class="snap-rect"></div>
+            <span class="snap-dims" style="left:16px;top:3px">320 x 200</span>
+          </div>
+          <h3>Snap</h3>
+          <p>Grab any region in a keystroke.</p>
+        </div>
+        <div class="pillar">
+          <div class="viz">
+            <svg class="mk-line" viewBox="0 0 100 64" preserveAspectRatio="none">
+              <path class="mk-path" d="M16 48 C 40 40, 52 20, 80 18"/>
+              <path class="mk-head" d="M80 18 l-9 1.5 l5 6 z"/>
+            </svg>
+          </div>
+          <h3>Markup</h3>
+          <p>Arrows, blur, text, in one pass.</p>
+        </div>
+        <div class="pillar">
+          <div class="viz">
+            <span class="roll-ring"></span>
+            <span class="roll-dot"></span>
+            <span class="roll-tc">00:14</span>
+          </div>
+          <h3>Roll</h3>
+          <p>Record screen, webcam, and audio.</p>
+        </div>
+      </div>
+      <p class="foot-note">Plus Grab Text (OCR) and Pin.</p>
+    </section>
+
+    <!-- ============ 3. PERMISSAO ============ -->
+    <section class="screen" id="s-perm" data-screen="2">
+      <div class="spotlight"></div>
+      <div class="perm-grid">
+        <div class="perm-copy">
+          <div class="eyebrow">one step, once</div>
+          <h2 class="title">KRIT needs to see your screen.</h2>
+          <p class="lede">It uses Screen Recording to capture what's on your display.</p>
+          <span class="local-badge">
+            <svg class="lock" viewBox="0 0 24 24" fill="none"><rect x="5" y="11" width="14" height="9" rx="2" stroke="currentColor" stroke-width="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="2"/></svg>
+            100% local — nothing is uploaded
+          </span>
+        </div>
+        <div class="settings-mock" aria-label="Privacy and Security settings">
+          <div class="sm-bar"><span class="sm-dot"></span><span class="sm-dot"></span><span class="sm-dot"></span></div>
+          <div class="sm-crumb">Privacy & Security › Screen Recording</div>
+          <div class="sm-row">
+            <span class="sm-icon">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M6 9 V6 H9" stroke="#F4F5F6" stroke-width="2.25"/><path d="M18 15 V18 H15" stroke="#F4F5F6" stroke-width="2.25"/><circle cx="12" cy="12" r="1.6" fill="#FF7847"/></svg>
+            </span>
+            <span class="sm-app">KRIT<small>krit.app</small></span>
+            <span class="toggle" role="switch" aria-checked="true"></span>
+          </div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn primary" id="grant-btn" data-go="next">Grant access</button>
+        <button class="btn" data-go="next">I'll do it later</button>
+      </div>
+    </section>
+
+    <!-- ============ 4. ATALHO ============ -->
+    <section class="screen" id="s-shortcut" data-screen="3">
+      <span class="capture-flash" id="flash"></span>
+      <span class="capture-frame" id="capframe"></span>
+      <div class="eyebrow">memorize this</div>
+      <h2 class="title">One shortcut worth memorizing:</h2>
+      <p class="lede">Press it and the region lights up. You open the rest of KRIT from here.</p>
+      <div class="kbd-row" id="kbdrow">
+        <span class="kbd" data-k="0">⇧</span>
+        <span class="kbd-plus">+</span>
+        <span class="kbd" data-k="1">⌘</span>
+        <span class="kbd-plus">+</span>
+        <span class="kbd" data-k="2">4</span>
+      </div>
+      <p class="shortcut-hint foot-note">Remappable later in Settings. This is the only one worth memorizing.</p>
+      <div class="btn-row">
+        <button class="btn" id="try-shortcut">Test the shortcut</button>
+        <button class="btn primary" data-go="next">Almost there</button>
+      </div>
+    </section>
+
+    <!-- ============ 5. PRONTO ============ -->
+    <section class="screen" id="s-done" data-screen="4">
+      <div class="spotlight"></div>
+      <div class="done-symbol">
+        <svg viewBox="0 0 24 24" class="notch" aria-hidden="true">
+          <path class="bracket" d="M6 9 V6 H9"/>
+          <path class="bracket" d="M18 15 V18 H15"/>
+          <circle class="dot-rec" cx="12" cy="12" r="1.6"/>
+        </svg>
+      </div>
+      <h2 class="title">You're set.</h2>
+      <p class="lede">The rest you'll figure out by capturing.</p>
+      <div class="btn-row">
+        <button class="btn primary" id="finish-btn">Capture now</button>
+      </div>
+    </section>
+
+  </div><!-- /stage -->
+
+  <!-- navegacao -->
+  <nav class="nav">
+    <div class="nav-side left">
+      <button class="skip" id="skip">Skip</button>
+    </div>
+    <div class="dots" id="dots"></div>
+    <div class="nav-side right">
+      <button class="next" id="next" aria-label="Next">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+  </nav>
+</main>
+
+<!-- noise SVG inline como data-uri (sem dependencia de rede) -->
+<script>
+(function(){
+  // ===== gera grain/noise procedural e injeta como CSS var =====
+  var noise = "url(\"data:image/svg+xml;utf8,"+
+    "%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E"+
+    "%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E"+
+    "%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E\")";
+  document.documentElement.style.setProperty('--noise', noise);
+
+  /* =====================================================================
+     CAMADA DE AUDIO — Web Audio API, 100% sintetizado, sem arquivos.
+     Sons curtos, suaves, volume baixo. Envelope ADSR pra nunca estalar.
+     ===================================================================== */
+  var Audio = (function(){
+    var ctx = null;
+    var master = null;
+    var enabled = (localStorage.getItem('krit-sound') !== 'off'); // default: ligado
+    var MASTER_GAIN = 0.12;
+    var lastPlay = {}; // debounce por tipo de som
+
+    function ensureCtx(){
+      if(ctx) return;
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if(!AC) return;
+      ctx = new AC();
+      master = ctx.createGain();
+      master.gain.value = MASTER_GAIN;
+      // leve limitador/suavizador na saida pra arredondar transientes
+      master.connect(ctx.destination);
+    }
+    // criar/resumir no primeiro gesto (autoplay policy)
+    function unlock(){
+      ensureCtx();
+      if(ctx && ctx.state === 'suspended') ctx.resume();
+    }
+
+    // bloco basico: oscilador com envelope ADSR + filtro opcional
+    function tone(opts){
+      if(!ctx) return;
+      var now = ctx.currentTime;
+      var t0 = now + (opts.delay || 0);
+      var osc = ctx.createOscillator();
+      var g = ctx.createGain();
+      osc.type = opts.type || 'sine';
+      // glide de frequencia (pra blips ascendentes)
+      osc.frequency.setValueAtTime(opts.freq, t0);
+      if(opts.toFreq){ osc.frequency.exponentialRampToValueAtTime(opts.toFreq, t0 + opts.dur); }
+
+      var peak = (opts.gain != null ? opts.gain : 0.8);
+      var a = opts.attack != null ? opts.attack : 0.004;
+      var d = opts.dur != null ? opts.dur : 0.06;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(peak, t0 + a);          // attack
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + a + d);    // decay/release
+
+      var node = osc;
+      if(opts.lp){ // lowpass pra tirar aspereza dos agudos
+        var lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass'; lp.frequency.value = opts.lp;
+        node.connect(lp); lp.connect(g);
+      } else {
+        node.connect(g);
+      }
+      g.connect(master);
+      osc.start(t0);
+      osc.stop(t0 + a + d + 0.02);
+    }
+
+    // ruido filtrado (whoosh/shutter) — buffer branco curto + bandpass
+    function noiseBurst(opts){
+      if(!ctx) return;
+      var now = ctx.currentTime + (opts.delay || 0);
+      var dur = opts.dur || 0.12;
+      var len = Math.floor(ctx.sampleRate * dur);
+      var buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      var data = buf.getChannelData(0);
+      for(var i=0;i<len;i++){ data[i] = (Math.random()*2 - 1); }
+      var src = ctx.createBufferSource(); src.buffer = buf;
+      var bp = ctx.createBiquadFilter();
+      bp.type = opts.filter || 'bandpass';
+      bp.frequency.setValueAtTime(opts.freq || 1800, now);
+      if(opts.toFreq){ bp.frequency.exponentialRampToValueAtTime(opts.toFreq, now + dur); }
+      bp.Q.value = opts.q || 0.7;
+      var g = ctx.createGain();
+      var peak = opts.gain != null ? opts.gain : 0.5;
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(peak, now + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      src.connect(bp); bp.connect(g); g.connect(master);
+      src.start(now); src.stop(now + dur + 0.02);
+    }
+
+    // ===== paleta de sons mapeada por evento =====
+    var sounds = {
+      // hero: colchetes travando — tick seco curtissimo
+      snap: function(){ tone({type:'triangle', freq:880, dur:0.035, attack:0.002, gain:0.5, lp:3200}); },
+      // crit coral: blip/pop satisfatorio, mais agudo
+      crit: function(){ tone({type:'sine', freq:1320, toFreq:1760, dur:0.05, attack:0.003, gain:0.55, lp:5000}); },
+      // transicao de tela: whoosh quase subliminar
+      transition: function(){ noiseBurst({freq:600, toFreq:1400, dur:0.11, q:0.6, gain:0.10, filter:'bandpass'}); },
+      // hover de botao: tick levissimo
+      hover: function(){ tone({type:'sine', freq:660, dur:0.025, attack:0.002, gain:0.18, lp:2600}); },
+      // click de botao: tick um pouco mais presente
+      click: function(){ tone({type:'triangle', freq:520, dur:0.04, attack:0.002, gain:0.42, lp:3000}); },
+      // shutter da captura: click seco + micro-swoosh (assinatura do app)
+      shutter: function(){
+        tone({type:'square', freq:1400, dur:0.018, attack:0.001, gain:0.35, lp:4200});
+        tone({type:'triangle', freq:300, dur:0.03, attack:0.001, gain:0.3, delay:0.012, lp:2000});
+        noiseBurst({freq:2600, toFreq:700, dur:0.11, q:0.5, gain:0.28, delay:0.02, filter:'bandpass'});
+      },
+      // toggle ligando: duas notas ascendentes (click positivo)
+      toggleOn: function(){
+        tone({type:'sine', freq:587, dur:0.05, attack:0.003, gain:0.4, lp:4000});           // D5
+        tone({type:'sine', freq:880, dur:0.07, attack:0.003, gain:0.45, delay:0.07, lp:4500}); // A5
+      },
+      // done: chime de conclusao — acorde suave 3 notas
+      done: function(){
+        tone({type:'sine', freq:659, dur:0.5, attack:0.01, gain:0.32, lp:5000});            // E5
+        tone({type:'sine', freq:880, dur:0.5, attack:0.01, gain:0.28, delay:0.06, lp:5000});  // A5
+        tone({type:'sine', freq:1175, dur:0.55, attack:0.012, gain:0.24, delay:0.13, lp:5500});// D6
+      }
+    };
+
+    function play(name, debounceMs){
+      if(!enabled || !ctx || ctx.state !== 'running') return;
+      var fn = sounds[name];
+      if(!fn) return;
+      if(debounceMs){
+        var now = performance.now();
+        if(lastPlay[name] && (now - lastPlay[name]) < debounceMs) return;
+        lastPlay[name] = now;
+      }
+      try{ fn(); }catch(e){ /* falha de audio nunca quebra a UI */ }
+    }
+
+    function setEnabled(v){
+      enabled = v;
+      localStorage.setItem('krit-sound', v ? 'on' : 'off');
+      if(v) unlock();
+    }
+    function isEnabled(){ return enabled; }
+
+    return { unlock:unlock, play:play, setEnabled:setEnabled, isEnabled:isEnabled };
+  })();
+
+  // ===== botao de som/mute (estado em localStorage) =====
+  var soundBtn = document.getElementById('sound-toggle');
+  function paintSoundBtn(){
+    var on = Audio.isEnabled();
+    soundBtn.classList.toggle('muted', !on);
+    soundBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    soundBtn.title = on ? 'Sound on' : 'Sound off';
+  }
+  soundBtn.addEventListener('click', function(e){
+    e.stopPropagation();
+    var on = !Audio.isEnabled();
+    Audio.setEnabled(on);
+    paintSoundBtn();
+    if(on) Audio.play('click'); // feedback ao religar
+  });
+  paintSoundBtn();
+
+  // ===== unlock do AudioContext no primeiro gesto (qualquer clique/tecla) =====
+  function firstGestureUnlock(){
+    Audio.unlock();
+    document.removeEventListener('pointerdown', firstGestureUnlock);
+    document.removeEventListener('keydown', firstGestureUnlock);
+  }
+  document.addEventListener('pointerdown', firstGestureUnlock);
+  document.addEventListener('keydown', firstGestureUnlock);
+
+  // ===== estado de navegacao =====
+  var screens = Array.prototype.slice.call(document.querySelectorAll('.screen'));
+  var TOTAL = screens.length;
+  var idx = 0;
+  var animating = false;
+
+  var dotsWrap = document.getElementById('dots');
+  var dots = [];
+  for(var i=0;i<TOTAL;i++){
+    var d = document.createElement('button');
+    d.className='dot'; d.setAttribute('aria-label','Screen '+(i+1));
+    (function(n){ d.addEventListener('click',function(){ goTo(n); }); })(i);
+    dotsWrap.appendChild(d); dots.push(d);
+  }
+
+  function paintDots(){
+    dots.forEach(function(d,i){
+      d.classList.remove('on','done');
+      if(i===idx) d.classList.add('on');
+      else if(i<idx) d.classList.add('done');
+    });
+  }
+
+  function goTo(n){
+    if(animating || n===idx || n<0 || n>=TOTAL) return;
+    animating = true;
+    Audio.play('transition');
+    var from = screens[idx];
+    var to = screens[n];
+    from.classList.add('exit-left');
+    from.classList.remove('active');
+    // reinicia animacoes da tela alvo removendo/recolocando a classe
+    to.classList.remove('active'); void to.offsetWidth;
+    to.classList.add('active');
+    setTimeout(function(){ from.classList.remove('exit-left'); animating=false; }, 560);
+    idx = n;
+    paintDots();
+    updateChrome();
+  }
+  function next(){ if(idx < TOTAL-1) goTo(idx+1); }
+  function prev(){ if(idx > 0) goTo(idx-1); }
+
+  function updateChrome(){
+    var nextBtn = document.getElementById('next');
+    var skipBtn = document.getElementById('skip');
+    // ultima tela: esconde "avancar" e troca "pular" por nada
+    nextBtn.style.visibility = (idx===TOTAL-1) ? 'hidden' : 'visible';
+    skipBtn.style.visibility = (idx===TOTAL-1) ? 'hidden' : 'visible';
+  }
+
+  // ===== bind navegacao =====
+  document.getElementById('next').addEventListener('click', next);
+  document.getElementById('skip').addEventListener('click', function(){ goTo(TOTAL-1); });
+  document.querySelectorAll('[data-go="next"]').forEach(function(b){ b.addEventListener('click', next); });
+
+  document.addEventListener('keydown', function(e){
+    if(e.key==='ArrowRight' || e.key==='Enter'){ next(); }
+    else if(e.key==='ArrowLeft'){ prev(); }
+    else if(e.key==='Escape'){ goTo(TOTAL-1); }
+  });
+
+  // ===== som de hover/click em controles interativos =====
+  // (delegacao: cobre botoes e dots; exclui o proprio botao de som)
+  function isControl(el){
+    return el && el.closest && el.closest('.btn, .next, .skip, .dot, #try-shortcut') && !el.closest('#sound-toggle');
+  }
+  document.addEventListener('pointerover', function(e){
+    if(isControl(e.target)) Audio.play('hover', 80); // debounce 80ms
+  });
+  document.addEventListener('pointerdown', function(e){
+    if(isControl(e.target)) Audio.play('click', 40);
+  });
+
+  // ===== hero: som sincronizado com as keyframes de snap e crit =====
+  // 'snap' = micro-snap quando os colchetes travam; 'critPulse' = pulso coral.
+  var heroSymbol = document.querySelector('#s-hero .notch');
+  var heroDot = document.querySelector('#s-hero .dot-rec');
+  if(heroSymbol){
+    heroSymbol.addEventListener('animationstart', function(e){
+      if(e.animationName === 'snap') Audio.play('snap');
+    });
+  }
+  if(heroDot){
+    heroDot.addEventListener('animationstart', function(e){
+      if(e.animationName === 'critPulse') Audio.play('crit');
+    });
+  }
+
+  // ===== permissao: som quando o toggle anima pra ligado =====
+  var permToggle = document.querySelector('#s-perm .toggle');
+  if(permToggle){
+    permToggle.addEventListener('animationstart', function(e){
+      if(e.animationName === 'toggleOn') Audio.play('toggleOn');
+    });
+  }
+
+  // ===== done: chime quando a tela final entra =====
+  var doneObs = new MutationObserver(function(){
+    if(document.getElementById('s-done').classList.contains('active')){
+      // pequeno atraso pra casar com o rise do simbolo
+      setTimeout(function(){ Audio.play('done'); }, 200);
+    }
+  });
+  doneObs.observe(document.getElementById('s-done'), {attributes:true, attributeFilter:['class']});
+
+  // ===== tela 4: animacao de tecla pressionada + flash =====
+  function fireShortcut(){
+    var keys = document.querySelectorAll('#kbdrow .kbd');
+    keys.forEach(function(k,i){
+      setTimeout(function(){
+        k.classList.add('press');
+        setTimeout(function(){ k.classList.remove('press'); }, 140);
+      }, i*90);
+    });
+    // flash + frame depois das 3 teclas
+    setTimeout(function(){
+      var f = document.getElementById('flash');
+      var cf = document.getElementById('capframe');
+      f.classList.remove('fire'); cf.classList.remove('fire'); void f.offsetWidth;
+      f.classList.add('fire'); cf.classList.add('fire');
+      Audio.play('shutter'); // assinatura sonora do app capturando
+      setTimeout(function(){ f.classList.remove('fire'); cf.classList.remove('fire'); }, 520);
+    }, 300);
+  }
+  document.getElementById('try-shortcut').addEventListener('click', fireShortcut);
+
+  // dispara o atalho automaticamente ao entrar na tela 4 (uma vez)
+  var shortcutDemoed = false;
+  var obs = new MutationObserver(function(){
+    var sc = document.getElementById('s-shortcut');
+    if(sc.classList.contains('active') && !shortcutDemoed){
+      shortcutDemoed = true;
+      setTimeout(fireShortcut, 700);
+    }
+  });
+  obs.observe(document.getElementById('s-shortcut'), {attributes:true, attributeFilter:['class']});
+
+  // ===== CTA final (placeholder no prototipo) =====
+  document.getElementById('finish-btn').addEventListener('click', function(){
+    this.textContent = 'KRIT ready';
+    this.disabled = true;
+    this.style.opacity = .8;
+  });
+
+  paintDots();
+  updateChrome();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,76 @@
+/* KRIT global base. Tokens (CSS vars) are imported in main.tsx straight
+   from packages/tokens, the single source of truth. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-void);
+  color: var(--color-text-hi);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* no accidental selection in the UI; the canvas owns its own */
+  user-select: none;
+  overflow: hidden;
+}
+
+h1,
+h2,
+h3,
+.mono,
+kbd {
+  font-family: var(--font-display);
+  font-weight: 600;
+}
+
+kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  font-size: 11px;
+  color: var(--color-text-lo);
+  background: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* Visible focus: blue double-ring (ice). Accessible without visual noise. */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--elevation-focus);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: var(--radius-pill);
+  border: 2px solid var(--color-void);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

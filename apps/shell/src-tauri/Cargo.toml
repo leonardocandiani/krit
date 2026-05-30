@@ -1,0 +1,26 @@
+[package]
+name = "krit"
+version = "0.1.0"
+description = "KRIT — screenshot and annotation for macOS"
+authors = ["Leonardo Candiani"]
+edition = "2021"
+
+[lib]
+# The `_lib` suffix avoids a lib/bin name clash on Windows.
+# See https://github.com/rust-lang/cargo/issues/8519
+name = "krit_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
