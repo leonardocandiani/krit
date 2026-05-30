@@ -69,11 +69,15 @@ final class CaptureEngine {
         var result: [CGDirectDisplayID: DisplayFreeze] = [:]
 
         for display in content.displays {
-            let cgImage = try await screenshot(of: display)
-
             let screen = nsScreen(for: display.displayID)
             let frame = screen?.frame ?? CGRect(x: 0, y: 0, width: display.width, height: display.height)
             let scale = screen?.backingScaleFactor ?? 1.0
+
+            // Capture at native pixel resolution: SCDisplay width/height are in
+            // POINTS, so we multiply by the backing scale. Without this the
+            // image comes out at point resolution and any later crop that
+            // assumes pixels lands on the wrong area.
+            let cgImage = try await screenshot(of: display, scale: scale)
 
             result[display.displayID] = DisplayFreeze(
                 display: display,
@@ -96,13 +100,13 @@ final class CaptureEngine {
     /// macOS 14+: uses `SCScreenshotManager.captureImage` (preferred path).
     /// macOS 13: falls back to `CGDisplayCreateImage` (deprecated in 14+ but functional;
     /// also requires Screen Recording permission).
-    private func screenshot(of display: SCDisplay) async throws -> CGImage {
+    private func screenshot(of display: SCDisplay, scale: CGFloat) async throws -> CGImage {
         if #available(macOS 14.0, *) {
             let filter = SCContentFilter(display: display, excludingWindows: [])
             let config = SCStreamConfiguration()
-            // Native resolution (pixels), not points.
-            config.width = display.width
-            config.height = display.height
+            // display.width/height are points; multiply by scale for native pixels.
+            config.width = Int((CGFloat(display.width) * scale).rounded())
+            config.height = Int((CGFloat(display.height) * scale).rounded())
             config.showsCursor = false
             config.scalesToFit = false
             return try await SCScreenshotManager.captureImage(
@@ -173,13 +177,16 @@ final class CaptureEngine {
         let displayHeightPts = freeze.frame.height
         let localTopY = displayHeightPts - (localBottomY + normalized.height)
 
-        // 3. Points -> pixels.
-        let scale = freeze.scale
+        // 3. Points -> pixels. Derive the factor from the image itself
+        //    (image pixels per frame point) instead of trusting backingScaleFactor,
+        //    so it's correct whether the freeze was captured in points or pixels.
+        let scaleX = CGFloat(freeze.image.width) / freeze.frame.width
+        let scaleY = CGFloat(freeze.image.height) / freeze.frame.height
         var pxRect = CGRect(
-            x: localX * scale,
-            y: localTopY * scale,
-            width: normalized.width * scale,
-            height: normalized.height * scale
+            x: localX * scaleX,
+            y: localTopY * scaleY,
+            width: normalized.width * scaleX,
+            height: normalized.height * scaleY
         ).integral
 
         // 4. Clamp to image bounds.

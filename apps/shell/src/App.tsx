@@ -53,18 +53,13 @@ export default function App() {
     window.setTimeout(() => setStatus(null), 1800);
   }, []);
 
-  // App launch chime. Browsers gate audio behind a user gesture, so the
-  // context is unlocked on the first interaction and the launch cue plays then.
-  // Skipped during onboarding — that flow owns the launch cue.
+  // Warm the audio context on the first gesture so copy/save/etc. cues are
+  // instant. The launch chime is NOT played here — it belongs to onboarding
+  // only; playing it on every editor open is intrusive.
   useEffect(() => {
     if (onboarding) return;
-    let played = false;
     function onFirstGesture() {
       unlockAudio();
-      if (!played) {
-        played = true;
-        void playSound("launch");
-      }
       window.removeEventListener("pointerdown", onFirstGesture);
       window.removeEventListener("keydown", onFirstGesture);
     }
