@@ -992,7 +992,13 @@ final class CaptureEngine {
             // shadow region with black; a clear color keeps them transparent so
             // the editor composites the window over its generated background.
             config.backgroundColor = .clear
-            config.ignoreShadowsSingleWindow = false
+            // Drop the native window shadow from the grab. The buffer is sized
+            // from window.frame, which does NOT include the shadow margin: with
+            // the shadow kept, SCK shrinks the window to fit window+shadow into
+            // the buffer and the clipped shadow halo composes as a ghost rounded
+            // rect around every supersampled window shot ("invisible border").
+            // The template draws its own shadow, so the native one only doubles.
+            config.ignoreShadowsSingleWindow = true
 
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
             return Self.nsImage(from: cgImage, logicalSize: logicalSize)

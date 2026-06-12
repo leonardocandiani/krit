@@ -79,6 +79,7 @@ final class UITestRunner: NSObject {
             case "capture-scale": report = await Self.runCaptureScaleSuite()
             case "chooser-visual": report = await Self.runChooserVisual()
             case "compose-scale": report = await Self.runComposeScaleSuite()
+            case "wallpaper-dump": report = await Self.runWallpaperDump()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -548,9 +549,21 @@ final class UITestRunner: NSObject {
             }
         }
         // Stage 1: the raw grab.
+        var insetPass = false
         if let rawCG = image.bestCGImage {
             savePNG(rawCG, "raw")
             r["rawPixels"] = ["w": rawCG.width, "h": rawCG.height]
+            // The window content must reach (almost) the buffer edges. A large
+            // inset means SCK shrank the window to fit the native shadow into
+            // the buffer, the clipped halo that composed as the ghost rounded
+            // rect around window shots ("invisible border" bug).
+            if let insets = opaqueContentInsets(rawCG) {
+                r["contentInsets"] = ["l": insets.l, "r": insets.r, "t": insets.t, "b": insets.b]
+                let maxInset = max(insets.l, insets.r, insets.t, insets.b)
+                let tolerance = Int(Double(max(rawCG.width, rawCG.height)) * 0.02)
+                insetPass = maxInset <= tolerance
+                r["contentInsetPass"] = insetPass
+            }
         }
         r["rawPointSize"] = ["w": image.size.width, "h": image.size.height]
 
@@ -644,7 +657,72 @@ final class UITestRunner: NSObject {
         ctrl.uiTestClose()
         r["fullFlowMatch"] = fullMatch
 
-        r["allPass"] = (r["routesMatch"] as? Bool ?? false) && realMatch && fullMatch
+        r["allPass"] = (r["routesMatch"] as? Bool ?? false) && realMatch && fullMatch && insetPass
+        return r
+    }
+
+    /// Distance from each buffer edge to the first nearly-opaque pixel, sampled
+    /// along the middle row/column. Cheap proxy for "does the window content
+    /// fill the buffer" (native-shadow margins show up as large insets).
+    private static func opaqueContentInsets(_ cg: CGImage) -> (l: Int, r: Int, t: Int, b: Int)? {
+        let w = cg.width, h = cg.height
+        guard w > 4, h > 4,
+              let data = cg.dataProvider?.data,
+              let ptr = CFDataGetBytePtr(data) else { return nil }
+        let bpr = cg.bytesPerRow
+        let bpp = cg.bitsPerPixel / 8
+        guard bpp >= 4 else { return nil }
+        // Alpha byte position depends on BOTH alphaInfo and byte order: SCK
+        // frames are typically BGRA in memory (alpha-first + 32-bit little),
+        // which puts the alpha byte LAST despite the "first" alpha info.
+        let alphaInfo = cg.alphaInfo
+        let alphaFirst = alphaInfo == .premultipliedFirst || alphaInfo == .first
+        let littleEndian = cg.bitmapInfo.contains(.byteOrder32Little)
+        let alphaOffset = (alphaFirst != littleEndian) ? 0 : 3
+        func alpha(_ x: Int, _ y: Int) -> UInt8 { ptr[y * bpr + x * bpp + alphaOffset] }
+        let midY = h / 2, midX = w / 2
+        var left = w, right = w, top = h, bottom = h
+        for x in 0..<w where alpha(x, midY) > 250 { left = x; break }
+        for x in stride(from: w - 1, through: 0, by: -1) where alpha(x, midY) > 250 { right = w - 1 - x; break }
+        for y in 0..<h where alpha(midX, y) > 250 { top = y; break }
+        for y in stride(from: h - 1, through: 0, by: -1) where alpha(midX, y) > 250 { bottom = h - 1 - y; break }
+        return (left, right, top, bottom)
+    }
+
+    /// Dumps the live wallpaper cache: the JPEG the compose path would use RIGHT
+    /// NOW (pre), then a fresh grab and its result (post). Lets the visual gate
+    /// see exactly what background a window shot composes over, separating a
+    /// poisoned grab (ghost in the cache) from a compose-side artifact.
+    private static func runWallpaperDump() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard #available(macOS 14.0, *) else {
+            r["skipped"] = "needs macOS 14+"; r["allPass"] = false; return r
+        }
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main ?? NSScreen.screens[0]
+        try? FileManager.default.createDirectory(atPath: "/tmp/krit-wallpaper", withIntermediateDirectories: true)
+
+        if let pre = SystemWallpaperSource.cachedCurrentWallpaperData(for: screen) {
+            try? pre.write(to: URL(fileURLWithPath: "/tmp/krit-wallpaper/cache-pre.jpg"))
+            r["preCache"] = "/tmp/krit-wallpaper/cache-pre.jpg"
+        } else {
+            r["preCache"] = "empty"
+        }
+
+        await SystemWallpaperSource.refreshCurrentWallpaper(for: screen)
+        r["grab"] = SystemWallpaperSource.uiTestLastWallpaperGrab
+        r["grabDetail"] = SystemWallpaperSource.uiTestLastWallpaperGrabDetail
+
+        if let post = SystemWallpaperSource.cachedCurrentWallpaperData(for: screen) {
+            try? post.write(to: URL(fileURLWithPath: "/tmp/krit-wallpaper/cache-post.jpg"))
+            r["postCache"] = "/tmp/krit-wallpaper/cache-post.jpg"
+        } else {
+            r["postCache"] = "empty"
+        }
+        // Diagnostic scenario: an empty cache is a finding (the live grab can
+        // legitimately fail and fall back to desktopImageURL), not a harness
+        // failure. The grab/grabDetail fields carry the actual story.
+        r["allPass"] = true
         return r
     }
 
