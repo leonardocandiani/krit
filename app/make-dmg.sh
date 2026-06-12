@@ -24,7 +24,9 @@ if [ ! -d "$APP_PATH" ]; then
 fi
 
 RW_DMG_PATH="$SCRIPT_DIR/rw.$$.$DMG_NAME.dmg"
-MOUNT_DIR="$(mktemp -d "$SCRIPT_DIR/dmg-mount.XXXXXX")"
+# Mount point must live on the system volume: hdiutil attach refuses custom
+# mountpoints inside external volumes ("attach failed - Permission denied").
+MOUNT_DIR="$(mktemp -d -t krit-dmg-mount)"
 cleanup() {
     if mount | grep -q "on $MOUNT_DIR "; then
         hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1 || hdiutil detach -force "$MOUNT_DIR" >/dev/null 2>&1 || true
