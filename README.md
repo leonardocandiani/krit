@@ -1,142 +1,132 @@
 <div align="center">
 
-<img src="assets/brand/og-image.png" alt="KRIT — Capture. Annotate. One shortcut." width="640" />
+<h1>KRIT</h1>
+
+<p><strong>Native macOS screenshot studio. Capture, annotate, record, all from the menu bar.</strong></p>
+
+<p>
+  Built with
+  <a href="https://developer.apple.com/documentation/appkit">AppKit</a>,
+  <a href="https://developer.apple.com/xcode/swiftui/">SwiftUI</a>,
+  <a href="https://developer.apple.com/documentation/screencapturekit">ScreenCaptureKit</a>, and
+  <a href="https://developer.apple.com/documentation/vision">Vision</a>.
+</p>
+
+<p>
+  <a href="#features">Features</a> •
+  <a href="#install">Install</a> •
+  <a href="#shortcuts">Shortcuts</a> •
+  <a href="#automation">Automation</a> •
+  <a href="#build-from-source">Build</a> •
+  <a href="#permissions">Permissions</a> •
+  <a href="#acknowledgments">Acknowledgments</a> •
+  <a href="#license">License</a>
+</p>
+
+<p>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg" /></a>
+  <img alt="Platform: macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-black.svg" />
+  <a href="https://github.com/leonardocandiani/krit/releases"><img alt="Release" src="https://img.shields.io/github/v/release/leonardocandiani/krit?display_name=tag" /></a>
+</p>
 
 <br />
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-FF7847.svg)](LICENSE)
-![Platform: macOS 13+](https://img.shields.io/badge/macOS-13%2B-0B0C0E.svg)
-![Status: early](https://img.shields.io/badge/status-v0.1%20%C2%B7%20early-8A9099.svg)
-
-A native screenshot and markup tool for macOS. Open source, no account, no upload.
+<img src="app/assets/screenshots/hero-window-shot.png" alt="KRIT editor with a window shot composed over the desktop wallpaper" width="820" />
 
 </div>
 
----
+KRIT takes a shot, drops you into an editor, and stays out of the way. It runs
+from the menu bar, has no account and no cloud, and nothing you capture leaves
+your Mac. The capture path is native Swift on ScreenCaptureKit, the editor is
+AppKit, and the whole app ships as a single bundle with a command line tool and
+an MCP server for AI agents.
 
-KRIT takes a shot, drops you into an editor, and gets out of the way. Press a
-shortcut, drag a region, mark it up, copy it. The capture path is native Swift;
-the editor is a Tauri + React app. Nothing you capture leaves your machine.
+## Features
 
-It's free and MIT-licensed. Screen recording is on the roadmap, not in this
-release — see [Status](#status).
-
-<div align="center">
-<img src="docs/screenshots/onboarding.png" alt="KRIT first run" width="49%" />
-<img src="docs/screenshots/editor.png" alt="KRIT editor" width="49%" />
-</div>
-
-## What it does
-
-- **Snap** — region or full screen from a global shortcut. The screen freezes
-  the instant you trigger, so a hover state or open menu stays put while you select.
-- **Markup** — arrow, rectangle, ellipse, line, text, blur, crop. Eight tools,
-  keyboard-driven, with undo/redo.
-- **Copy / Save** — full-resolution PNG to the clipboard or disk. No re-encode,
-  no quality loss.
-- **Menu bar** — KRIT lives in the menu bar, not the Dock. One icon, one menu.
-- **Quiet by default** — a few UI sounds you can mute, and one accent color. It
-  doesn't nag you with badges or upsells.
+- **Screenshot**: area, window (isolated through ScreenCaptureKit and composed over the real wallpaper with a shadow), and fullscreen capture. Capture quality is configurable (Standard, High 2x, Maximum 3x supersampling), with an optional countdown before the shot.
+- **All-in-One**: one shortcut opens a radial panel to pick any capture or recording mode on the spot.
+- **Scrolling capture**: stitch a long page or list into a single tall image.
+- **Snap & Paste**: capture and drop the result straight into the app you were using.
+- **Read the screen**: pull text out of any capture with OCR, or decode a QR code in frame.
+- **Annotation editor**: a two-band toolbar (CleanShot style) with a contextual properties bar per tool. Arrows, rectangles, ellipses, lines, freehand, rich text with style presets and backplates, numbered steps, and a highlighter that snaps onto detected text lines.
+- **Redaction**: blur and pixelate, an irreversible Secure Blur that bakes a mosaic under the gaussian pass, and Smart Redact that finds emails, keys, and card numbers and proposes the boxes for you.
+- **Editing**: crop with contextual Cancel/Apply, full zoom and pan (Cmd+scroll, pinch, Space+drag, Cmd+0), undo/redo, duplicate, and arrow-key nudge.
+- **Backgrounds**: drop a capture onto gradient, wallpaper, or solid backgrounds with padding, inset, corner radius, shadow, and aspect ratio controls, plus reusable presets.
+- **Color picker**: a saturation/brightness field with a draggable favorites strip you can reorder and prune.
+- **Screen recording**: record the screen, a window, or an area to MP4 or GIF, with system audio and microphone, a floating camera bubble, mouse click highlights, and a keystroke overlay. Trim and convert the clip after you stop.
+- **Quick Access**: a floating card after every capture. Drag it out to drop the file into an app, drag it down to stash it, or fling it off the anchor line to delete.
+- **Preview and pin**: hit Space to Quick Look a shot, or pin it to the desktop so it floats on top while you work.
+- **History**: a floating panel and full browser of recent screenshots, videos, and GIFs, with type and time filters, badges, and restore back into the editor.
+- **Native feel**: lives in the menu bar (no Dock icon), Liquid Glass surfaces on macOS 26 and later with a blur fallback below, and light, dark, or system appearance.
 
 ## Install
 
-KRIT is distributed unsigned (no paid Apple Developer account yet), so macOS
-will quarantine it on first open. Two steps:
+> Requires **macOS 13.0** (Ventura) or later.
 
-1. Download `KRIT_0.1.0_aarch64.dmg` from the
-   [latest release](https://github.com/leonardocandiani/krit/releases/latest)
-   and drag KRIT to Applications.
-2. Clear the quarantine flag so Gatekeeper lets it run:
+### Homebrew
 
-   ```sh
+```bash
+brew tap leonardocandiani/krit https://github.com/leonardocandiani/krit
+brew install --cask krit
+```
+
+### Shell script
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/main/install.sh | bash
+```
+
+### Download a release
+
+1. Go to [Releases](https://github.com/leonardocandiani/krit/releases) and download `KRIT-v<version>-macOS.dmg`.
+2. Open the DMG and drag **KRIT** to Applications.
+3. Clear the quarantine flag so Gatekeeper lets it run:
+
+   ```bash
    xattr -dr com.apple.quarantine /Applications/KRIT.app
    ```
 
-On first launch, KRIT asks for **Screen Recording** permission — macOS requires
-it for any app that reads the screen. Grant it in System Settings › Privacy &
-Security › Screen Recording, then reopen KRIT.
-
-## Build from source
-
-You need Xcode 15+, Rust, and [Bun](https://bun.sh).
-
-```sh
-git clone https://github.com/leonardocandiani/krit.git
-cd krit
-
-# 1. design tokens -> CSS
-cd packages/tokens && bun install && bun run build && cd -
-
-# 2. native capture helper (Swift)
-cd apps/helper
-swift build -c release --build-path /tmp/krit-build
-./scripts/make-app.sh /tmp/krit-build release
-cd -
-
-# 3. the app (bundles the helper, outputs a .dmg)
-cd apps/shell
-bun install
-bun run tauri build
-```
-
-The `.dmg` and `.app` land in `apps/shell/src-tauri/target/release/bundle/`.
+KRIT is not notarized yet (no paid Apple Developer account), so macOS quarantines
+it on first open. The `xattr` step above removes that flag. Without it, macOS
+shows an "unidentified developer" warning and refuses to launch.
 
 ## Shortcuts
 
-| Shortcut | Action |
+Every global shortcut is rebindable in Preferences. These are the defaults.
+
+| Action | Shortcut |
 | --- | --- |
-| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>4</kbd> | Snap a region |
-| <kbd>⇧</kbd><kbd>⌘</kbd><kbd>3</kbd> | Snap the full screen |
-| <kbd>⌘</kbd><kbd>C</kbd> | Copy to clipboard |
-| <kbd>⌘</kbd><kbd>S</kbd> | Save as PNG |
-| <kbd>⌘</kbd><kbd>Z</kbd> / <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd> | Undo / redo |
-| <kbd>V A R E L T B C</kbd> | Select tool by letter |
+| Area screenshot | <kbd>⇧⌘4</kbd> |
+| Window screenshot | <kbd>⇧⌘5</kbd> |
+| Fullscreen screenshot | <kbd>⇧⌘3</kbd> |
+| Capture previous area | <kbd>⇧⌘7</kbd> |
+| All-in-One | <kbd>⇧⌘A</kbd> |
+| Snap & Paste | <kbd>⇧⌘P</kbd> |
+| Screen recording | <kbd>⇧⌘6</kbd> |
+| OCR (capture text) | <kbd>⇧⌘O</kbd> |
+| Scrolling capture | <kbd>⇧⌘S</kbd> |
+| Capture history | <kbd>⇧⌘H</kbd> |
 
-## How it works
+In the editor, tools are one key each: <kbd>V</kbd> select, <kbd>A</kbd> arrow,
+<kbd>R</kbd> rectangle, <kbd>E</kbd> ellipse, <kbd>L</kbd> line, <kbd>D</kbd>
+freehand, <kbd>T</kbd> text, <kbd>N</kbd> numbered steps, <kbd>H</kbd>
+highlighter, <kbd>B</kbd> blur, <kbd>P</kbd> pixelate, <kbd>C</kbd> crop.
 
-KRIT is split along the line that matters for performance: pixels stay native,
-everything else is TypeScript.
+## Automation
 
-- **`apps/helper`** — a Swift agent (`LSUIElement`) that owns the hot path:
-  global hotkeys, the freeze-frame snapshot, the AppKit selection overlay, and
-  the crop. It captures via ScreenCaptureKit and writes a PNG. Captured frames
-  never cross the IPC boundary — only the file path does.
-- **`apps/shell`** — a Tauri 2 + React app holding the Konva annotation editor,
-  the menu-bar tray, and export. It launches the helper one-shot and opens the
-  result.
-- **`packages/tokens`** — one JSON design source compiled by Style Dictionary
-  into CSS variables (web) and Swift (native), so both halves share one palette.
+KRIT ships a command line tool and an MCP server inside the bundle, so agents
+and scripts can capture and read the screen without leaving the app. Both talk
+to the running app, so captures reuse KRIT's Screen Recording permission and
+annotation runs headless.
 
-## Status
+### CLI
 
-This is **v0.1** — still capture and annotation, built in the open.
-
-| | KRIT v0.1 | CleanShot X | Cap |
-| --- | :---: | :---: | :---: |
-| Region & screen capture | ✅ | ✅ | ✅ |
-| Annotation editor | ✅ | ✅ | — |
-| Copy / save full-res | ✅ | ✅ | ✅ |
-| Screen recording | roadmap | ✅ | ✅ |
-| OCR / grab text | roadmap | ✅ | — |
-| Scrolling capture | roadmap | ✅ | — |
-| Cloud upload | not planned | ✅ | ✅ |
-| Price | free | paid | freemium |
-| Open source | ✅ | — | ✅ |
-
-KRIT reimplements features from scratch. It shares no code, assets, or branding
-with CleanShot X or Cap. The table is a comparison, not a lineage.
-
-## Automation (CLI for agents and scripts)
-
-KRIT ships a command line tool at `KRIT.app/Contents/Helpers/krit`. It talks to
-the running app, so captures reuse KRIT's Screen Recording permission, and
-annotation runs headless. Output is a single JSON line per command, which makes
-it directly usable from agents like Claude Code:
+The binary lives at `KRIT.app/Contents/Helpers/krit`.
 
 ```bash
 KRIT=/Applications/KRIT.app/Contents/Helpers/krit
 
-# Capture a region (top-left origin, points) or the full screen
+# Capture a region (global top-left origin, points) or the full screen
 $KRIT capture --region 300,200,800,500 --out shot.png
 $KRIT capture --fullscreen --out screen.png
 
@@ -148,24 +138,63 @@ $KRIT annotate --in shot.png --out annotated.png --spec '[
   {"type":"step","at":[80,100],"number":1},
   {"type":"blur","rect":[900,600,300,200]}
 ]'
+
+# Read the accessibility tree of the frontmost window
+$KRIT inspect
 ```
 
-Spec types: `arrow`, `box`, `ellipse`, `line`, `text`, `step`, `highlight`,
-`blur`, `pixelate`. Errors come back as `{"ok":false,"error":...,"code":...}`
-with a non-zero exit code.
+Each command prints a single JSON line. Errors come back as
+`{"ok":false,"error":...,"code":...}` with a non-zero exit code.
 
-## Roadmap
+### MCP server
 
-- **v0.1** — region/screen capture + annotation editor *(now)*
-- **v0.2** — full annotation set, OCR (grab text), capture history
-- **v0.3** — screen recording (video + audio)
-- **v0.4** — scrolling capture
-- **v1.0** — Homebrew, polish, signed builds
+`krit mcp` runs a JSON-RPC MCP server over stdin/stdout, so an agent like Claude
+Code can capture and read the screen in one call. Tools: `capture_region`,
+`capture_fullscreen`, `annotate_image`, `capture_and_read` (captures, then OCRs
+the result locally with Vision), and `inspect_ui`.
 
-## Contributing
+## Build from source
 
-Issues and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout,
-build steps, and the one rule that matters: original code and assets only.
+You need Xcode 15 or later (Swift 5.9+) on macOS 13 or later.
+
+```bash
+git clone https://github.com/leonardocandiani/krit.git
+cd krit/app
+
+# Build the app and the krit CLI, assemble and sign the bundle, copy to /Applications
+./build-app.sh
+```
+
+To build the targets by hand:
+
+```bash
+cd app
+swift build -c release --product KritApp   # the menu-bar app
+swift build -c release --product krit       # the CLI / MCP binary
+```
+
+`build-app.sh` builds both targets into separate paths (the `krit` CLI and the
+`KritApp` binary would otherwise collide on a case-insensitive volume),
+assembles the `.app`, ad-hoc signs it, and installs it. To package a DMG, run
+`./make-dmg.sh` afterward.
+
+## Permissions
+
+- **Screen Recording** (required): macOS gates every screen read behind it. KRIT asks on first launch. Grant it in System Settings › Privacy & Security › Screen Recording, then reopen KRIT.
+- **Accessibility** (optional): needed for Snap & Paste (it synthesizes the paste keystroke) and for the click and keystroke overlay during recording.
+- **Microphone / Camera** (optional): only when you enable microphone audio or the camera bubble for a recording.
+
+KRIT runs without the App Sandbox, sends no telemetry, and makes no network
+requests of its own. Everything stays on disk in `~/Pictures/KRIT`.
+
+## Acknowledgments
+
+KRIT is inspired by [CleanShot X](https://cleanshot.com/) and reimplements its
+ideas from scratch in native Swift. The editor's two-band toolbar and several
+interaction patterns were studied against [Snapzy](https://github.com/duongductrong/Snapzy),
+an open source (BSD-3) take on the same space. KRIT also draws on
+[Shotnix](https://github.com/OMARVII/Shotnix) (MIT). Third-party dependencies
+are listed in [THIRD_PARTY_NOTICES.md](app/THIRD_PARTY_NOTICES.md).
 
 ## License
 

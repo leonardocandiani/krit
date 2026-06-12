@@ -1046,6 +1046,17 @@ final class AnnotationCanvas: NSView {
 
     // MARK: - Mouse
 
+    /// Preview mode (Snapzy editor-mode toggle): the canvas turns read-only.
+    /// Editing clicks are swallowed; zoom (pinch, Cmd+scroll, shortcuts) and
+    /// Space-drag pan stay live so the user can still inspect the result.
+    var isPreviewMode = false {
+        didSet {
+            guard isPreviewMode != oldValue else { return }
+            if isPreviewMode { setSelection([]) }
+            setNeedsDisplay(bounds)
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         lastEventModifiers = event.modifierFlags
 
@@ -1054,6 +1065,9 @@ final class AnnotationCanvas: NSView {
             panAnchor = event.locationInWindow
             return
         }
+
+        // Read-only in preview: no selection, creation or editing from clicks.
+        if isPreviewMode { return }
 
         let point = convert(event.locationInWindow, from: nil)
 

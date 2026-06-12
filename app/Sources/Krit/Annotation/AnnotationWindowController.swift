@@ -459,6 +459,14 @@ final class AnnotationWindowController: NSWindowController {
             let level = self.canvas.fitToWindow()
             self.bottomBar?.setZoomLabel(for: level)
         }
+        bar.onPreviewModeChanged = { [weak self] preview in
+            guard let self else { return }
+            self.toolbar.setPreviewMode(preview)
+            self.canvas.isPreviewMode = preview
+            // Preview means "what exports": close the background sidebar if open
+            // so nothing editorial frames the result.
+            if preview, self.sidebarVisible { self.toggleBackgroundSidebar() }
+        }
         bar.onRequestDragImage = { [weak self] in self?.exportImage() }
         bar.onDragDelivered = { [weak self] in self?.window?.close() }
         bar.onShare = { [weak self] in self?.shareFromBottomBar() }
@@ -1325,6 +1333,8 @@ final class AnnotationToolbar: NSView {
     private var contextWidthRow: NSView?
     private var contextFontRow: NSView?
     private var secureBlurButton: NSButton?
+    private var toolStripView: NSView?
+    private var headerDivider: NSView?
     /// The leading canvas group (crop · background · redact). Held so buildUI can
     /// set the post-group spacing against a stable view instead of guessing.
     private var canvasGroup: NSView?
@@ -1370,7 +1380,9 @@ final class AnnotationToolbar: NSView {
         // smart redact, bordered chrome buttons like CleanShot's leading group.
         appendCanvasGroup(to: main)
         if let group = canvasGroup { main.setCustomSpacing(10, after: group) }
-        main.addArrangedSubview(makeHeaderDivider())
+        let leadingDivider = makeHeaderDivider()
+        main.addArrangedSubview(leadingDivider)
+        headerDivider = leadingDivider
 
         // Tool strip: one flat button per tool (bare glyph when inactive, a mono
         // pad behind the selected one), in the CleanShot order.
@@ -1379,6 +1391,7 @@ final class AnnotationToolbar: NSView {
             .text, .pixelate, .blur, .numberedStep, .freehand, .highlighter,
         ])
         main.addArrangedSubview(strip)
+        toolStripView = strip
 
         // Flexible gap: this is the band's shock absorber. It has no minimum
         // beyond a hair of breathing room and zero hugging, so the band tracks
@@ -1767,6 +1780,20 @@ final class AnnotationToolbar: NSView {
         }
     }
 
+    /// Preview mode (the Snapzy editor-mode toggle): hides every editing
+    /// control in both bands, keeping only Save as/Done, so the header reads
+    /// as plain chrome while the user inspects the final result.
+    func setPreviewMode(_ on: Bool) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            context.allowsImplicitAnimation = true
+            canvasGroup?.animator().isHidden = on
+            headerDivider?.animator().isHidden = on
+            toolStripView?.animator().isHidden = on
+            propertiesStack?.animator().isHidden = on
+        }
+    }
+
     /// Contextual action slot: while a crop region is staged, Save as/Done fade
     /// out and Cancel/Apply fade in (NSStackView collapses the hidden pair).
     func setCropApplyVisible(_ visible: Bool) {
@@ -2080,8 +2107,12 @@ final class EditorBottomBar: NSView {
     var onShare: (() -> Void)?
     var onPin: (() -> Void)?
     var onCopy: (() -> Void)?
+    /// Fired when the Annotate/Preview segmented control flips (the Snapzy
+    /// editor-mode toggle). true = preview (editing chrome hidden).
+    var onPreviewModeChanged: ((Bool) -> Void)?
 
     private let zoomPopup = NSPopUpButton()
+    private let modeControl = NSSegmentedControl(labels: ["Annotate", "Preview"], trackingMode: .selectOne, target: nil, action: nil)
     private var shareButton: NSButton?
     private var sharePicker: NSSharingServicePicker?
     private var dragPill: BottomBarDragPill?
@@ -2120,6 +2151,20 @@ final class EditorBottomBar: NSView {
             zoomPopup.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             zoomPopup.centerYAnchor.constraint(equalTo: centerYAnchor),
             zoomPopup.widthAnchor.constraint(equalToConstant: 88),
+        ])
+
+        // Annotate/Preview mode toggle beside the zoom popup (Snapzy's editor
+        // mode switch). Preview hides every piece of editing chrome so the user
+        // sees exactly what exports.
+        modeControl.target = self
+        modeControl.action = #selector(modeChanged(_:))
+        modeControl.selectedSegment = 0
+        modeControl.controlSize = .regular
+        modeControl.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(modeControl)
+        NSLayoutConstraint.activate([
+            modeControl.leadingAnchor.constraint(equalTo: zoomPopup.trailingAnchor, constant: 10),
+            modeControl.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
 
         // Center: Drag me pill. Degrades gracefully when the window narrows
@@ -2162,10 +2207,14 @@ final class EditorBottomBar: NSView {
     /// Measures the real central slack between the zoom popup (left zone) and
     /// the action cluster (right zone) and degrades the centered drag pill:
     /// full label, grip only, or gone. The Snapzy footer pattern, in AppKit.
+    @objc private func modeChanged(_ sender: NSSegmentedControl) {
+        onPreviewModeChanged?(sender.selectedSegment == 1)
+    }
+
     override func layout() {
         super.layout()
         guard let pill = dragPill else { return }
-        let leftEdge = zoomPopup.frame.maxX
+        let leftEdge = max(zoomPopup.frame.maxX, modeControl.frame.maxX)
         let rightEdge = actionCluster?.frame.minX ?? bounds.maxX
         let margin: CGFloat = 12   // breathing room on each side of the pill
         // The pill is pinned to centerX, so its usable half-slack is limited by
