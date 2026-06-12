@@ -544,9 +544,10 @@ private final class QuickAccessWindow: NSWindow {
     private func updateHoverFocus(_ inside: Bool) {
         let owns = inside && cursorOwnsThisCard()
         setHovered(owns)
-        // P1: the Space hint pill follows hover; the big companion preview closes
-        // the moment the cursor leaves this card (toggle parity with the reference).
-        setSpaceHintVisible(owns)
+        // The Space hint is a one-shot affordance at landing (showSpaceHintOnce);
+        // hover only DISMISSES an onscreen pill early, never re-shows it. The big
+        // companion preview still closes the moment the cursor leaves this card.
+        if !owns { setSpaceHintVisible(false) }
         if owns {
             grabKey()
         } else {
@@ -1660,8 +1661,13 @@ private final class QuickAccessWindow: NSWindow {
                 ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
                 self.animator().setFrame(NSRect(origin: slot.origin, size: self.frame.size), display: true)
             }, completionHandler: { [weak self] in
-                DispatchQueue.main.async { self?.isEntering = false }
+                DispatchQueue.main.async {
+                    self?.isEntering = false
+                    self?.showSpaceHintOnce()
+                }
             })
+        } else {
+            showSpaceHintOnce()
         }
 
         let underCursor = slot.contains(NSEvent.mouseLocation)
@@ -1922,6 +1928,7 @@ private final class QuickAccessWindow: NSWindow {
                     card.animator().alphaValue = 1
                 }
             }
+            card.showSpaceHintOnce()
         }
     }
 
@@ -2132,15 +2139,27 @@ private final class QuickAccessWindow: NSWindow {
         QuickLookController.shared.toggle(
             owner: self, image: image, cardFrame: frame, screen: overlayScreen
         )
-        // The big preview carries its own "Space" pill, so hide the small hint while
-        // it is open and bring it back when the preview closes (cursor still here).
-        setSpaceHintVisible(mouseInsideOverlay && cursorOwnsThisCard())
+        // The big preview carries its own "Space" pill; the small hint is a
+        // one-shot at landing, so opening the preview just retires it.
+        setSpaceHintVisible(false)
     }
 
-    /// Show or hide the small "Space" hint pill near the card on hover. Built lazily
-    /// the first time the card is hovered; positioned just below the card, centered.
-    /// While the big preview is open the hint stays hidden (the preview has its own
-    /// "Space" pill). Hidden whenever the card isn't hovered.
+    /// One-shot affordance: the Space hint shows right when the card lands and
+    /// fades out by itself. It used to follow hover, which nagged on every pass
+    /// of the cursor over the card.
+    private var didShowSpaceHint = false
+    private func showSpaceHintOnce() {
+        guard !didShowSpaceHint, !isClosing, !isParked else { return }
+        didShowSpaceHint = true
+        setSpaceHintVisible(true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.setSpaceHintVisible(false)
+        }
+    }
+
+    /// Show or hide the small Space hint pill near the card. Built lazily on
+    /// first show; positioned just below the card, centered. While the big
+    /// preview is open the hint stays hidden (the preview has its own pill).
     private func setSpaceHintVisible(_ visible: Bool) {
         let shouldShow = visible && !isPreviewZoomed
             && !QuickLookController.shared.isOpen(forOwner: self)
@@ -2161,17 +2180,33 @@ private final class QuickAccessWindow: NSWindow {
         }
     }
 
-    /// Build the "Space" hint pill window once (a small dark capsule with white
-    /// text). It mirrors the preview's own pill so the affordance reads the same.
+    /// Build the hint pill window once: a dark capsule with a spacebar keycap
+    /// ("Space" inside a key-shaped outline) followed by what it does ("Zoom").
+    /// Sizing comes from each label's own fitting size, the old hand-computed
+    /// width clipped the text ("Spac").
     private func ensureSpaceHint() {
         guard spaceHintWindow == nil else { return }
-        let text = "Space"
-        let font = NSFont.systemFont(ofSize: metrics.pillFontSize, weight: .medium)
-        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
-        let textW = ceil((text as NSString).size(withAttributes: attrs).width)
-        let padX: CGFloat = 14
-        let pillW = textW + padX * 2
-        let pillH = metrics.pillHeight
+        let pillH = metrics.pillHeight + 4
+
+        // Keycap: small rounded rect that reads as the space bar key.
+        let keyFont = NSFont.systemFont(ofSize: metrics.pillFontSize - 1, weight: .semibold)
+        let keyLabel = NSTextField(labelWithString: "Space")
+        keyLabel.font = keyFont
+        keyLabel.textColor = NSColor.white.withAlphaComponent(0.95)
+        keyLabel.sizeToFit()
+        let keyPadX: CGFloat = 8
+        let keycapH = keyLabel.frame.height + 4
+        let keycapW = ceil(keyLabel.frame.width) + keyPadX * 2
+
+        let actionFont = NSFont.systemFont(ofSize: metrics.pillFontSize, weight: .medium)
+        let actionLabel = NSTextField(labelWithString: "Zoom")
+        actionLabel.font = actionFont
+        actionLabel.textColor = NSColor.white.withAlphaComponent(0.85)
+        actionLabel.sizeToFit()
+
+        let padX: CGFloat = 10
+        let gap: CGFloat = 7
+        let pillW = padX + keycapW + gap + ceil(actionLabel.frame.width) + padX + 2
 
         let win = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: round(pillW), height: pillH),
@@ -2191,12 +2226,26 @@ private final class QuickAccessWindow: NSWindow {
         pill.layer?.cornerRadius = pillH / 2
         pill.layer?.cornerCurve = .continuous
 
-        let label = NSTextField(labelWithAttributedString: NSAttributedString(string: text, attributes: attrs))
-        label.isBezeled = false
-        label.drawsBackground = false
-        label.isEditable = false
-        label.frame = NSRect(x: padX, y: (pillH - font.pointSize - 6) / 2, width: textW, height: font.pointSize + 6)
-        pill.addSubview(label)
+        let keycap = NSView(frame: NSRect(x: padX, y: (pillH - keycapH) / 2, width: keycapW, height: keycapH))
+        keycap.wantsLayer = true
+        keycap.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        keycap.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
+        keycap.layer?.borderWidth = 1
+        keycap.layer?.cornerRadius = 5
+        keycap.layer?.cornerCurve = .continuous
+        keyLabel.frame.origin = NSPoint(
+            x: (keycapW - keyLabel.frame.width) / 2,
+            y: (keycapH - keyLabel.frame.height) / 2
+        )
+        keycap.addSubview(keyLabel)
+        pill.addSubview(keycap)
+
+        actionLabel.frame.origin = NSPoint(
+            x: padX + keycapW + gap,
+            y: (pillH - actionLabel.frame.height) / 2
+        )
+        pill.addSubview(actionLabel)
+
         win.contentView = pill
         win.alphaValue = 0
         spaceHintWindow = win
@@ -3255,6 +3304,11 @@ extension QuickAccessOverlay {
     /// leaving any real user cards untouched.
     @MainActor static func uiTestCloseNewest() {
         (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestForceCleanup()
+    }
+
+    /// Restores every parked card on `screen` (harness hook for gesture tests).
+    @MainActor static func uiTestRestoreAll(on screen: NSScreen?) {
+        QuickAccessWindow.restoreAll(on: screen)
     }
 
     /// Gesture-machine state of the newest card, for the harness to assert which

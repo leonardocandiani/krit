@@ -213,7 +213,12 @@ private final class SpacePreviewWindow: NSWindow {
         let text = "Space"
         let font = NSFont.systemFont(ofSize: 14, weight: .medium)
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
-        let textW = ceil((text as NSString).size(withAttributes: attrs).width)
+        // Size from the field's own fitting size: measuring via NSString.size
+        // under-counted and clipped the last glyph ("Spac").
+        let sizer = NSTextField(labelWithAttributedString: NSAttributedString(string: text, attributes: attrs))
+        sizer.sizeToFit()
+        let textW = ceil(sizer.frame.width)
+        let textH = ceil(sizer.frame.height)
         let padX: CGFloat = 18
         let pillW = textW + padX * 2
         let pillH = Self.pillHeight
@@ -245,7 +250,7 @@ private final class SpacePreviewWindow: NSWindow {
         label.isBezeled = false
         label.drawsBackground = false
         label.isEditable = false
-        label.frame = NSRect(x: padX, y: (pillH - font.pointSize - 6) / 2, width: textW, height: font.pointSize + 6)
+        label.frame = NSRect(x: padX, y: (pillH - textH) / 2, width: textW, height: textH)
         pill.addSubview(label)
         win.contentView = pill
         win.alphaValue = 0
