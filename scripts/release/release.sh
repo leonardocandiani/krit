@@ -48,9 +48,9 @@ DMG_SCRIPT="$APP_DIR/make-dmg.sh"
 # Output helpers
 # ---------------------------------------------------------------------------
 
-info() { printf '\033[1;36m▸\033[0m %s\n' "$*"; }
-ok()   { printf '\033[1;32m✔\033[0m %s\n' "$*"; }
-fail() { printf '\033[1;31m✖\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -78,7 +78,7 @@ DMG_PATH="$APP_DIR/$DMG_NAME"
 # Pre-flight checks
 # ---------------------------------------------------------------------------
 
-info "Running pre-flight checks for $TAG…"
+info "Running pre-flight checks for $TAG"
 
 [ "$(uname -s)" = "Darwin" ] || fail "Releases must be built on macOS (codesign, hdiutil)."
 
@@ -130,7 +130,7 @@ elif [ ! -t 0 ]; then
 fi
 
 if [ ! -s "$NOTES_TMP" ]; then
-    info "No notes provided. Generating a stub from git log since the last tag…"
+    info "No notes provided. Generating a stub from git log since the last tag"
     PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
     {
         printf '## KRIT %s\n\n' "$TAG"
@@ -172,7 +172,7 @@ ok "Version set to $VERSION in app/Info.plist"
 # Build the app
 # ---------------------------------------------------------------------------
 
-info "Building KRIT.app (release)…"
+info "Building KRIT.app (release)"
 bash "$BUILD_SCRIPT"
 ok "App built and deployed to /Applications/KRIT.app"
 
@@ -185,7 +185,7 @@ ok "App built and deployed to /Applications/KRIT.app"
 # fresh one.
 rm -f "$DMG_PATH"
 
-info "Packaging $DMG_NAME…"
+info "Packaging $DMG_NAME"
 bash "$DMG_SCRIPT"
 
 [ -f "$DMG_PATH" ] || fail "Expected DMG not produced: $DMG_PATH"
@@ -198,10 +198,10 @@ info "Update Casks/krit.rb with version \"$VERSION\" and sha256 \"$DMG_SHA\"."
 # Tag and publish
 # ---------------------------------------------------------------------------
 
-info "Creating git tag $TAG…"
+info "Creating git tag $TAG"
 git tag -a "$TAG" -m "KRIT $TAG"
 
-info "Publishing GitHub release $TAG with $DMG_NAME…"
+info "Publishing GitHub release $TAG with $DMG_NAME"
 # Push the tag so gh attaches the release to a commit that exists on the remote.
 git push origin "$TAG"
 gh release create "$TAG" "$DMG_PATH" \
