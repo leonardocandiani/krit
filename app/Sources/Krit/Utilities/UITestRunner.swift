@@ -80,6 +80,9 @@ final class UITestRunner: NSObject {
             case "chooser-visual": report = await Self.runChooserVisual()
             case "compose-scale": report = await Self.runComposeScaleSuite()
             case "wallpaper-dump": report = await Self.runWallpaperDump()
+            case "overlay-entrance": report = await Self.runOverlayEntranceFrames()
+            case "area-delay": report = await Self.runAreaSelectionDelay()
+            case "overlay-interaction": report = await Self.runOverlayInteraction()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -687,6 +690,219 @@ final class UITestRunner: NSObject {
         for y in 0..<h where alpha(midX, y) > 250 { top = y; break }
         for y in stride(from: h - 1, through: 0, by: -1) where alpha(midX, y) > 250 { bottom = h - 1 - y; break }
         return (left, right, top, bottom)
+    }
+
+    /// Reproduces the "interaction works once, then I must click elsewhere"
+    /// report with REAL synthesized mouse moves: hover the card (1st arm), drag
+    /// it a little and snap back (interaction without executing anything), move
+    /// the cursor away, hover again (2nd arm) and assert the card re-armed
+    /// (hovered + controls visible + key restored).
+    private static func runOverlayInteraction() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        let before = QuickAccessOverlay.uiTestWindows.count
+
+        // Spawn a card through the normal (slide) entrance.
+        let img = NSImage(size: NSSize(width: 300, height: 200))
+        img.lockFocus(); NSColor.systemIndigo.setFill()
+        NSRect(x: 0, y: 0, width: 300, height: 200).fill(); img.unlockFocus()
+        let tmpPath = "/tmp/krit-interaction-test.png"
+        if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: tmpPath))
+        }
+        let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: tmpPath,
+                               thumbnailPath: tmpPath, captureRect: nil)
+        QuickAccessOverlay.show(image: img, historyItem: item,
+                                historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        guard QuickAccessOverlay.uiTestWindows.count > before,
+              let card = QuickAccessOverlay.uiTestWindows.last else {
+            r["error"] = "card did not appear"; r["allPass"] = false; return r
+        }
+
+        // CG (top-left) coordinates of the card center for event posting.
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        func cgPoint(_ p: NSPoint) -> CGPoint { CGPoint(x: p.x, y: primaryH - p.y) }
+        func post(_ type: CGEventType, _ p: CGPoint, button: CGMouseButton = .left) {
+            CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: button)?
+                .post(tap: .cghidEventTap)
+        }
+        func moveTo(_ p: CGPoint) { post(.mouseMoved, p) }
+        let center = cgPoint(NSPoint(x: card.frame.midX, y: card.frame.midY))
+        let outside = CGPoint(x: center.x + card.frame.width * 2.2, y: center.y - 160)
+
+        // 1st hover: arm.
+        moveTo(CGPoint(x: center.x - 30, y: center.y)); try? await Task.sleep(nanoseconds: 120_000_000)
+        moveTo(center); try? await Task.sleep(nanoseconds: 450_000_000)
+        let hover1 = QuickAccessOverlay.uiTestHoverState()
+        r["hover1"] = hover1
+
+        // "Mexer sem executar": small drag inside the card and release (snaps back).
+        post(.leftMouseDown, center)
+        var p = center
+        for _ in 0..<6 {
+            p.x += 6; p.y -= 3
+            post(.leftMouseDragged, p)
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        post(.leftMouseUp, p)
+        try? await Task.sleep(nanoseconds: 800_000_000)   // snap-back settle
+
+        // Leave the card.
+        moveTo(outside); try? await Task.sleep(nanoseconds: 500_000_000)
+        let away = QuickAccessOverlay.uiTestHoverState()
+        r["away"] = away
+
+        // 2nd hover: this is the moment the user reports as dead.
+        moveTo(CGPoint(x: center.x - 20, y: center.y + 10)); try? await Task.sleep(nanoseconds: 120_000_000)
+        moveTo(center); try? await Task.sleep(nanoseconds: 600_000_000)
+        let hover2 = QuickAccessOverlay.uiTestHoverState()
+        r["hover2"] = hover2
+
+        let armed1 = (hover1["hovered"] as? Bool ?? false)
+        let disarmed = !(away["hovered"] as? Bool ?? true)
+        r["armedOnFirstHover"] = armed1
+        r["disarmedAway"] = disarmed
+
+        // Behavioral proof on the 2nd hover: press SPACE for the quick-look
+        // zoom. This is the interaction the user reports as dead.
+        func postKey(_ code: CGKeyCode, down: Bool) {
+            CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)?.post(tap: .cghidEventTap)
+        }
+        postKey(49, down: true); postKey(49, down: false)   // Space
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        // Space opens the COMPANION preview (QuickLookController), that is the
+        // behavior the user exercises; the O5 in-place zoom is a different path.
+        let previewOpened = QuickLookController.shared.isOpen
+        r["spacePreviewOpenedOnSecondHover"] = previewOpened
+        r["afterSpace"] = QuickAccessOverlay.uiTestHoverState()
+        if previewOpened {
+            postKey(49, down: true); postKey(49, down: false)   // Space closes it
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        r["allPass"] = armed1 && disarmed && previewOpened
+
+        QuickAccessOverlay.uiTestCloseNewest()
+        return r
+    }
+
+    /// Measures the hotkey-to-selection latency: fires the real area-capture
+    /// path and polls until a SelectionOverlayWindow is visible. This was the
+    /// "takes ~2 seconds to let me select" complaint; the scenario keeps it
+    /// honest forever (fails above 600ms).
+    private static func runAreaSelectionDelay() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        func selectionWindowVisible() -> Bool {
+            NSApp.windows.contains {
+                String(describing: type(of: $0)) == "SelectionOverlayWindow" && $0.isVisible
+            }
+        }
+        let t0 = CACurrentMediaTime()
+        appDelegate.captureArea()
+        var shownMs = -1
+        for _ in 0..<300 {   // poll a 10ms até 3s
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            if selectionWindowVisible() {
+                shownMs = Int((CACurrentMediaTime() - t0) * 1000)
+                break
+            }
+        }
+        r["selectionShownMs"] = shownMs
+        // Dá um instante pros frozen grabs em paralelo despacharem, depois
+        // cancela a seleção pra não deixar a UI armada na tela.
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        if let esc = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true) { esc.post(tap: .cghidEventTap) }
+        if let esc = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false) { esc.post(tap: .cghidEventTap) }
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        r["dismissed"] = !selectionWindowVisible()
+        r["allPass"] = shownMs >= 0 && shownMs <= 600 && (r["dismissed"] as? Bool ?? false)
+        return r
+    }
+
+    /// Captures the visual entrance of the overlay card frame by frame: runs a
+    /// REAL fullscreen capture (flash + fly-to-tray ghost + handoff card) and
+    /// snapshots the bottom-right quadrant of the active screen every ~50ms via
+    /// CGWindowList, so a glitchy first paint ("appears broken, then snaps
+    /// right") can be seen and diagnosed instead of guessed at.
+    private static func runOverlayEntranceFrames() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        try? FileManager.default.createDirectory(atPath: "/tmp/krit-entrance", withIntermediateDirectories: true)
+
+        guard let primary = NSScreen.screens.first else {
+            r["error"] = "no screens"; r["allPass"] = false; return r
+        }
+
+        let before = QuickAccessOverlay.uiTestWindows.count
+        appDelegate.captureFullscreen()
+
+        // Wait for the card object (capture takes a few hundred ms), then film
+        // the region AROUND the card's real frame: the handoff card is parked
+        // invisible at its slot, so filming starts before the reveal and catches
+        // the whole ghost-landing + fade-in choreography wherever it happens.
+        var card: NSWindow?
+        for _ in 0..<40 {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            let cards = QuickAccessOverlay.uiTestWindows
+            if cards.count > before { card = cards.last; break }
+        }
+        guard let card else {
+            r["error"] = "card never appeared"; r["allPass"] = false; return r
+        }
+        let cf = card.frame
+        // Cocoa (bottom-left) -> CG (top-left) global coordinates, with a margin
+        // of one card all around so the ghost's final approach is in frame too.
+        // Clamped to the card's screen: CGWindowListCreateImage returns only the
+        // on-screen intersection, which would silently shift the pixel mapping.
+        let cardScreen = NSScreen.screens.first { $0.frame.intersects(cf) } ?? primary
+        let sf = cardScreen.frame
+        let cgScreenRect = CGRect(x: sf.origin.x, y: primary.frame.height - sf.origin.y - sf.height,
+                                  width: sf.width, height: sf.height)
+        let cardCG = CGRect(x: cf.origin.x, y: primary.frame.height - cf.origin.y - cf.height,
+                            width: cf.width, height: cf.height)
+        let margin: CGFloat = max(cf.width, cf.height)
+        let region = cardCG.insetBy(dx: -margin, dy: -margin).intersection(cgScreenRect)
+        var saved = 0
+        let t0 = CACurrentMediaTime()
+        for i in 0..<40 {
+            if let cg = CGWindowListCreateImage(region, .optionAll, kCGNullWindowID, [.bestResolution]) {
+                let ms = Int((CACurrentMediaTime() - t0) * 1000)
+                let rep = NSBitmapImageRep(cgImage: cg)
+                if let data = rep.representation(using: .png, properties: [:]) {
+                    try? data.write(to: URL(fileURLWithPath: String(format: "/tmp/krit-entrance/f%02d-%04dms.png", i, ms)))
+                    saved += 1
+                }
+                // Card-only crop, computed here where the geometry is known:
+                // image pixels = (point in region) * (imageWidth / regionWidth).
+                let pxPerPt = CGFloat(cg.width) / region.width
+                let cardInRegion = CGRect(
+                    x: (cardCG.minX - region.minX - 8) * pxPerPt,
+                    y: (cardCG.minY - region.minY - 8) * pxPerPt,
+                    width: (cf.width + 16) * pxPerPt,
+                    height: (cf.height + 16) * pxPerPt
+                )
+                if let cardCG = cg.cropping(to: cardInRegion),
+                   let cardData = NSBitmapImageRep(cgImage: cardCG).representation(using: .png, properties: [:]) {
+                    try? cardData.write(to: URL(fileURLWithPath: String(format: "/tmp/krit-entrance/card%02d-%04dms.png", i, ms)))
+                }
+            }
+            try? await Task.sleep(nanoseconds: 40_000_000)
+        }
+        r["cardFrame"] = ["x": cf.origin.x, "y": cf.origin.y, "w": cf.width, "h": cf.height]
+        r["framesSaved"] = saved
+        r["framesDir"] = "/tmp/krit-entrance"
+        r["allPass"] = saved > 20
+        // Limpa o card de teste pra não poluir a tela do usuário.
+        QuickAccessOverlay.uiTestCloseNewest()
+        return r
     }
 
     /// Dumps the live wallpaper cache: the JPEG the compose path would use RIGHT
