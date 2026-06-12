@@ -2180,33 +2180,22 @@ private final class QuickAccessWindow: NSWindow {
         }
     }
 
-    /// Build the hint pill window once: a dark capsule with a spacebar keycap
-    /// ("Space" inside a key-shaped outline) followed by what it does ("Zoom").
-    /// Sizing comes from each label's own fitting size, the old hand-computed
-    /// width clipped the text ("Spac").
+    /// Build the hint pill window once: the same system-style glass capsule the
+    /// Quick Look companion uses, with a plain "Press Space to zoom" label (the
+    /// macOS "Press esc to exit full screen" language). Sized from the label's
+    /// own fitting size, hand-computed widths clipped the text ("Spac").
     private func ensureSpaceHint() {
         guard spaceHintWindow == nil else { return }
+
+        let label = NSTextField(labelWithString: "Press Space to zoom")
+        label.font = NSFont.systemFont(ofSize: metrics.pillFontSize, weight: .medium)
+        label.textColor = .labelColor
+        label.sizeToFit()
+        let textW = ceil(label.frame.width)
+        let textH = ceil(label.frame.height)
+        let padX: CGFloat = 14
+        let pillW = textW + padX * 2
         let pillH = metrics.pillHeight + 4
-
-        // Keycap: small rounded rect that reads as the space bar key.
-        let keyFont = NSFont.systemFont(ofSize: metrics.pillFontSize - 1, weight: .semibold)
-        let keyLabel = NSTextField(labelWithString: "Space")
-        keyLabel.font = keyFont
-        keyLabel.textColor = NSColor.white.withAlphaComponent(0.95)
-        keyLabel.sizeToFit()
-        let keyPadX: CGFloat = 8
-        let keycapH = keyLabel.frame.height + 4
-        let keycapW = ceil(keyLabel.frame.width) + keyPadX * 2
-
-        let actionFont = NSFont.systemFont(ofSize: metrics.pillFontSize, weight: .medium)
-        let actionLabel = NSTextField(labelWithString: "Zoom")
-        actionLabel.font = actionFont
-        actionLabel.textColor = NSColor.white.withAlphaComponent(0.85)
-        actionLabel.sizeToFit()
-
-        let padX: CGFloat = 10
-        let gap: CGFloat = 7
-        let pillW = padX + keycapW + gap + ceil(actionLabel.frame.width) + padX + 2
 
         let win = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: round(pillW), height: pillH),
@@ -2218,33 +2207,14 @@ private final class QuickAccessWindow: NSWindow {
         win.hasShadow = true
         win.ignoresMouseEvents = true
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        win.sharingType = .none
+        // Capturable only under the UI-test harness (visual gate of the pill);
+        // invisible to recordings and captures in production.
+        win.sharingType = ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" ? .readWrite : .none
 
         let pill = NSView(frame: NSRect(x: 0, y: 0, width: round(pillW), height: pillH))
-        pill.wantsLayer = true
-        pill.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
-        pill.layer?.cornerRadius = pillH / 2
-        pill.layer?.cornerCurve = .continuous
-
-        let keycap = NSView(frame: NSRect(x: padX, y: (pillH - keycapH) / 2, width: keycapW, height: keycapH))
-        keycap.wantsLayer = true
-        keycap.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
-        keycap.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
-        keycap.layer?.borderWidth = 1
-        keycap.layer?.cornerRadius = 5
-        keycap.layer?.cornerCurve = .continuous
-        keyLabel.frame.origin = NSPoint(
-            x: (keycapW - keyLabel.frame.width) / 2,
-            y: (keycapH - keyLabel.frame.height) / 2
-        )
-        keycap.addSubview(keyLabel)
-        pill.addSubview(keycap)
-
-        actionLabel.frame.origin = NSPoint(
-            x: padX + keycapW + gap,
-            y: (pillH - actionLabel.frame.height) / 2
-        )
-        pill.addSubview(actionLabel)
+        pill.addSubview(ChromeFactory.backing(frame: pill.bounds, cornerRadius: pillH / 2))
+        label.frame = NSRect(x: padX, y: (pillH - textH) / 2, width: textW, height: textH)
+        pill.addSubview(label)
 
         win.contentView = pill
         win.alphaValue = 0
