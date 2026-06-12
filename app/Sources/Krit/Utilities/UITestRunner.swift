@@ -94,6 +94,7 @@ final class UITestRunner: NSObject {
             case "sidebar-motion": report = await Self.runSidebarMotion()
             case "prefs-bottom": report = await Self.runPrefsBottom()
             case "controls-demo": report = await Self.runControlsDemo()
+            case "drag-prep": report = await Self.runDragPrep()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -210,6 +211,75 @@ final class UITestRunner: NSObject {
         r["docEnd"] = docEnd
         r["visibleBottom"] = visibleBottom
         r["allPass"] = ok
+        return r
+    }
+
+    // MARK: - Cenário: drag-prep (hitch do drag-out do card)
+
+    /// Reproduz a "travada" relatada na transformação card → arquivo: o encode
+    /// PNG + escrita aconteciam na main thread dentro do gesto. Mede a etapa de
+    /// materialização nos dois caminhos com a MESMA captura grande: o fast path
+    /// (arquivo pré-exportado no pouso do card) tem que ser ~0ms; o forceInline
+    /// reporta o custo legado como evidência do delta.
+    private static func runDragPrep() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        let before = QuickAccessOverlay.uiTestWindows.count
+
+        // Captura Retina grande com conteúdo não-trivial: PNG encode caro de
+        // verdade (gradiente + grade de retângulos quebra a compressão fácil).
+        let size = NSSize(width: 5120, height: 2880)
+        let img = NSImage(size: size)
+        img.lockFocus()
+        NSGradient(colors: [.systemBlue, .systemPurple, .systemOrange])?
+            .draw(in: NSRect(origin: .zero, size: size), angle: 30)
+        for i in stride(from: 0, to: 5120, by: 64) {
+            NSColor(calibratedHue: CGFloat(i % 360) / 360, saturation: 0.8, brightness: 0.9, alpha: 0.35).setFill()
+            NSRect(x: CGFloat(i), y: CGFloat((i * 7) % 2400), width: 48, height: 320).fill()
+        }
+        img.unlockFocus()
+
+        let tmpPath = "/tmp/krit-dragprep-test.png"
+        let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: tmpPath,
+                               thumbnailPath: tmpPath, captureRect: nil)
+        QuickAccessOverlay.show(image: img, historyItem: item,
+                                historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        // Pouso do card + pre-export em background.
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        defer { if QuickAccessOverlay.uiTestWindows.count > before { QuickAccessOverlay.uiTestCloseNewest() } }
+        guard QuickAccessOverlay.uiTestWindows.count > before else {
+            r["error"] = "card did not appear"; r["allPass"] = false; return r
+        }
+
+        // Probe cedo: gesto disparado logo após o pouso NUNCA pode bloquear,
+        // mesmo que o pre-export ainda esteja rodando (vira promise-only).
+        let early = QuickAccessOverlay.uiTestDragPrep(forceInline: false)
+        r["earlyMs"] = early["ms"] ?? -1
+        r["earlyMode"] = early["mode"] ?? "?"
+        let earlyQuick = ((early["ms"] as? Double) ?? 999) < 8
+
+        // O pre-export tem que completar e devolver o caminho de URL concreta.
+        var preparedMs = -1.0
+        var preparedSeen = false
+        for _ in 0..<40 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            let probe = QuickAccessOverlay.uiTestDragPrep(forceInline: false)
+            if probe["mode"] as? String == "prepared" {
+                preparedSeen = true
+                preparedMs = probe["ms"] as? Double ?? -1
+                break
+            }
+        }
+        r["preparedSeen"] = preparedSeen
+        r["preparedMs"] = preparedMs
+
+        // Evidência do custo que o caminho antigo cobrava na main thread.
+        let legacy = QuickAccessOverlay.uiTestDragPrep(forceInline: true)
+        r["legacyMs"] = legacy["ms"] ?? -1
+
+        r["allPass"] = earlyQuick && preparedSeen && preparedMs >= 0 && preparedMs < 8
         return r
     }
 

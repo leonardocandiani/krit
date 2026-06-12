@@ -1245,6 +1245,9 @@ private final class QuickAccessWindow: NSWindow {
             self.collapseZoom()
             return true
         }
+        // Card fully configured (fileURLOverride decided): pre-export the drag
+        // file in background so the drag-out gesture starts without a hitch.
+        thumb.prepareForFileDrag()
         clipView.addSubview(thumb)
         thumbView = thumb
 
@@ -2410,6 +2413,7 @@ private final class QuickAccessWindow: NSWindow {
         image = newImage
         thumbView?.layer?.contents = newImage.bestCGImage
         thumbView?.dragImage = newImage
+        thumbView?.prepareForFileDrag()
     }
 
     private var isClosing = false
@@ -2856,6 +2860,41 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     private static var retainedDragFiles: Set<URL> = []
     private static let dragFileCleanupDelay: TimeInterval = 300
 
+    /// Temp PNG materialized ahead of the gesture. Encoding + writing a big
+    /// Retina capture inside beginFileDrag stalled the main thread right as the
+    /// card-to-file morph started (the visible hitch), so the export happens in
+    /// background the moment the card is configured; the drag then starts with
+    /// zero main-thread work. The generation guards a stale write landing after
+    /// the image was swapped.
+    private var preparedDragFile: URL?
+    private var dragFileGeneration = 0
+
+    /// Call after the card is fully configured (dragImage and fileURLOverride
+    /// set): video cards drag the real clip and need no temp export.
+    func prepareForFileDrag() {
+        if let stale = preparedDragFile, stale != activeDragFileURL {
+            try? FileManager.default.removeItem(at: stale)
+            Self.retainedDragFiles.remove(stale)
+        }
+        preparedDragFile = nil
+        dragFileGeneration += 1
+        let generation = dragFileGeneration
+        guard fileURLOverride == nil, let cg = dragImage?.bestCGImage else { return }
+        nonisolated(unsafe) let frame = cg
+        Task.detached(priority: .utility) {
+            guard let png = ImageExporter.pngData(from: frame),
+                  let url = Self.makeTemporaryDragFile(data: png) else { return }
+            await MainActor.run { [weak self] in
+                guard let self, self.dragFileGeneration == generation else {
+                    try? FileManager.default.removeItem(at: url)
+                    return
+                }
+                self.preparedDragFile = url
+                Self.retainedDragFiles.insert(url)
+            }
+        }
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
 
@@ -2914,32 +2953,61 @@ private final class DraggableImageView: NSView, NSDraggingSource {
             return
         }
 
-        guard let png = ImageExporter.pngData(from: dragImg),
-              let fileURL = Self.makeTemporaryDragFile(data: png) else { return }
-
         onDragStarted?()
 
-        activeDragFileURL = fileURL
-        Self.retainedDragFiles.insert(fileURL)
+        // The session must start NOW with the gesture's event; any synchronous
+        // encode here is exactly the reported card-to-file hitch. Two shapes:
+        //  - pre-export done (normal case): concrete file URL + promise, as before
+        //  - gesture beat the background encode: promise ONLY; the encode then
+        //    happens at DROP time on the promise's own queue, never on this gesture.
+        //    The promise is the canonical path HistoryPanelController already uses.
+        var items: [NSDraggingItem] = []
+        if let prepared = preparedDragFile {
+            activeDragFileURL = prepared
+            Self.retainedDragFiles.insert(prepared)
+            // Plain file URL covers Finder and apps that read a concrete file.
+            let fileItem = NSDraggingItem(pasteboardWriter: prepared as NSURL)
+            fileItem.setDraggingFrame(bounds, contents: dragImg)
+            items.append(fileItem)
+        } else {
+            activeDragFileURL = nil
+        }
 
-        // Plain file URL covers Finder and apps that read a concrete file.
-        let fileItem = NSDraggingItem(pasteboardWriter: fileURL as NSURL)
-        fileItem.setDraggingFrame(bounds, contents: dragImg)
-
-        // File-promise fallback for apps (Slack, Mail, VS Code, browsers) that
-        // request a promised file instead of reading the URL directly. Mirrors
-        // the canonical promise path in HistoryPanelController.
+        // File-promise for apps (Slack, Mail, VS Code, browsers) that request a
+        // promised file instead of reading the URL directly.
         let promise = NSFilePromiseProvider(
             fileType: "public.png",
             delegate: OverlayImageFilePromiseDelegate(image: dragImg)
         )
         let promiseItem = NSDraggingItem(pasteboardWriter: promise)
         promiseItem.setDraggingFrame(bounds, contents: dragImg)
+        items.append(promiseItem)
 
-        beginDraggingSession(with: [fileItem, promiseItem], event: event, source: self)
+        beginDraggingSession(with: items, event: event, source: self)
     }
 
-    private static func makeTemporaryDragFile(data: Data) -> URL? {
+    /// Test hook: measures ONLY the main-thread materialization step a drag-out
+    /// would run right now; no session starts. Modes mirror the product paths:
+    /// "prepared" (pre-export done, concrete URL + promise) and "promise-only"
+    /// (gesture beat the encode), both ~0ms. forceInline re-runs the REMOVED
+    /// legacy synchronous encode on the same image, as evidence of the old cost.
+    func uiTestDragPrep(forceInline: Bool) -> [String: Any] {
+        guard let dragImg = dragImage else { return ["error": "no drag image"] }
+        let t0 = CACurrentMediaTime()
+        var mode = "promise-only"
+        if forceInline {
+            mode = "legacy-inline"
+            if let png = ImageExporter.pngData(from: dragImg),
+               let url = Self.makeTemporaryDragFile(data: png) {
+                try? FileManager.default.removeItem(at: url) // probe only, no litter
+            }
+        } else if preparedDragFile != nil {
+            mode = "prepared"
+        }
+        return ["ms": (CACurrentMediaTime() - t0) * 1000, "mode": mode]
+    }
+
+    nonisolated private static func makeTemporaryDragFile(data: Data) -> URL? {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("KritDrag", isDirectory: true)
         let filename = "\(ImageExporter.timestampedName)-\(UUID().uuidString.prefix(8)).png"
         let url = directory.appendingPathComponent(filename)
@@ -3300,10 +3368,22 @@ extension QuickAccessOverlay {
         }
         return card.uiTestHoverSnapshot()
     }
+
+    /// Drag-out materialization probe of the newest card (see
+    /// DraggableImageView.uiTestDragPrep).
+    @MainActor static func uiTestDragPrep(forceInline: Bool) -> [String: Any] {
+        guard let card = QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow else {
+            return ["error": "no card"]
+        }
+        return card.uiTestDragPrepProbe(forceInline: forceInline)
+    }
 }
 
 private extension QuickAccessWindow {
     static var uiTestOpenWindows: [NSWindow] { openWindows }
+    func uiTestDragPrepProbe(forceInline: Bool) -> [String: Any] {
+        thumbView?.uiTestDragPrep(forceInline: forceInline) ?? ["error": "no thumb"]
+    }
     func uiTestHoverSnapshot() -> [String: Any] {
         [
             "exists": true,
