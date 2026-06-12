@@ -91,6 +91,9 @@ final class UITestRunner: NSObject {
             case "alignment": report = await Self.runAlignment()
             case "wallpaper-apply": report = await Self.runWallpaperApply()
             case "wallpaper-sweep": report = await Self.runWallpaperSweep()
+            case "sidebar-motion": report = await Self.runSidebarMotion()
+            case "prefs-bottom": report = await Self.runPrefsBottom()
+            case "controls-demo": report = await Self.runControlsDemo()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -98,6 +101,266 @@ final class UITestRunner: NSObject {
                 try? data.write(to: URL(fileURLWithPath: outPath))
             }
         }
+    }
+
+    // MARK: - Cenário: sidebar-motion (filma a abertura da coluna de backgrounds)
+
+    /// Diagnóstico visual: abre o editor, dispara o toggle da sidebar e captura
+    /// frames da janela durante a moção (e o estado final). Gate é olhar os
+    /// PNGs em /tmp/krit-sidebar-motion: janela, coluna, canvas e chrome têm
+    /// que se mover como UMA peça (o relato era "componentes se movem diferente
+    /// do fundo"). allPass valida só o estado final são (sidebar visível em x:0).
+    private static func runSidebarMotion() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let savedDefaultTemplate = TemplateStore.defaultTemplate?.name
+        TemplateStore.setDefault(name: nil)
+        defer { TemplateStore.setDefault(name: savedDefaultTemplate) }
+
+        let img = NSImage(size: NSSize(width: 1600, height: 1000))
+        img.lockFocus()
+        NSColor(srgbRed: 0.16, green: 0.45, blue: 0.78, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: 1600, height: 1000).fill()
+        img.unlockFocus()
+
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController,
+              let window = ctrl.window else {
+            r["error"] = "editor window did not open"; r["allPass"] = false; return r
+        }
+        defer { window.close() }
+
+        let dir = "/tmp/krit-sidebar-motion"
+        try? FileManager.default.removeItem(atPath: dir)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        // Sidebar fechada no início (estado default), dispara e mede a moção
+        // REAL pelo presentation layer (screenshot custa ~100ms+ e perde os
+        // frames; o presentation é o que o render server está pintando).
+        ctrl.uiTestToggleSidebar()
+        var xs: [Int] = []
+        for _ in 0..<18 {
+            let x = ctrl.uiTestSidebar?.layer?.presentation()?.frame.origin.x
+                ?? ctrl.uiTestSidebar?.frame.origin.x ?? -9999
+            xs.append(Int(x))
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        r["presentationXs"] = xs
+        // Moção suave = pelo menos 3 valores intermediários distintos entre
+        // -width e 0 (um jump-cut só registra os extremos).
+        let intermediates = Set(xs.filter { $0 > -Int(BackgroundSidebar.preferredWidth) + 4 && $0 < -4 })
+        r["intermediateCount"] = intermediates.count
+        let smooth = intermediates.count >= 3
+        r["smoothMotionPass"] = smooth
+
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        _ = Self.snapshotWindow(window, to: "\(dir)/final.png")
+
+        let sidebarOpen = ctrl.uiTestSidebar?.isHidden == false && (ctrl.uiTestSidebar?.frame.minX ?? -1) == 0
+        r["sidebarOpenAtEnd"] = sidebarOpen
+        r["frames"] = dir
+        r["allPass"] = sidebarOpen && smooth
+        return r
+    }
+
+    // MARK: - Cenário: prefs-bottom (margem no fim do scroll das Preferences)
+
+    /// Abre as Preferences reais, rola a seção General até o FIM e fotografa:
+    /// a última row precisa de margem de segurança antes da borda da janela
+    /// (o relato: "sem bordas no final"). Gate visual em /tmp/krit-prefs-bottom.png.
+    private static func runPrefsBottom() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let ctrl = PreferencesWindowController.shared
+        ctrl.uiTestForceShow()
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        guard let win = ctrl.uiTestWindow else {
+            r["error"] = "preferences window did not open"; r["allPass"] = false; return r
+        }
+        defer { ctrl.uiTestClose() }
+
+        // Janela curta o bastante pra General PRECISAR rolar.
+        var f = win.frame
+        f.size.height = 520
+        win.setFrame(f, display: true)
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        guard let scroll = findView(in: win.contentView ?? NSView(), where: { $0 is NSScrollView }) as? NSScrollView,
+              let doc = scroll.documentView else {
+            r["error"] = "form scroll view not found"; r["allPass"] = false; return r
+        }
+        // Rola até o fim do documento.
+        let endY = max(0, doc.frame.height - scroll.contentView.bounds.height)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: doc.isFlipped ? endY : 0))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        let shot = "/tmp/krit-prefs-bottom.png"
+        let ok = Self.snapshotWindow(win, to: shot)
+        r["snapshot"] = ok ? shot : "FAILED"
+        // Margem: o fim do documento fica acima da borda inferior da janela por
+        // pelo menos ~16pt de respiro (contentMargins de 24 menos tolerância).
+        let visibleBottom = scroll.contentView.bounds.maxY
+        let docEnd = doc.frame.height
+        r["docEnd"] = docEnd
+        r["visibleBottom"] = visibleBottom
+        r["allPass"] = ok
+        return r
+    }
+
+    // MARK: - Cenário: controls-demo (controles atuais vs nativos macOS 26+)
+
+    /// Side-by-side demo for the owner to choose from, nothing in the product
+    /// changes here. Left column replicates the sidebar's current controls
+    /// (checkbox, rounded "None", smallSquare alignment grid); right column
+    /// shows the native macOS 26+ counterparts (NSSwitch, .glass bezels) over
+    /// a vivid backdrop so glass has something to sample. Deliverable is the
+    /// snapshot at /tmp/krit-controls-demo.png (WindowServer composite).
+    private static func runControlsDemo() async -> [String: Any] {
+        var r: [String: Any] = [:]
+
+        let size = NSSize(width: 880, height: 560)
+        let backdrop = NSImage(size: size)
+        backdrop.lockFocus()
+        NSGradient(colors: [
+            NSColor(srgbRed: 0.16, green: 0.32, blue: 0.75, alpha: 1),
+            NSColor(srgbRed: 0.55, green: 0.20, blue: 0.65, alpha: 1),
+            NSColor(srgbRed: 0.95, green: 0.45, blue: 0.30, alpha: 1),
+        ])?.draw(in: NSRect(origin: .zero, size: size), angle: 35)
+        backdrop.unlockFocus()
+
+        let win = NSWindow(contentRect: NSRect(origin: .zero, size: size),
+                           styleMask: [.titled, .fullSizeContentView],
+                           backing: .buffered, defer: false)
+        win.titleVisibility = .hidden
+        win.titlebarAppearsTransparent = true
+        win.isReleasedWhenClosed = false
+        let bg = NSImageView(frame: NSRect(origin: .zero, size: size))
+        bg.image = backdrop
+        bg.imageScaling = .scaleAxesIndependently
+        bg.autoresizingMask = [.width, .height]
+        win.contentView?.addSubview(bg)
+
+        func sectionLabel(_ text: String) -> NSTextField {
+            let l = NSTextField(labelWithString: text.uppercased())
+            l.font = .systemFont(ofSize: 10, weight: .semibold)
+            l.textColor = .tertiaryLabelColor
+            return l
+        }
+
+        func alignmentGrid(native: Bool) -> NSView {
+            var rows: [[NSView]] = []
+            var current: [NSView] = []
+            for i in 0..<9 {
+                let b = NSButton()
+                b.title = ""
+                if native, #available(macOS 26.0, *) {
+                    b.bezelStyle = .glass
+                } else {
+                    b.bezelStyle = .smallSquare
+                }
+                b.setButtonType(.toggle)
+                b.state = i == 4 ? .on : .off
+                b.translatesAutoresizingMaskIntoConstraints = false
+                b.widthAnchor.constraint(equalToConstant: 28).isActive = true
+                b.heightAnchor.constraint(equalToConstant: 22).isActive = true
+                current.append(b)
+                if current.count == 3 { rows.append(current); current = [] }
+            }
+            let grid = NSGridView(views: rows)
+            grid.rowSpacing = 3
+            grid.columnSpacing = 3
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            return grid
+        }
+
+        func column(native: Bool) -> NSView {
+            let stack = NSStackView()
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 14
+            stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+
+            let title = NSTextField(labelWithString: native ? "Native (macOS 26+)" : "Current")
+            title.font = .systemFont(ofSize: 13, weight: .bold)
+            stack.addArrangedSubview(title)
+
+            stack.addArrangedSubview(sectionLabel("Toggle"))
+            if native {
+                let row = NSStackView()
+                row.orientation = .horizontal
+                row.spacing = 8
+                let sw = NSSwitch()
+                sw.state = .on
+                row.addArrangedSubview(sw)
+                let lbl = NSTextField(labelWithString: "Auto-balance")
+                lbl.font = .systemFont(ofSize: 12)
+                row.addArrangedSubview(lbl)
+                stack.addArrangedSubview(row)
+            } else {
+                let cb = NSButton(checkboxWithTitle: "Auto-balance", target: nil, action: nil)
+                cb.state = .on
+                cb.font = .systemFont(ofSize: 11)
+                cb.controlSize = .small
+                stack.addArrangedSubview(cb)
+            }
+
+            stack.addArrangedSubview(sectionLabel("Push toggle"))
+            let none = NSButton(title: "None", target: nil, action: nil)
+            none.setButtonType(.pushOnPushOff)
+            if native, #available(macOS 26.0, *) {
+                none.bezelStyle = .glass
+            } else {
+                none.bezelStyle = .rounded
+            }
+            none.state = .on
+            none.translatesAutoresizingMaskIntoConstraints = false
+            none.widthAnchor.constraint(equalToConstant: 180).isActive = true
+            stack.addArrangedSubview(none)
+
+            stack.addArrangedSubview(sectionLabel("Alignment"))
+            stack.addArrangedSubview(alignmentGrid(native: native))
+
+            stack.addArrangedSubview(sectionLabel(native ? "Slider (already native)" : "Slider"))
+            let slider = NSSlider(value: 0.6, minValue: 0, maxValue: 1, target: nil, action: nil)
+            slider.translatesAutoresizingMaskIntoConstraints = false
+            slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
+            stack.addArrangedSubview(slider)
+
+            stack.addArrangedSubview(sectionLabel(native ? "Segmented (already native)" : "Segmented"))
+            let seg = NSSegmentedControl(labels: ["Annotate", "Preview"], trackingMode: .selectOne, target: nil, action: nil)
+            seg.selectedSegment = 0
+            stack.addArrangedSubview(seg)
+
+            return ChromeFactory.make(content: stack, cornerRadius: ChromeFactory.Radius.panel)
+        }
+
+        let rowStack = NSStackView(views: [column(native: false), column(native: true)])
+        rowStack.orientation = .horizontal
+        rowStack.alignment = .top
+        rowStack.distribution = .fillEqually
+        rowStack.spacing = 60
+        rowStack.translatesAutoresizingMaskIntoConstraints = false
+        win.contentView?.addSubview(rowStack)
+        NSLayoutConstraint.activate([
+            rowStack.centerXAnchor.constraint(equalTo: win.contentView!.centerXAnchor),
+            rowStack.centerYAnchor.constraint(equalTo: win.contentView!.centerYAnchor),
+        ])
+
+        if let primary = NSScreen.screens.first {
+            let pf = primary.visibleFrame
+            win.setFrameOrigin(NSPoint(x: pf.midX - size.width / 2, y: pf.midY - size.height / 2))
+        }
+        win.makeKeyAndOrderFront(nil)
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+
+        let shot = "/tmp/krit-controls-demo.png"
+        let cg = snapshotScreenRegion(of: win, to: shot)
+        let contrast = cg.map { hasVisibleContrast($0) } ?? false
+        win.orderOut(nil)
+        r["snapshot"] = cg != nil ? shot : "FAILED"
+        r["contrast"] = contrast
+        r["allPass"] = cg != nil && contrast
+        return r
     }
 
     // MARK: - Cenário: wallpaper-apply (clique real no thumbnail + render)
@@ -1205,6 +1468,19 @@ final class UITestRunner: NSObject {
         }
         AreaSelectionDiag.timeline["hotkeyUpPosted"] = CACurrentMediaTime()
 
+        // Foco preservado: o app alvo (Finder) tem que CONTINUAR frontmost com a
+        // seleção viva. O overlay é um painel não-ativante; se o KRIT aparecer
+        // aqui, a seleção/realce do app do usuário muda no momento do print (o
+        // bug relatado: "ele sempre tira de seleção onde eu estou").
+        for _ in 0..<30 {
+            if AreaSelectionDiag.timeline["becameKey"] != nil { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let frontmostDuring = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
+        r["frontmostDuringSelection"] = frontmostDuring
+        let focusKept = frontmostDuring == (r["frontmostBefore"] as? String)
+        r["focusKeptPass"] = focusKept
+
         // Wiggle the cursor like a hand so the first delivered mouseMoved (the
         // moment the crosshair goes live) is part of the timeline.
         let mouse = NSEvent.mouseLocation
@@ -1242,7 +1518,7 @@ final class UITestRunner: NSObject {
         r["selectionLiveMs"] = live
         let mouseFlow = (deltas["firstMouseMoved"] ?? -1) >= 0
         r["mouseFlowPass"] = mouseFlow
-        r["allPass"] = live >= 0 && live <= 450 && mouseFlow
+        r["allPass"] = live >= 0 && live <= 450 && mouseFlow && focusKept
         return r
     }
 
