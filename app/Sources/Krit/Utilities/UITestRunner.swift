@@ -89,6 +89,8 @@ final class UITestRunner: NSObject {
             case "update-check": report = await Self.runUpdateCheck()
             case "color-pick": report = await Self.runColorPick()
             case "alignment": report = await Self.runAlignment()
+            case "wallpaper-apply": report = await Self.runWallpaperApply()
+            case "wallpaper-sweep": report = await Self.runWallpaperSweep()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -96,6 +98,182 @@ final class UITestRunner: NSObject {
                 try? data.write(to: URL(fileURLWithPath: outPath))
             }
         }
+    }
+
+    // MARK: - Cenário: wallpaper-apply (clique real no thumbnail + render)
+
+    /// Reproduz o relato "clico num wallpaper e fica bugado": abre o editor com
+    /// uma imagem vermelha, clica num thumbnail REAL da seção Wallpapers e
+    /// valida o RESULTADO: o canvas composto mostra o conteúdo (pixels
+    /// vermelhos) sobre um fundo não-preto-uniforme, e a janela fica num
+    /// tamanho são. Snapshot em /tmp/krit-editor/wallpaper-apply.png é o gate
+    /// visual. (O editor-suite só validava as OPTIONS, o render preto passava.)
+    private static func runWallpaperApply() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let savedDefaultTemplate = TemplateStore.defaultTemplate?.name
+        TemplateStore.setDefault(name: nil)
+        defer { TemplateStore.setDefault(name: savedDefaultTemplate) }
+
+        // Imagem GRANDE (print de ultrawide): o relato do dono era com um shot
+        // que abre o editor no envelope máximo com fit < 100%; o caso pequeno
+        // não reproduzia o palco preto com canvas fora da viewport.
+        let img = NSImage(size: NSSize(width: 2800, height: 1200))
+        img.lockFocus()
+        NSColor(srgbRed: 0.85, green: 0.12, blue: 0.10, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: 2800, height: 1200).fill()
+        img.unlockFocus()
+
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController,
+              let window = ctrl.window else {
+            r["error"] = "editor window did not open"; r["allPass"] = false; return r
+        }
+        defer { window.close() }
+
+        let frameBefore = window.frame
+        r["windowBefore"] = ["w": frameBefore.width, "h": frameBefore.height]
+
+        if ctrl.uiTestSidebar == nil || ctrl.uiTestSidebar?.isHidden != false {
+            ctrl.uiTestToggleSidebar()
+            try? await Task.sleep(nanoseconds: 600_000_000)
+        }
+        guard let sidebar = ctrl.uiTestSidebar,
+              let wpLabel = findView(in: sidebar, where: { ($0 as? NSTextField)?.stringValue.caseInsensitiveCompare("Wallpapers") == .orderedSame }),
+              let section = wpLabel.superview?.superview ?? wpLabel.superview,
+              let thumb = findView(in: section, where: {
+                  String(describing: type(of: $0)).contains("ThumbnailButton") && $0.frame.width > 10
+              }) else {
+            r["error"] = "wallpaper thumbnail not found"; r["allPass"] = false; return r
+        }
+        await synthesizeClick(in: window, view: thumb)
+        try? await Task.sleep(nanoseconds: 2_500_000_000)   // backgroundData é async
+
+        let opts = ctrl.uiTestOptions
+        r["optionsApplied"] = opts.isEnabled && opts.style == .image
+        let frameAfter = window.frame
+        r["windowAfter"] = ["w": frameAfter.width, "h": frameAfter.height]
+        let canvas = ctrl.uiTestCanvas
+        r["canvasFrame"] = ["w": canvas.frame.width, "h": canvas.frame.height]
+
+        // Render real: compõe via o pipeline do canvas? Não, valida o que está NA
+        // TELA: snapshot da janela e análise de pixels do palco.
+        try? FileManager.default.createDirectory(atPath: "/tmp/krit-editor", withIntermediateDirectories: true)
+        let shotPath = "/tmp/krit-editor/wallpaper-apply.png"
+        let shotOK = Self.snapshotWindow(window, to: shotPath)
+        r["snapshot"] = shotOK ? shotPath : "FAILED"
+
+        var contentVisible = false, backgroundNotBlack = false
+        if shotOK, let data = FileManager.default.contents(atPath: shotPath),
+           let rep = NSBitmapImageRep(data: data) {
+            let w = rep.pixelsWide, h = rep.pixelsHigh
+            var redCount = 0, darkCount = 0, sampled = 0
+            // Varre o terço central-direito (palco; a sidebar ocupa a esquerda).
+            var x = w * 45 / 100
+            while x < w - 8 {
+                var y = h * 20 / 100
+                while y < h * 90 / 100 {
+                    guard let c = rep.colorAt(x: x, y: y) else { y += 12; continue }
+                    sampled += 1
+                    if c.redComponent > 0.55 && c.greenComponent < 0.35 && c.blueComponent < 0.35 { redCount += 1 }
+                    if c.redComponent < 0.06 && c.greenComponent < 0.06 && c.blueComponent < 0.06 { darkCount += 1 }
+                    y += 12
+                }
+                x += 12
+            }
+            r["pixelStats"] = ["sampled": sampled, "red": redCount, "nearBlack": darkCount]
+            contentVisible = sampled > 0 && redCount > sampled / 50
+            backgroundNotBlack = sampled > 0 && darkCount < sampled * 9 / 10
+        }
+        r["contentVisible"] = contentVisible
+        r["backgroundNotBlack"] = backgroundNotBlack
+
+        // Janela sã: não estourou o envelope padrão da tela.
+        let vf = NSScreen.main?.visibleFrame ?? .zero
+        let windowSane = frameAfter.width <= vf.width + 2 && frameAfter.height <= vf.height + 2
+        r["windowSane"] = windowSane
+
+        r["allPass"] = (r["optionsApplied"] as? Bool ?? false) && contentVisible && backgroundNotBlack && windowSane
+        return r
+    }
+
+    // MARK: - Cenário: wallpaper-sweep (diagnóstico: TODOS os wallpapers)
+
+    /// Varre a lista inteira de wallpapers aplicando cada um pelo caminho real
+    /// (backgroundData + commit) e analisando o render do canvas: acha qualquer
+    /// wallpaper que pinte o fundo preto-uniforme (o relato do dono). Não entra
+    /// na bateria, é diagnóstico sob demanda.
+    private static func runWallpaperSweep() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let savedDefaultTemplate = TemplateStore.defaultTemplate?.name
+        TemplateStore.setDefault(name: nil)
+        defer { TemplateStore.setDefault(name: savedDefaultTemplate) }
+
+        let img = NSImage(size: NSSize(width: 600, height: 400))
+        img.lockFocus()
+        NSColor(srgbRed: 0.85, green: 0.12, blue: 0.10, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: 600, height: 400).fill()
+        img.unlockFocus()
+
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController,
+              let window = ctrl.window else {
+            r["error"] = "editor window did not open"; r["allPass"] = false; return r
+        }
+        defer { window.close() }
+
+        var failures: [String] = []
+        var checked = 0
+        let wallpapers = SystemWallpaperSource.all
+        r["total"] = wallpapers.count
+        try? FileManager.default.createDirectory(atPath: "/tmp/krit-editor", withIntermediateDirectories: true)
+
+        for wallpaper in wallpapers {
+            let data: Data? = await withCheckedContinuation { cont in
+                SystemWallpaperSource.backgroundData(for: wallpaper) { cont.resume(returning: $0) }
+            }
+            guard let data else { failures.append("\(wallpaper.name): data nil"); continue }
+            var opts = ctrl.uiTestOptions
+            opts.isEnabled = true
+            opts.style = .image
+            opts.presetName = wallpaper.name
+            opts.customImageName = wallpaper.name
+            opts.customImageData = data
+            ctrl.uiTestApplyBackground(opts)
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            checked += 1
+
+            // Render direto do pipeline (sem screenshot de janela): compõe e
+            // mede a uniformidade do fundo fora do slot do conteúdo.
+            let composed = ScreenshotBackgroundComposer.composeIfNeeded(img, options: opts)
+            guard let cg = composed.bestCGImage else { failures.append("\(wallpaper.name): compose nil"); continue }
+            var dark = 0, samples = 0
+            if let srgb = CGColorSpace(name: CGColorSpace.sRGB) {
+                let w = 64, h = 64
+                var buf = [UInt8](repeating: 0, count: w * h * 4)
+                if let bctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8,
+                                        bytesPerRow: w * 4, space: srgb,
+                                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    bctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+                    // Bordas (fundo): topo, base, esquerda, direita do downscale.
+                    for i in 0..<w {
+                        for row in [1, h - 2] {
+                            let o = (row * w + i) * 4
+                            samples += 1
+                            if buf[o] < 14 && buf[o+1] < 14 && buf[o+2] < 14 { dark += 1 }
+                        }
+                    }
+                }
+            }
+            if samples > 0 && dark > samples * 9 / 10 {
+                failures.append("\(wallpaper.name): fundo preto (\(dark)/\(samples))")
+            }
+        }
+        r["checked"] = checked
+        r["failures"] = failures
+        r["allPass"] = failures.isEmpty
+        return r
     }
 
     // MARK: - Cenário: alignment (âncoras seamless do composer)
