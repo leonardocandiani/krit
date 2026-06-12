@@ -88,6 +88,7 @@ final class UITestRunner: NSObject {
             case "overlay-postgesture": report = await Self.runOverlayPostGesture()
             case "update-check": report = await Self.runUpdateCheck()
             case "color-pick": report = await Self.runColorPick()
+            case "alignment": report = await Self.runAlignment()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -95,6 +96,79 @@ final class UITestRunner: NSObject {
                 try? data.write(to: URL(fileURLWithPath: outPath))
             }
         }
+    }
+
+    // MARK: - Cenário: alignment (âncoras seamless do composer)
+
+    /// Prova as âncoras de alinhamento no caminho REAL de compose: conteúdo
+    /// vermelho 400×300 num canvas 16:9 com padding, uma composição por âncora,
+    /// e o bounding box dos pixels vermelhos no PNG final tem que ENCOSTAR na
+    /// borda da âncora (semântica seamless do Snapzy) ou centrar no centro.
+    /// Pega regressão do alignedOrigin (o bug "alignment não faz nada" vinha
+    /// de free space zerado pelo inset em canvas justo).
+    private static func runAlignment() async -> [String: Any] {
+        var r: [String: Any] = [:]
+
+        let content = NSImage(size: NSSize(width: 400, height: 300))
+        content.lockFocus()
+        NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: 400, height: 300).fill()
+        content.unlockFocus()
+
+        var opts = ScreenshotBackgroundOptions.editorDefault
+        opts.isEnabled = true
+        opts.style = .solid
+        opts.colorHex = "#101418"
+        opts.padding = 64
+        opts.cornerRadius = 0
+        opts.shadow = 0
+        opts.aspectPreset = .ratio16x9
+
+        // Bounding box dos pixels vermelhos, em pontos, row 0 = topo.
+        func redBox(_ image: NSImage) -> (left: Int, right: Int, top: Int, bottom: Int, w: Int, h: Int)? {
+            let w = Int(image.size.width.rounded()), h = Int(image.size.height.rounded())
+            guard w > 0, h > 0, let cg = image.bestCGImage,
+                  let srgb = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+            var buf = [UInt8](repeating: 0, count: w * h * 4)
+            guard let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w * 4, space: srgb,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+            var minX = w, maxX = -1, minY = h, maxY = -1
+            for row in 0..<h {
+                for col in 0..<w {
+                    let o = (row * w + col) * 4
+                    if buf[o] > 200 && buf[o + 1] < 100 && buf[o + 2] < 100 {
+                        if col < minX { minX = col }; if col > maxX { maxX = col }
+                        if row < minY { minY = row }; if row > maxY { maxY = row }
+                    }
+                }
+            }
+            guard maxX >= 0 else { return nil }
+            return (minX, maxX, minY, maxY, w, h)
+        }
+
+        let tol = 2
+        var all = true
+        let cases: [(String, BackgroundAlignment, ((Int, Int, Int, Int, Int, Int)) -> Bool)] = [
+            ("bottom",      .bottom,      { $0.3 >= $0.5 - 1 - tol && abs($0.0 - ($0.4 - 1 - $0.1)) <= tol }),
+            ("topRight",    .topRight,    { $0.2 <= tol && $0.1 >= $0.4 - 1 - tol }),
+            ("bottomLeft",  .bottomLeft,  { $0.3 >= $0.5 - 1 - tol && $0.0 <= tol }),
+            ("center",      .center,      { abs($0.0 - ($0.4 - 1 - $0.1)) <= tol && abs($0.2 - ($0.5 - 1 - $0.3)) <= tol }),
+        ]
+        for (name, alignment, check) in cases {
+            opts.alignment = alignment
+            let composed = ScreenshotBackgroundComposer.composeIfNeeded(content, options: opts)
+            guard composed !== content, let box = redBox(composed) else {
+                r[name] = "compose/scan failed"; all = false; continue
+            }
+            let pass = check(box)
+            r[name] = ["left": box.left, "right": box.right, "top": box.top, "bottom": box.bottom,
+                       "w": box.w, "h": box.h, "pass": pass]
+            if !pass { all = false }
+        }
+        r["allPass"] = all
+        return r
     }
 
     // MARK: - Cenário: color-pick (eyedropper end-to-end)
@@ -878,8 +952,19 @@ final class UITestRunner: NSObject {
         if parked { QuickAccessOverlay.uiTestRestoreAll(on: NSScreen.main) }
         try? await Task.sleep(nanoseconds: 900_000_000)
 
-        // 4. PREVIEW: Space open + close.
-        await hover()
+        // 4. PREVIEW: Space open + close. O Space só chega no card se ele for a
+        // key window NAQUELE instante (o monitor de teclado é local): re-asserta
+        // o hover até o probe confirmar, porque o cursor físico do usuário
+        // disputa com o sintético (flaky conhecido de CGEvent em Mac em uso).
+        func armCard() async -> Bool {
+            for _ in 0..<5 {
+                await hover()
+                if (QuickAccessOverlay.uiTestHoverState()["isKey"] as? Bool) == true { return true }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            return false
+        }
+        r["spaceArmed"] = await armCard()
         func postKey(_ code: CGKeyCode, down: Bool) {
             CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)?.post(tap: .cghidEventTap)
         }
@@ -891,7 +976,7 @@ final class UITestRunner: NSObject {
         try? await Task.sleep(nanoseconds: 600_000_000)
 
         // 5. DELETE after preview: drag toward the stack edge past 40% width.
-        await hover()
+        r["deleteArmed"] = await armCard()
         let edge: CGFloat = Settings.overlayOnLeft ? -1 : 1
         let countBeforeDelete = QuickAccessOverlay.uiTestWindows.count
         await dragFrom(center(), by: CGVector(dx: edge * card.frame.width * 0.7, dy: 0),
@@ -968,9 +1053,18 @@ final class UITestRunner: NSObject {
             if let d = delta(k) { deltas[k] = d }
         }
         r["timelineMs"] = deltas
-        let ready = deltas["firstMouseMoved"] ?? -1
-        r["selectionLiveMs"] = ready
-        r["allPass"] = ready >= 0 && ready <= 450
+        // O elo que o usuário sente é hotkey → janela de seleção key (overlay na
+        // tela e recebendo eventos). firstMouseMoved continua reportado, mas só
+        // prova fluxo de eventos: seu timestamp depende de QUANDO o harness
+        // posta o wiggle sintético (sob carga o key-up já saiu a 600ms, inflando
+        // a medida sem nenhum atraso do app).
+        let hotkeyMs = deltas["hotkeyFired"] ?? -1
+        let keyMs = deltas["becameKey"] ?? -1
+        let live = (hotkeyMs >= 0 && keyMs >= hotkeyMs) ? keyMs - hotkeyMs : -1
+        r["selectionLiveMs"] = live
+        let mouseFlow = (deltas["firstMouseMoved"] ?? -1) >= 0
+        r["mouseFlowPass"] = mouseFlow
+        r["allPass"] = live >= 0 && live <= 450 && mouseFlow
         return r
     }
 
