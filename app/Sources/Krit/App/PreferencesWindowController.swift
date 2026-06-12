@@ -224,6 +224,12 @@ private final class PreferencesSidebar {
                 x: horizontalInset, y: y,
                 width: width - horizontalInset * 2, height: rowHeight
             )
+            // Anchor to the TOP edge: the frames above are computed from the
+            // initial height, and the default mask pins them to the bottom, so
+            // any window-height change pushed the first rows under the traffic
+            // lights. A flexible bottom margin keeps the 56pt top clearance at
+            // every height.
+            row.view.autoresizingMask = [.minYMargin]
             view.addSubview(row.view)
             rows[tab] = row
             y -= gap
