@@ -95,7 +95,7 @@ final class BackgroundSidebar: NSView {
     private let insetValue = makeValueLabel()
     private let shadowValue = makeValueLabel()
     private let cornerValue = makeValueLabel()
-    private let autoBalanceCheckbox = NSButton()
+    private let autoBalanceSwitch = NSSwitch()
     private let blurCheckbox = NSButton()
     private let ratioPopup = NSPopUpButton()
     private var alignmentButtons: [NSButton] = []
@@ -474,7 +474,11 @@ final class BackgroundSidebar: NSView {
     private func makeNoneButton() -> NSView {
         let button = NSButton(title: "None", target: self, action: #selector(selectNone))
         button.setButtonType(.pushOnPushOff)
-        button.bezelStyle = .rounded
+        if #available(macOS 26.0, *) {
+            button.bezelStyle = .glass
+        } else {
+            button.bezelStyle = .rounded
+        }
         button.translatesAutoresizingMaskIntoConstraints = false
         button.widthAnchor.constraint(equalToConstant: Style.innerWidth).isActive = true
         noneButton = button
@@ -659,21 +663,20 @@ final class BackgroundSidebar: NSView {
         cornerSlider.maxValue = 36
         configureSlider(cornerSlider)
 
-        autoBalanceCheckbox.setButtonType(.switch)
-        autoBalanceCheckbox.title = "Auto-balance"
-        autoBalanceCheckbox.toolTip = "Rebalance the framing (padding, inset, shadow, corners) around the screenshot. Leaves the background unchanged."
-        autoBalanceCheckbox.font = .systemFont(ofSize: 11)
-        autoBalanceCheckbox.controlSize = .small
-        autoBalanceCheckbox.target = self
-        autoBalanceCheckbox.action = #selector(autoBalanceToggled(_:))
-        autoBalanceCheckbox.translatesAutoresizingMaskIntoConstraints = false
+        // Native macOS switch (the one the Settings panes use); flips on, fires
+        // the one-shot rebalance and syncControls rests it back to off.
+        autoBalanceSwitch.controlSize = .mini
+        autoBalanceSwitch.toolTip = "Rebalance the framing (padding, inset, shadow, corners) around the screenshot. Leaves the background unchanged."
+        autoBalanceSwitch.target = self
+        autoBalanceSwitch.action = #selector(autoBalanceToggled(_:))
+        autoBalanceSwitch.translatesAutoresizingMaskIntoConstraints = false
 
         // Layout em pares, como a referência: Padding cheio; Inset+Auto-balance;
         // Shadow+Corners; Alignment+Ratio. Compacto sem perder o valor mono.
         stack.addArrangedSubview(labeledControl("Padding", paddingSlider, value: paddingValue))
         stack.addArrangedSubview(pairRow(
             labeledControl("Inset", insetSlider, value: insetValue),
-            checkboxColumn(autoBalanceCheckbox)
+            checkboxColumn(autoBalanceRow())
         ))
         stack.addArrangedSubview(pairRow(
             labeledControl("Shadow", shadowSlider, value: shadowValue),
@@ -713,8 +716,8 @@ final class BackgroundSidebar: NSView {
         return column
     }
 
-    /// Checkbox alinhado verticalmente com o slider vizinho do par.
-    private func checkboxColumn(_ checkbox: NSButton) -> NSView {
+    /// Controle alinhado verticalmente com o slider vizinho do par.
+    private func checkboxColumn(_ control: NSView) -> NSView {
         let column = NSStackView()
         column.orientation = .vertical
         column.alignment = .leading
@@ -724,8 +727,23 @@ final class BackgroundSidebar: NSView {
         spacer.translatesAutoresizingMaskIntoConstraints = false
         spacer.heightAnchor.constraint(equalToConstant: 14).isActive = true
         column.addArrangedSubview(spacer)
-        column.addArrangedSubview(checkbox)
+        column.addArrangedSubview(control)
         return column
+    }
+
+    /// O switch nativo com o rótulo ao lado; o NSSwitch não carrega título.
+    private func autoBalanceRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(labelWithString: "Auto-balance")
+        label.font = .systemFont(ofSize: 11)
+        label.toolTip = autoBalanceSwitch.toolTip
+        row.addArrangedSubview(autoBalanceSwitch)
+        row.addArrangedSubview(label)
+        return row
     }
 
     private func configureSlider(_ slider: NSSlider) {
@@ -782,7 +800,11 @@ final class BackgroundSidebar: NSView {
         for (index, _) in order.enumerated() {
             let button = NSButton()
             button.title = ""
-            button.bezelStyle = .smallSquare
+            if #available(macOS 26.0, *) {
+                button.bezelStyle = .glass
+            } else {
+                button.bezelStyle = .smallSquare
+            }
             button.setButtonType(.toggle)
             button.tag = index
             button.target = self
@@ -985,7 +1007,7 @@ final class BackgroundSidebar: NSView {
         commit(next)
     }
 
-    @objc private func autoBalanceToggled(_ sender: NSButton) {
+    @objc private func autoBalanceToggled(_ sender: NSSwitch) {
         guard sender.state == .on else { return }
         // Auto-balance reorganizes the LAYOUT around the print (padding, inset,
         // shadow, corners), it never touches the background's style or colors. The
@@ -1036,13 +1058,17 @@ final class BackgroundSidebar: NSView {
         shadowSlider.doubleValue = Double(options.shadow)
         cornerSlider.doubleValue = Double(options.cornerRadius)
         updateValueLabels(for: options)
-        autoBalanceCheckbox.state = .off
+        autoBalanceSwitch.state = .off
         // Os thumbs da seção Blurred espelham o fundo selecionado no momento.
         refreshBlurPreviewsIfNeeded()
 
         let order = BackgroundAlignment.allCases
         for button in alignmentButtons {
-            button.state = (order[min(button.tag, order.count - 1)] == options.alignment) ? .on : .off
+            let selected = order[min(button.tag, order.count - 1)] == options.alignment
+            button.state = selected ? .on : .off
+            // O bezel glass não diferencia on/off sobre fundo escuro; o tint
+            // coral é quem marca a célula ativa.
+            button.bezelColor = selected ? KritColors.accent : nil
         }
 
         if let preset = options.aspectPreset,
