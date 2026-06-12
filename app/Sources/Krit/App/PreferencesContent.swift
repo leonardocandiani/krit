@@ -43,6 +43,19 @@ private struct PreferencesSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
+        if #available(macOS 14.0, *) {
+            form
+                // Margem de segurança DENTRO do scroll: o fim do conteúdo respira
+                // antes da borda da janela (sem isso a última row encosta seca).
+                // Margem interna não cria faixa morta no meio do scroll, ao
+                // contrário de um padding externo.
+                .contentMargins(.bottom, 24, for: .scrollContent)
+        } else {
+            form
+        }
+    }
+
+    private var form: some View {
         Form {
             content
         }
