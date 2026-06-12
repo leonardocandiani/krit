@@ -35,7 +35,9 @@ enum CaptureFlash {
         window.level = .screenSaver
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         window.hasShadow = false
-        window.sharingType = .none   // keep the flash out of any concurrent recording
+        // Keep the flash/ghost out of any concurrent recording. In UI-test mode
+        // it stays capturable so the harness can film the fly-to-tray handoff.
+        window.sharingType = ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" ? .readWrite : .none
 
         let host = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
         host.wantsLayer = true
@@ -132,13 +134,27 @@ enum CaptureFlash {
         spring.mass = 1; spring.stiffness = 300; spring.damping = 20; spring.initialVelocity = 0
         spring.duration = spring.settlingDuration
 
-        let scaleX = target.width / max(local.width, 1)
-        let scaleY = target.height / max(local.height, 1)
-        let scale = CASpringAnimation(keyPath: "transform.scale")
-        scale.fromValue = 1.0
-        scale.toValue = min(scaleX, scaleY)
-        scale.mass = 1; scale.stiffness = 300; scale.damping = 20
-        scale.duration = scale.settlingDuration
+        // Animate BOUNDS, not a uniform transform scale: with aspect-fill
+        // gravity the contents re-crop every frame, so the ghost lands with
+        // EXACTLY the slot's geometry. The old min(scaleX, scaleY) transform
+        // landed a wide capture as a short letterboxed strip, and the card
+        // revealing at full slot height underneath read as a visible glitch
+        // (the "appears broken, then snaps right" flick).
+        let boundsSpring = CASpringAnimation(keyPath: "bounds.size")
+        boundsSpring.fromValue = NSValue(size: local.size)
+        boundsSpring.toValue = NSValue(size: target.size)
+        boundsSpring.mass = 1; boundsSpring.stiffness = 300; boundsSpring.damping = 20
+        boundsSpring.duration = boundsSpring.settlingDuration
+
+        // Corner radius eases to the card's thumb radius so the rounded corners
+        // match at the moment of the handoff. The thumb radius scales with the
+        // overlay size setting (180/240/320 wide -> 10/12/14).
+        let cardRadius: CGFloat = target.width <= 200 ? 10 : (target.width <= 260 ? 12 : 14)
+        let radius = CABasicAnimation(keyPath: "cornerRadius")
+        radius.fromValue = 6
+        radius.toValue = cardRadius
+        radius.duration = spring.settlingDuration * 0.6
+        radius.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 1.0
@@ -149,10 +165,12 @@ enum CaptureFlash {
         fade.isRemovedOnCompletion = false
 
         snap.position = CGPoint(x: target.midX, y: target.midY)
-        snap.transform = CATransform3DMakeScale(min(scaleX, scaleY), min(scaleX, scaleY), 1)
+        snap.bounds = CGRect(origin: .zero, size: target.size)
+        snap.cornerRadius = cardRadius
         snap.opacity = 0
         snap.add(spring, forKey: "fly-pos")
-        snap.add(scale, forKey: "fly-scale")
+        snap.add(boundsSpring, forKey: "fly-bounds")
+        snap.add(radius, forKey: "fly-radius")
         snap.add(fade, forKey: "fly-fade")
 
         tearDown(window, after: max(spring.settlingDuration, 0.42) + 0.05)

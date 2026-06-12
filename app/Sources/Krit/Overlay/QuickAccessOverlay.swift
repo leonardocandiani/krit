@@ -321,6 +321,12 @@ private final class QuickAccessWindow: NSWindow {
     private var metrics: OverlayMetrics
 
     // O4/O1 card-drag state (mouse-drag of the card background).
+    /// Diagnostics for the harness: how many keyDowns reached the local monitor
+    /// and how many the hover/ownership gate dropped.
+    nonisolated(unsafe) static var uiTestKeySeen = 0
+    nonisolated(unsafe) static var uiTestKeyGateDrop = 0
+    /// The app that was frontmost before this card borrowed the keyboard.
+    private var borrowedFromApp: NSRunningApplication?
     private var cardDragStartMouse: NSPoint?
     private var cardDragStartOrigin: NSPoint?
     private var isCardDragging = false
@@ -398,7 +404,9 @@ private final class QuickAccessWindow: NSWindow {
         isMovableByWindowBackground = false
         acceptsMouseMovedEvents = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        sharingType = .none  // overlay must never leak into a capture
+        // The overlay must never leak into a user's capture. In UI-test mode it
+        // stays capturable so the harness can film entrance animations.
+        sharingType = ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" ? .readWrite : .none
 
         buildContent()
         positionOverlay()
@@ -435,7 +443,7 @@ private final class QuickAccessWindow: NSWindow {
         isMovableByWindowBackground = false
         acceptsMouseMovedEvents = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        sharingType = .none
+        sharingType = ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" ? .readWrite : .none
 
         buildContent()
         positionOverlay()
@@ -463,10 +471,14 @@ private final class QuickAccessWindow: NSWindow {
         // Consumes the event (returns nil) so it isn't double-handled.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, !self.isClosing else { return event }
+            QuickAccessWindow.uiTestKeySeen += 1
             // O5': while zoomed the card owns the keyboard regardless of where the
             // cursor sits, so Space/Esc always collapse it (the hover gate would
             // otherwise drop the key the moment the mouse left the preview).
-            guard self.isPreviewZoomed || (self.mouseInsideOverlay && self.cursorOwnsThisCard()) else { return event }
+            guard self.isPreviewZoomed || (self.mouseInsideOverlay && self.cursorOwnsThisCard()) else {
+                QuickAccessWindow.uiTestKeyGateDrop += 1
+                return event
+            }
             return self.handleKey(event) ? nil : event
         }
 
@@ -547,24 +559,62 @@ private final class QuickAccessWindow: NSWindow {
     /// .accessory and activates so the local keyDown monitor starts receiving keys.
     private func grabKey() {
         guard !isClosing, !isParked, !isKeyWindow else { return }
+        // Remember whose keyboard we are borrowing, releaseKey hands focus back
+        // by ACTIVATING that app (the clean system path), never by deactivating
+        // ourselves into a half-resigned zombie window.
+        if !NSApp.isActive {
+            borrowedFromApp = NSWorkspace.shared.frontmostApplication
+        }
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
         makeKeyAndOrderFront(nil)
         makeFirstResponder(self)
+        // macOS 14+ cooperative activation: right after a releaseKey deactivate
+        // the app can still believe it is active, activate() no-ops and the
+        // makeKey above fails SILENTLY. That left the card hovered but key-less
+        // on every second approach ("works once, then I must click elsewhere").
+        // Re-assert through NSRunningApplication (the real system activation
+        // path) and retake key on the next runloop turn.
+        if !isKeyWindow {
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+            // The system processes the activation asynchronously; retake key in
+            // a short window instead of once, the first turn often runs before
+            // the activation lands.
+            for delay in [0.05, 0.15, 0.30, 0.50] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, !self.isClosing, !self.isParked,
+                          self.mouseInsideOverlay, !self.isKeyWindow else { return }
+                    NSApp.activate(ignoringOtherApps: true)
+                    self.makeKeyAndOrderFront(nil)
+                    self.makeFirstResponder(self)
+                }
+            }
+        }
     }
 
     /// Return focus when the cursor leaves: resign key so the user's app regains
     /// the keyboard. The Space companion preview never takes key (it ignores mouse
     /// events), so there is nothing to keep alive here, hover-exit already closed it.
     private func releaseKey() {
-        resignKey()
-        // Only hand the app back when the cursor isn't on another card, moving
-        // between overlapping cards (A6 cascade) just shifts key, no deactivate
-        // flicker. Defer so a sibling's grabKey (fired from its own monitor) lands
-        // first; if a card still owns the cursor, keep the app active.
-        DispatchQueue.main.async {
+        // NEVER call resignKey() directly (the docs forbid it) and avoid bare
+        // NSApp.deactivate(): both leave NSApp.keyWindow pointing at a window
+        // whose isKeyWindow is false, a zombie state in which every later
+        // makeKeyAndOrderFront no-ops and the card stops answering the keyboard
+        // until the user clicks some other app ("works once, then I must click
+        // elsewhere"). Handing focus back by ACTIVATING the previous app makes
+        // the system resign our key through the normal app-switch path. Only
+        // hand back when the cursor isn't on another card (A6 cascade just
+        // shifts key); defer so a sibling's grabKey lands first.
+        DispatchQueue.main.async { [weak self] in
             guard QuickAccessWindow.openWindows.allSatisfy({ !$0.cursorOwnsThisCard() }) else { return }
-            NSApp.deactivate()
+            let prev = self?.borrowedFromApp
+            self?.borrowedFromApp = nil
+            if let prev, !prev.isTerminated,
+               prev.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                prev.activate()
+            } else {
+                NSApp.deactivate()
+            }
         }
     }
 
@@ -1857,10 +1907,20 @@ private final class QuickAccessWindow: NSWindow {
             card.mouseInsideOverlay = underCursor
             card.updateHoverFocus(underCursor)
             if !underCursor { card.restartDismissTimer() }
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.15
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                card.animator().alphaValue = 1
+            if delay > 0 {
+                // The ghost is still fully opaque ON TOP of the card at this
+                // moment, so the card snaps to opaque underneath it and only the
+                // ghost fades out above. Cross-fading both at once dipped the
+                // luminance mid-blend (both layers half transparent over the
+                // desktop), which read as the "appears broken, then snaps" flick.
+                card.alphaValue = 1
+            } else {
+                // No ghost (Reduce Motion or no image): plain fade-in at the slot.
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.15
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    card.animator().alphaValue = 1
+                }
             }
         }
     }
@@ -3204,10 +3264,39 @@ extension QuickAccessOverlay {
     @MainActor static func uiTestGestureState() -> String {
         (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestGestureState ?? "none"
     }
+
+    /// Hover/focus snapshot of the newest card, for the harness to assert that a
+    /// SECOND hover still arms the card (the "interaction works once, then I have
+    /// to click elsewhere" report): mouseInside, isKey, app active, controls alpha.
+    @MainActor static func uiTestHoverState() -> [String: Any] {
+        guard let card = QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow else {
+            return ["exists": false]
+        }
+        return card.uiTestHoverSnapshot()
+    }
 }
 
 private extension QuickAccessWindow {
     static var uiTestOpenWindows: [NSWindow] { openWindows }
+    func uiTestHoverSnapshot() -> [String: Any] {
+        [
+            "exists": true,
+            "mouseInside": mouseInsideOverlay,
+            "isKey": isKeyWindow,
+            "appActive": NSApp.isActive,
+            "controlsAlpha": controlsOverlay?.alphaValue ?? -1,
+            "hovered": isHovered,
+            "keyWindowClass": NSApp.keyWindow.map { String(describing: type(of: $0)) } ?? "none",
+            "keyWindowVisible": NSApp.keyWindow?.isVisible ?? false,
+            "cardCount": QuickAccessWindow.openWindows.count,
+            "keyCardIndex": NSApp.keyWindow.flatMap { kw in
+                QuickAccessWindow.openWindows.firstIndex { $0 === kw }
+            } ?? -1,
+            "cardFrames": QuickAccessWindow.openWindows.map { "\(Int($0.frame.origin.x)),\(Int($0.frame.origin.y)) \(Int($0.frame.width))x\(Int($0.frame.height))" },
+            "keySeen": QuickAccessWindow.uiTestKeySeen,
+            "keyGateDrop": QuickAccessWindow.uiTestKeyGateDrop,
+        ]
+    }
     var uiTestIsParked: Bool { isParked }
     var uiTestIsZoomed: Bool { isPreviewZoomed }
     func uiTestForceCleanup() { forceCleanup() }
