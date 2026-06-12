@@ -1,9 +1,9 @@
 cask "krit" do
-  version "0.17.0"
+  version "0.17.1"
 
   # Digest of the published DMG; release.sh prints it ("DMG sha256:") for each
   # release. Update version and sha256 together, never one without the other.
-  sha256 "916553578ac309a726981b1c2e7414e395f2e1b842db74be87d294968ad7fdf6"
+  sha256 "e3d516661241191b088a2962dcbc2213aa057c1e8dc850c3bb5cee5bc0b69fab"
 
   # The artifact name MUST match what app/make-dmg.sh produces
   # (KRIT-v#{version}-macOS.dmg). Any mismatch breaks cask installation.
