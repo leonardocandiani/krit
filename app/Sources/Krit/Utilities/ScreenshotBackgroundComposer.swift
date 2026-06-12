@@ -145,7 +145,19 @@ struct ScreenshotBackgroundOptions: Equatable, Codable {
         // Sage, muted desaturated green, calm and editorial.
         .init(name: "Sage",          startHex: "#141d16", endHex: "#a8c2a0", accentHexes: ["#7fa078", "#d2e0c8", "#6a8a66"]),
         // Mono cream, near-white warm paper for light layouts.
-        .init(name: "Mono Cream",    startHex: "#faf7f2", endHex: "#e6dfd2", accentHexes: ["#efe7d8", "#f5f0e8", "#ddd2c0"])
+        .init(name: "Mono Cream",    startHex: "#faf7f2", endHex: "#e6dfd2", accentHexes: ["#efe7d8", "#f5f0e8", "#ddd2c0"]),
+
+        // Flowing-wave palettes: organic layered waves over the mesh base.
+        // Warm amber dune light rolling over deep umber.
+        .init(name: "Amber Flow",    startHex: "#20100a", endHex: "#ff9a4f", accentHexes: ["#ff7a3f", "#ffc070", "#d9543f"], waves: true),
+        // Midnight indigo swells with an electric crest.
+        .init(name: "Indigo Flow",   startHex: "#0a0a2e", endHex: "#5a5af0", accentHexes: ["#3a3ad9", "#8f6fff", "#2a2a80"], waves: true),
+        // Airy pastel cyan mist, soft and light.
+        .init(name: "Cyan Drift",    startHex: "#0e2433", endHex: "#9fd9e8", accentHexes: ["#6fc0d9", "#c0a8f0", "#8fd9c0"], waves: true),
+        // Vivid magenta surf over a dark plum sea.
+        .init(name: "Magenta Tide",  startHex: "#240a2e", endHex: "#ff6fd9", accentHexes: ["#d94fff", "#ff8fa8", "#8f3fd9"], waves: true),
+        // Deep violet rollers with a soft lavender crest.
+        .init(name: "Violet Surge",  startHex: "#160a33", endHex: "#8f6fff", accentHexes: ["#6f4fe0", "#b08fff", "#4f2fa8"], waves: true)
     ]
 
     static let editorDefault = ScreenshotBackgroundOptions(
@@ -173,6 +185,9 @@ struct ScreenshotBackgroundImagePreset: Equatable {
     let startHex: String
     let endHex: String
     let accentHexes: [String]
+    // Organic flowing wave layers over the mesh base (the Snapzy-style look).
+    // The classic presets keep the pure bloom field.
+    var waves: Bool = false
 }
 
 enum ScreenshotBackgroundComposer {
@@ -530,7 +545,8 @@ enum ScreenshotBackgroundComposer {
             rect: rect,
             start: color(from: preset.startHex),
             end: color(from: preset.endHex),
-            accents: preset.accentHexes.map(color(from:))
+            accents: preset.accentHexes.map(color(from:)),
+            waves: preset.waves
         )
     }
 
@@ -542,7 +558,7 @@ enum ScreenshotBackgroundComposer {
     // blobs, an overhead sheen, a gentle corner vignette for real depth, and a
     // fine dither that erases 8-bit banding even on 2000px+ canvases. Every layer
     // is keyed off the base luminance so light and dark palettes both stay clean.
-    private static func drawMesh(in context: CGContext, rect: CGRect, start: NSColor, end: NSColor, accents: [NSColor]) {
+    private static func drawMesh(in context: CGContext, rect: CGRect, start: NSColor, end: NSColor, accents: [NSColor], waves: Bool = false) {
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         let maxDim = max(rect.width, rect.height)
         let light = isLightBase(start, end)
@@ -591,9 +607,13 @@ enum ScreenshotBackgroundComposer {
         //    blue+teal, indigo+violet) and the preset reads at a glance. Saturation
         //    is boosted first so the hue is vivid; the soft mid stop in
         //    drawGradientGlow feathers each field so it blends instead of edging.
-        let fieldSpec: [(radius: CGFloat, alpha: CGFloat)] = light
+        // With wave layers on top, the radial fields drop to a supporting role:
+        // full strength would wash the swells into texture.
+        let fieldDamp: CGFloat = waves ? 0.45 : 1.0
+        let fieldSpec: [(radius: CGFloat, alpha: CGFloat)] = (light
             ? [(1.05, 0.52), (0.95, 0.44), (0.86, 0.36)]
-            : [(1.10, 0.66), (1.00, 0.56), (0.90, 0.46)]
+            : [(1.10, 0.66), (1.00, 0.56), (0.90, 0.46)])
+            .map { (radius: $0.0, alpha: $0.1 * fieldDamp) }
         for (index, accent) in accents.prefix(3).enumerated() {
             let center = anchors[index % anchors.count]
             let spec = fieldSpec[index]
@@ -614,6 +634,14 @@ enum ScreenshotBackgroundComposer {
             drawGradientGlow(in: context, rect: rect, color: saturated(lead, by: 1.2),
                              center: anchors[0], radius: maxDim * 0.60, alpha: 0.30)
             context.restoreGState()
+        }
+
+        // 2c. Organic wave layers (the Snapzy-style flowing look): stacked soft
+        //     swells rising from the bottom, each filled with a vertical gradient
+        //     of a palette tone and crowned with a glowing crest line. Drawn under
+        //     the corner light and vignette so the atmosphere still grounds them.
+        if waves {
+            drawWaveLayers(in: context, rect: rect, start: start, end: end, accents: accents, light: light)
         }
 
         // 3. The end color as a CONTAINED corner light: a tight glow at the top-right
@@ -642,6 +670,102 @@ enum ScreenshotBackgroundComposer {
         //    where the eye catches steps most; it shifts luminance by under a code
         //    value, invisible as texture but enough to dissolve the contours.
         drawGrain(in: context, rect: rect, alpha: light ? 0.030 : 0.045)
+    }
+
+    // Layered flowing waves. Each layer is a closed path: in from the left edge,
+    // two cubic swells across the field, down the right edge and back along the
+    // bottom. Geometry is FIXED per layer (no randomness) so a preset renders
+    // identically every time at any resolution. Three depth layers from back
+    // (darker, higher) to front (brighter, lower), each with a soft glow crest.
+    private static func drawWaveLayers(in context: CGContext, rect: CGRect, start: NSColor, end: NSColor, accents: [NSColor], light: Bool) {
+        let tones: [NSColor] = [
+            accents.count > 2 ? accents[2] : end,
+            accents.count > 1 ? accents[1] : end,
+            accents.first ?? end
+        ]
+        // Per-layer alpha; the shapes themselves are hand-tuned in waveShapePath
+        // (one long diagonal swell, one double crest, one bold front roller) so
+        // the stack reads as rolling water, not concentric stripes.
+        let layerAlphas: [CGFloat] = light ? [0.45, 0.55, 0.65] : [0.55, 0.70, 0.85]
+        let layerTops: [CGFloat] = [0.74, 0.52, 0.36]
+        for index in 0..<3 {
+            let spec = (alpha: layerAlphas[index], top: layerTops[index])
+            let tone = saturated(tones[index], by: 1.2)
+            let deep = tone.blended(withFraction: 0.80, of: start) ?? tone
+            let path = waveShapePath(layer: index, in: rect)
+            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+            let topY = rect.minY + rect.height * spec.top
+
+            // Fill: a lit crest band falling into a deep shadowed face. Strong
+            // contrast between the top of the swell and its body is what makes
+            // the wave read as a 3D roller instead of a flat color band.
+            context.saveGState()
+            context.addPath(path)
+            context.clip()
+            if let fill = CGGradient(
+                colorsSpace: colorSpace,
+                colors: [tone.withAlphaComponent(spec.alpha).cgColor,
+                         tone.blended(withFraction: 0.45, of: start)!.withAlphaComponent(spec.alpha * 0.8).cgColor,
+                         deep.withAlphaComponent(spec.alpha * 0.65).cgColor] as CFArray,
+                locations: [0, 0.30, 1]
+            ) {
+                context.drawLinearGradient(
+                    fill,
+                    start: CGPoint(x: rect.midX, y: topY),
+                    end: CGPoint(x: rect.midX, y: rect.minY),
+                    options: [.drawsAfterEndLocation]
+                )
+            }
+            context.restoreGState()
+
+            // Crest light: a soft luminous band hugging the crest from above,
+            // clipped OUTSIDE the wave so the glow rims the edge like backlight.
+            let crestTone = tone.blended(withFraction: 0.35, of: end) ?? tone
+            context.saveGState()
+            context.addPath(path)
+            context.setBlendMode(light ? .normal : .screen)
+            context.setShadow(offset: .zero, blur: rect.height * 0.10,
+                              color: crestTone.withAlphaComponent(light ? 0.55 : 0.85).cgColor)
+            context.setStrokeColor(crestTone.withAlphaComponent(light ? 0.40 : 0.55).cgColor)
+            context.setLineWidth(max(2, rect.height * 0.010))
+            context.strokePath()
+            context.restoreGState()
+        }
+    }
+
+    // Three hand-tuned closed wave shapes (left edge -> swells -> right edge ->
+    // bottom). Each layer has its own period and diagonal so the stack reads as
+    // distinct rollers: a long back swell falling right, a lively double crest
+    // in the middle, and one bold front roller rising right. Coordinates are
+    // fractions of the rect, deterministic at any resolution.
+    private static func waveShapePath(layer: Int, in rect: CGRect) -> CGPath {
+        let w = rect.width, h = rect.height
+        func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: rect.minX + w * x, y: rect.minY + h * y)
+        }
+        let path = CGMutablePath()
+        path.move(to: pt(0, 0))
+        switch layer {
+        case 0:
+            // Back: one long swell cresting left of center, falling to the right.
+            path.addLine(to: pt(0, 0.58))
+            path.addCurve(to: pt(0.55, 0.62), control1: pt(0.18, 0.78), control2: pt(0.38, 0.74))
+            path.addCurve(to: pt(1.0, 0.34), control1: pt(0.74, 0.48), control2: pt(0.90, 0.38))
+        case 1:
+            // Middle: two crests with a deep trough, the lively layer.
+            path.addLine(to: pt(0, 0.30))
+            path.addCurve(to: pt(0.42, 0.26), control1: pt(0.14, 0.50), control2: pt(0.30, 0.34))
+            path.addCurve(to: pt(0.78, 0.46), control1: pt(0.55, 0.18), control2: pt(0.66, 0.46))
+            path.addCurve(to: pt(1.0, 0.26), control1: pt(0.88, 0.46), control2: pt(0.95, 0.34))
+        default:
+            // Front: low on the left, one bold roller rising to the right.
+            path.addLine(to: pt(0, 0.14))
+            path.addCurve(to: pt(0.52, 0.10), control1: pt(0.18, 0.06), control2: pt(0.36, 0.04))
+            path.addCurve(to: pt(1.0, 0.24), control1: pt(0.72, 0.18), control2: pt(0.88, 0.34))
+        }
+        path.addLine(to: pt(1.0, 0))
+        path.closeSubpath()
+        return path
     }
 
     // Bloom anchors that SPREAD the accent hues across the composition instead of
