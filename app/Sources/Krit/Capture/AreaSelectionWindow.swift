@@ -32,8 +32,10 @@ final class AreaSelectionWindow: NSObject {
 
     func prepareAndShow(engine: CaptureEngine) async {
         AreaSelectionDiag.mark("prepareEntry")
-        NSApp.setActivationPolicy(.accessory)
-        NSApp.activate(ignoringOtherApps: true)
+        // NUNCA ativar o KRIT aqui: o overlay é um painel não-ativante que vira
+        // key sozinho. Ativar o app desativava o app do usuário no instante do
+        // atalho, mudando seleção de texto/realce/aparência de foco exatamente
+        // no estado que ele queria fotografar (o bug "tira de seleção onde estou").
 
         // Overlays go up IMMEDIATELY so the selection is usable the instant the
         // hotkey fires. The frozen frames (loupe sampling + legacy crop source)
@@ -78,9 +80,9 @@ final class AreaSelectionWindow: NSObject {
     private func focusFirstOverlay() {
         guard !overlays.isEmpty, let first = overlays.first else { return }
         guard first.isVisible else { return }
-        NSApp.activate(ignoringOtherApps: true)
+        // Painel não-ativante: makeKey entrega teclado (Esc) sem tirar o app do
+        // usuário do estado ativo.
         first.makeKeyAndOrderFront(nil)
-        first.makeMain()
         first.makeFirstResponder(first.contentView)
     }
 
@@ -125,8 +127,9 @@ final class AreaSelectionWindow: NSObject {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         overlays.forEach { $0.orderOut(nil) }
         overlays.removeAll()
-        // Restore background-only policy
-        NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded()
+        // Sem restore de activation policy: este fluxo nunca escala o policy
+        // (painel não-ativante), então restaurar aqui só atropelaria outro fluxo
+        // que esteja legitimamente em .accessory (Preferences abertas, etc).
     }
 }
 
@@ -139,7 +142,7 @@ enum AreaSelectionDiag {
 }
 
 @MainActor
-private final class SelectionOverlayWindow: NSWindow {
+private final class SelectionOverlayWindow: NSPanel {
 
     var selectionHandler: ((CGRect, CGWindowID?) -> Void)?
     var cancelHandler: (() -> Void)?
@@ -155,9 +158,12 @@ private final class SelectionOverlayWindow: NSWindow {
         self.targetScreen = screen
         self.mode = mode
         self.overlayView = SelectionOverlayView(mode: mode, frozenImage: frozenImage)
+        // .nonactivatingPanel (estilo Spotlight): o painel recebe teclado e
+        // mouse SEM ativar o KRIT, então o app do usuário continua frontmost
+        // com seleção/realce intactos durante toda a seleção de área.
         super.init(
             contentRect: screen.frame,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -166,6 +172,8 @@ private final class SelectionOverlayWindow: NSWindow {
         level = .screenSaver
         ignoresMouseEvents = false
         acceptsMouseMovedEvents = true
+        hidesOnDeactivate = false
+        isFloatingPanel = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         contentView = overlayView
         overlayView.frame = NSRect(origin: .zero, size: screen.frame.size)
@@ -257,11 +265,18 @@ private final class SelectionOverlayView: NSView {
         if let old = trackingArea { removeTrackingArea(old) }
         let area = NSTrackingArea(
             rect: bounds,
-            options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited],
+            options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .cursorUpdate],
             owner: self
         )
         addTrackingArea(area)
         trackingArea = area
+    }
+
+    // O app fica INATIVO durante a seleção (painel não-ativante): NSCursor.push
+    // global não vale nesse estado, o cursor vem do cursorUpdate da janela sob
+    // o ponteiro. Garante o crosshair sempre que o cursor entra no overlay.
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.crosshair.set()
     }
 
     // MARK: - Drawing
@@ -571,10 +586,10 @@ private final class SelectionOverlayView: NSView {
     // MARK: - Mouse Events
 
     override func mouseDown(with event: NSEvent) {
-        // Safety net: if window isn't key (activation race on first capture),
-        // force it now so the subsequent drag events are delivered here.
+        // Safety net: if the panel isn't key (race on first capture), take key
+        // now so the drag events are delivered here. Never activates the app:
+        // the user's frontmost app must keep its focus appearance.
         if let win = window, !win.isKeyWindow {
-            NSApp.activate(ignoringOtherApps: true)
             win.makeKeyAndOrderFront(nil)
             win.makeFirstResponder(self)
         }
