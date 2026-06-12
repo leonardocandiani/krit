@@ -1,13 +1,9 @@
 cask "krit" do
-  version "0.15.4"
+  version "0.16.0"
 
-  # RELEASE BLOCKER: :no_check disables integrity verification and must not ship
-  # in a published tap. Before publishing, replace it with the real digest:
-  #   sha256 "<hash>"
-  # using the value release.sh prints ("DMG sha256:") for the matching release.
-  # :no_check is only acceptable for local testing before the first published
-  # release exists (no DMG to hash yet).
-  sha256 :no_check
+  # Digest of the published DMG; release.sh prints it ("DMG sha256:") for each
+  # release. Update version and sha256 together, never one without the other.
+  sha256 "6145da1461b0acee7b48e0aa29735406761e956633f73d153db10e1d5ba0164a"
 
   # The artifact name MUST match what app/make-dmg.sh produces
   # (KRIT-v#{version}-macOS.dmg). Any mismatch breaks cask installation.
