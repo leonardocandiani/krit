@@ -199,7 +199,7 @@ final class AnnotationCanvas: NSView {
         case .line, .freehand, .highlighter:               cursor = .crosshair
         case .text:                                        cursor = .iBeam
         case .numberedStep:                                cursor = .pointingHand
-        case .blur, .pixelate, .crop:                      cursor = .crosshair
+        case .blur, .pixelate, .crop, .eyedropper:         cursor = .crosshair
         }
         addCursorRect(bounds, cursor: cursor)
     }
@@ -386,6 +386,26 @@ final class AnnotationCanvas: NSView {
             height: clipped.height * scaleY
         )
     }
+
+    // MARK: - Eyedropper
+
+    /// Samples the captured image's pixel under the click, copies its hex and
+    /// confirms with a toast. Reads the BACKGROUND image (the shot itself), the
+    /// color the user is after; annotation strokes on top are not flattened in.
+    private func handleEyedropperDown(at point: CGPoint) {
+        guard let backgroundImage, let cg = backgroundImage.bestCGImage else { return }
+        let imageSize = CGSize(width: cg.width, height: cg.height)
+        guard let imgRect = viewRectToCGImageRect(
+            CGRect(x: point.x, y: point.y, width: 1, height: 1), imageSize: imageSize
+        ), let hex = PixelSampler.hex(in: cg, x: Int(imgRect.origin.x), y: Int(imgRect.origin.y)) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(hex, forType: .string)
+        ToastWindow.show(message: "\(hex) copied")
+    }
+
+    /// Test hook: runs the eyedropper click path at a canvas-space point.
+    func uiTestEyedrop(at point: CGPoint) { handleEyedropperDown(at: point) }
 
     // MARK: - Highlighter OCR snapping
 
@@ -1103,6 +1123,10 @@ final class AnnotationCanvas: NSView {
             objects.append(step)
             setSelection([step])
             setNeedsDisplay(bounds)
+            return
+        }
+        if activeTool == .eyedropper {
+            handleEyedropperDown(at: point)
             return
         }
 
@@ -2576,6 +2600,7 @@ final class AnnotationCanvas: NSView {
             case "b": activeTool = .blur; return
             case "p": activeTool = .pixelate; return
             case "c": activeTool = .crop; return
+            case "i": activeTool = .eyedropper; return
             default: break
             }
         }

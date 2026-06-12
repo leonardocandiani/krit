@@ -463,6 +463,7 @@ private struct ShortcutsForm: View {
         Section("Tools") {
             KeyboardShortcuts.Recorder("Capture text (OCR)", name: .ocrCapture)
             KeyboardShortcuts.Recorder("Scrolling capture", name: .scrollingCapture)
+            KeyboardShortcuts.Recorder("Pick color", name: .pickColor)
         }
 
         Section {

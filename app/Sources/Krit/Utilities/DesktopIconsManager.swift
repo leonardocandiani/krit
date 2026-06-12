@@ -16,18 +16,52 @@ enum DesktopIconsManager {
         desktopIconsVisible ? hide() : show()
     }
 
+    /// Per-screen cover windows that visually hide the icons during a capture.
+    @MainActor private static var coverWindows: [NSWindow] = []
+
+    /// Capture-scoped hiding: covers the desktop-icon layer with the current
+    /// wallpaper on every screen. The old approach rewrote Finder's
+    /// CreateDesktop pref and KILLED/relaunched Finder, which yanked event
+    /// focus for ~half a second right as the selection overlay appeared (the
+    /// "hotkey takes forever to let me select" delay) and could abort file
+    /// operations. A cover window composes in one frame and is fully
+    /// reversible; SCK captures it in front of the icons, which is the point.
+    @MainActor
     static func hideForCapture() -> Bool {
         guard desktopIconsVisible else {
             isHidden = true
             return false
         }
-        hide()
+        guard coverWindows.isEmpty else { return true }
+        for screen in NSScreen.screens {
+            let win = NSWindow(contentRect: screen.frame, styleMask: [.borderless],
+                               backing: .buffered, defer: false)
+            win.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+            win.ignoresMouseEvents = true
+            win.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            win.isOpaque = true
+            win.hasShadow = false
+            win.isReleasedWhenClosed = false
+            if let data = SystemWallpaperSource.currentDesktopBackgroundData(for: screen),
+               let img = NSImage(data: data) {
+                let iv = NSImageView(frame: NSRect(origin: .zero, size: screen.frame.size))
+                iv.imageScaling = .scaleAxesIndependently
+                iv.image = img
+                win.contentView = iv
+            } else {
+                win.backgroundColor = .windowBackgroundColor
+            }
+            win.orderFrontRegardless()
+            coverWindows.append(win)
+        }
         return true
     }
 
+    @MainActor
     static func showAfterCapture(ifHiddenByCapture hiddenByCapture: Bool) {
         guard hiddenByCapture else { return }
-        show()
+        coverWindows.forEach { $0.orderOut(nil) }
+        coverWindows.removeAll()
     }
 
     static func hide() {

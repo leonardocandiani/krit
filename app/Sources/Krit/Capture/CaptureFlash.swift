@@ -8,6 +8,77 @@ import QuartzCore
 @MainActor
 enum CaptureFlash {
 
+    /// Shutter feedback alone: the white blink over the captured region, fired
+    /// BEFORE the SCK grab so the response to the gesture is instant (the grab
+    /// at supersampling scale plus template compose take long enough to read as
+    /// lag when the blink waits for them). This window is NEVER capturable
+    /// (sharingType .none unconditionally): it is on screen DURING the grab, so
+    /// even the UI-test gate must not let it leak into the shot it announces.
+    static func blink(rect: CGRect, on screen: NSScreen) {
+        let window = FlashWindow(
+            contentRect: screen.frame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.ignoresMouseEvents = true
+        window.level = .screenSaver
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        window.hasShadow = false
+        window.sharingType = .none
+
+        let host = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.clear.cgColor
+        window.contentView = host
+        window.orderFrontRegardless()
+
+        let local = CGRect(
+            x: rect.minX - screen.frame.minX,
+            y: rect.minY - screen.frame.minY,
+            width: rect.width,
+            height: rect.height
+        )
+        let flash = CALayer()
+        flash.frame = local
+        flash.backgroundColor = NSColor.white.cgColor
+        flash.opacity = 0
+        flash.cornerRadius = 4
+        flash.cornerCurve = .continuous
+        host.layer?.addSublayer(flash)
+
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.55
+            fade.toValue = 0
+            fade.duration = 0.15
+            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            flash.add(fade, forKey: "rm-flash")
+            tearDown(window, after: 0.2)
+            return
+        }
+
+        let up = CABasicAnimation(keyPath: "opacity")
+        up.fromValue = 0
+        up.toValue = 0.85
+        up.duration = 0.06
+        up.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        up.beginTime = 0
+        let down = CABasicAnimation(keyPath: "opacity")
+        down.fromValue = 0.85
+        down.toValue = 0
+        down.duration = 0.18
+        down.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        down.beginTime = 0.06
+        let group = CAAnimationGroup()
+        group.animations = [up, down]
+        group.duration = 0.24
+        flash.add(group, forKey: "flash")
+        tearDown(window, after: 0.3)
+    }
+
     /// Plays the flash (+ optional zoom-to-tray) on `screen`. Returns how long
     /// the flying snapshot takes to settle (0 when there is no fly), so the
     /// caller can reveal the real overlay card exactly under the ghost's landing.
@@ -18,10 +89,14 @@ enum CaptureFlash {
     /// - target: the REAL slot frame of the overlay card in global AppKit coords.
     ///   Without it the ghost lands on a generic 240×150 corner guess, which sat
     ///   on top of the real card at a different size: the post-capture flicker.
+    /// - includeBlink: false when the white blink already fired at the gesture
+    ///   (see `blink`), so this only flies the ghost into the slot.
     @discardableResult
     static func play(rect: CGRect, on screen: NSScreen, image: NSImage?, landLeft: Bool,
-                     target globalTarget: CGRect? = nil) -> TimeInterval {
+                     target globalTarget: CGRect? = nil, includeBlink: Bool = true) -> TimeInterval {
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        // Ghost-only call with nothing to fly: nothing to draw at all.
+        if !includeBlink && image == nil { return 0 }
 
         let window = FlashWindow(
             contentRect: screen.frame,
@@ -53,43 +128,50 @@ enum CaptureFlash {
             height: rect.height
         )
 
-        // 1. White flash clipped to the captured region.
-        let flash = CALayer()
-        flash.frame = local
-        flash.backgroundColor = NSColor.white.cgColor
-        flash.opacity = 0
-        flash.cornerRadius = 4
-        flash.cornerCurve = .continuous
-        host.layer?.addSublayer(flash)
+        // 1. White flash clipped to the captured region (skipped when the blink
+        //    already fired at the gesture).
+        if includeBlink {
+            let flash = CALayer()
+            flash.frame = local
+            flash.backgroundColor = NSColor.white.cgColor
+            flash.opacity = 0
+            flash.cornerRadius = 4
+            flash.cornerCurve = .continuous
+            host.layer?.addSublayer(flash)
 
-        if reduceMotion {
-            // A single soft cross-fade; no zoom.
-            let fade = CABasicAnimation(keyPath: "opacity")
-            fade.fromValue = 0.55
-            fade.toValue = 0
-            fade.duration = 0.15
-            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            flash.add(fade, forKey: "rm-flash")
-            tearDown(window, after: 0.2)
+            if reduceMotion {
+                // A single soft cross-fade; no zoom.
+                let fade = CABasicAnimation(keyPath: "opacity")
+                fade.fromValue = 0.55
+                fade.toValue = 0
+                fade.duration = 0.15
+                fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                flash.add(fade, forKey: "rm-flash")
+                tearDown(window, after: 0.2)
+                return 0
+            }
+
+            let up = CABasicAnimation(keyPath: "opacity")
+            up.fromValue = 0
+            up.toValue = 0.85
+            up.duration = 0.06
+            up.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            up.beginTime = 0
+            let down = CABasicAnimation(keyPath: "opacity")
+            down.fromValue = 0.85
+            down.toValue = 0
+            down.duration = 0.18
+            down.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            down.beginTime = 0.06
+            let group = CAAnimationGroup()
+            group.animations = [up, down]
+            group.duration = 0.24
+            flash.add(group, forKey: "flash")
+        } else if reduceMotion {
+            // Blink already happened and motion is reduced: no zoom either.
+            tearDown(window, after: 0.05)
             return 0
         }
-
-        let up = CABasicAnimation(keyPath: "opacity")
-        up.fromValue = 0
-        up.toValue = 0.85
-        up.duration = 0.06
-        up.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        up.beginTime = 0
-        let down = CABasicAnimation(keyPath: "opacity")
-        down.fromValue = 0.85
-        down.toValue = 0
-        down.duration = 0.18
-        down.timingFunction = CAMediaTimingFunction(name: .easeIn)
-        down.beginTime = 0.06
-        let group = CAAnimationGroup()
-        group.animations = [up, down]
-        group.duration = 0.24
-        flash.add(group, forKey: "flash")
 
         // 2. Zoom-to-tray: the shot flies into the overlay's corner slot.
         guard let image, let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {

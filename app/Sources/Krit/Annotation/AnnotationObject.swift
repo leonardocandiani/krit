@@ -4,7 +4,7 @@ import AppKit
 
 enum AnnotationTool: String, CaseIterable {
     case select, arrow, rectangle, filledRectangle, ellipse, line, freehand
-    case text, numberedStep, highlighter, blur, pixelate, crop
+    case text, numberedStep, highlighter, blur, pixelate, crop, eyedropper
 
     var icon: String {
         switch self {
@@ -23,6 +23,7 @@ enum AnnotationTool: String, CaseIterable {
         case .blur:            return "camera.filters"
         case .pixelate:        return "square.grid.3x3.fill"
         case .crop:            return "crop"
+        case .eyedropper:      return "eyedropper"
         }
     }
 
@@ -41,6 +42,7 @@ enum AnnotationTool: String, CaseIterable {
         case .blur:            return "Blur (B)"
         case .pixelate:        return "Pixelate (P)"
         case .crop:            return "Crop (C)"
+        case .eyedropper:      return "Pick Color (I)"
         }
     }
 }

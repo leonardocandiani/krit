@@ -8,7 +8,7 @@ import KeyboardShortcuts
 @MainActor
 final class HotkeyManager {
 
-    // `onKeyUp` appends handlers, so calling register twice would double-fire
+    // `onKeyDown` appends handlers, so calling register twice would double-fire
     // every capture. AppDelegate calls registerHotkeys() more than once (launch
     // plus the native-shortcut prompt callback), so install exactly once.
     private var didInstall = false
@@ -20,7 +20,7 @@ final class HotkeyManager {
 
     // Preset shortcut names we've installed a handler for, so re-registration
     // installs exactly one handler per new preset and clears bindings for deleted
-    // ones. KeyboardShortcuts.onKeyUp appends, so we never re-add for the same name.
+    // ones. KeyboardShortcuts.onKeyDown appends, so we never re-add for the same name.
     private var installedPresetNames: Set<String> = []
 
     func register(captureEngine: CaptureEngine, historyManager: HistoryManager, onToggleHistory: @escaping () -> Void) {
@@ -29,39 +29,40 @@ final class HotkeyManager {
         self.captureEngine = captureEngine
         self.historyManager = historyManager
 
-        KeyboardShortcuts.onKeyUp(for: .captureArea) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .captureArea) { [weak captureEngine, weak historyManager] in
             guard let e = captureEngine, let h = historyManager else { return }
+            AreaSelectionDiag.mark("hotkeyFired")
             Task { await e.startAreaCapture(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyUp(for: .captureWindow) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .captureWindow) { [weak captureEngine, weak historyManager] in
             guard let e = captureEngine, let h = historyManager else { return }
             Task { await e.startWindowCapture(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyUp(for: .captureFullscreen) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .captureFullscreen) { [weak captureEngine, weak historyManager] in
             guard let e = captureEngine, let h = historyManager else { return }
             Task { await e.captureFullscreen(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyUp(for: .capturePreviousArea) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .capturePreviousArea) { [weak captureEngine, weak historyManager] in
             guard let e = captureEngine, let h = historyManager else { return }
             Task { await e.capturePreviousArea(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyUp(for: .allInOne) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .allInOne) { [weak captureEngine, weak historyManager] in
             guard let e = captureEngine, let h = historyManager else { return }
             Task { await e.startAllInOne(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyUp(for: .snapAndPaste) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .snapAndPaste) { [weak captureEngine, weak historyManager] in
             guard let e = captureEngine, let h = historyManager else { return }
             Task { await e.startSnapAndPaste(historyManager: h) }
         }
 
         // Record screen is a toggle, like CleanShot: while a recording is live the
         // shortcut stops it; otherwise it opens area recording (the primary case).
-        KeyboardShortcuts.onKeyUp(for: .recordScreen) { [weak captureEngine] in
+        KeyboardShortcuts.onKeyDown(for: .recordScreen) { [weak captureEngine] in
             guard let e = captureEngine else { return }
             if e.recordingActive {
                 e.stopRecording()
@@ -70,17 +71,22 @@ final class HotkeyManager {
             }
         }
 
-        KeyboardShortcuts.onKeyUp(for: .ocrCapture) { [weak captureEngine] in
+        KeyboardShortcuts.onKeyDown(for: .ocrCapture) { [weak captureEngine] in
             guard let e = captureEngine else { return }
             Task { await e.startOCRCapture() }
         }
 
-        KeyboardShortcuts.onKeyUp(for: .scrollingCapture) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .scrollingCapture) { [weak captureEngine, weak historyManager] in
             guard let e = captureEngine, let h = historyManager else { return }
             Task { await e.startScrollingCapture(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyUp(for: .captureHistory) { onToggleHistory() }
+        KeyboardShortcuts.onKeyDown(for: .pickColor) { [weak captureEngine] in
+            guard let e = captureEngine else { return }
+            Task { await e.startColorPick() }
+        }
+
+        KeyboardShortcuts.onKeyDown(for: .captureHistory) { onToggleHistory() }
 
         registerPresets()
     }
@@ -88,7 +94,7 @@ final class HotkeyManager {
     /// (Re)wires the dynamic per-preset shortcuts. Re-callable: AppDelegate wires
     /// PresetStore.onChange to this so adding/removing/editing a preset updates the
     /// live bindings. Idempotent per preset, the handler is installed once per name
-    /// (onKeyUp appends, so re-adding would double-fire) and looks the preset up by
+    /// (onKeyDown appends, so re-adding would double-fire) and looks the preset up by
     /// id at DISPATCH time, so editing a preset's rect/format/actions takes effect
     /// without reinstalling. Deleted presets get their binding cleared.
     func registerPresets() {
@@ -107,7 +113,7 @@ final class HotkeyManager {
             guard !installedPresetNames.contains(name.rawValue) else { continue }
             installedPresetNames.insert(name.rawValue)
             let presetID = preset.id
-            KeyboardShortcuts.onKeyUp(for: name) { [weak self] in
+            KeyboardShortcuts.onKeyDown(for: name) { [weak self] in
                 guard let self,
                       let engine = self.captureEngine,
                       let history = self.historyManager,

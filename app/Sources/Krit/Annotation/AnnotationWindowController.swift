@@ -1389,6 +1389,7 @@ final class AnnotationToolbar: NSView {
         let strip = makeToolStrip([
             .select, .rectangle, .filledRectangle, .ellipse, .line, .arrow,
             .text, .pixelate, .blur, .numberedStep, .freehand, .highlighter,
+            .eyedropper,
         ])
         main.addArrangedSubview(strip)
         toolStripView = strip

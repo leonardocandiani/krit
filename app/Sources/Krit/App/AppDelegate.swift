@@ -27,6 +27,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if port.start() { automationPort = port }
         setupStatusItem()
         registerHotkeys()
+        // Arms Sparkle's scheduled background update checks (the shared instance
+        // starts the updater on first touch).
+        _ = UpdaterManager.shared
         // Re-bind the dynamic per-preset hotkeys whenever a preset is added,
         // edited, or removed in Preferences.
         PresetStore.onChange = { [weak self] in self?.hotkeyManager.registerPresets() }
@@ -250,6 +253,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let about = NSMenuItem(title: "About KRIT", action: #selector(openAbout), keyEquivalent: "")
         about.target = self
         menu.addItem(about)
+
+        let updates = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        updates.target = self
+        menu.addItem(updates)
         menu.addItem(.separator())
 
         menu.addItem(header: "Capture")
@@ -272,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
         menu.addItem(header: "Tools")
         menu.addItem(title: "Capture Text (OCR)",   key: "o",  action: #selector(captureText), icon: "text.viewfinder")
+        menu.addItem(title: "Pick Color",           key: "",  action: #selector(pickColor), icon: "eyedropper")
         menu.addItem(title: "Scan QR Code",         key: "",  action: #selector(scanQRCode), icon: "qrcode.viewfinder")
         menu.addItem(title: "Open History",         key: "",  action: #selector(openHistory), icon: "clock.arrow.circlepath")
         menu.addItem(title: "Show Editor",          key: "",  action: #selector(showEditor), icon: "pencil.and.outline")
@@ -321,6 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func stopRecording()       { captureEngine.stopRecording() }
     @objc func reopenLastRecording() { captureEngine.reopenLastRecording() }
     @objc func captureText()         { Task { await captureEngine.startOCRCapture() } }
+    @objc func pickColor()           { Task { await captureEngine.startColorPick() } }
     @objc func scanQRCode()          { Task { await captureEngine.startQRCodeCapture() } }
     @objc func showEditor()          { AnnotationWindowController.bringOpenEditorsToFront() }
     @objc func annotateLastScreenshot() {
@@ -331,6 +340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func toggleDesktopIcons()  { DesktopIconsManager.toggle() }
     @objc func openPreferences()     { PreferencesWindowController.shared.show(tab: .general) }
     @objc func openAbout()           { PreferencesWindowController.shared.show(tab: .about) }
+    @objc func checkForUpdates()     { UpdaterManager.shared.checkForUpdates() }
 
     // MARK: - Recent captures (status item menu section)
 

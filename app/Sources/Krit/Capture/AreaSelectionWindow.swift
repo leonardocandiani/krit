@@ -1,9 +1,11 @@
 import AppKit
 
-enum SelectionMode { case area, window }
+enum SelectionMode { case area, window, colorPick }
 
 /// Full-screen translucent overlay that lets the user drag-select a region.
-/// In `.window` mode it highlights the window under the cursor instead.
+/// In `.window` mode it highlights the window under the cursor instead. In
+/// `.colorPick` mode a click samples the pixel under the loupe and reports
+/// its hex through `onColorPicked` (the rect completion only fires on cancel).
 @MainActor
 final class AreaSelectionWindow: NSObject {
 
@@ -12,6 +14,9 @@ final class AreaSelectionWindow: NSObject {
     // CGWindowID under the cursor so the caller can grab that window in
     // isolation (SCK) instead of recropping the screen rect.
     typealias Completion = (CGRect?, NSScreen, CGWindowID?) -> Void
+
+    /// `.colorPick` success path: the sampled pixel as "#RRGGBB".
+    var onColorPicked: ((String) -> Void)?
 
     private let mode: SelectionMode
     private let completion: Completion
@@ -26,6 +31,7 @@ final class AreaSelectionWindow: NSObject {
     private var keyMonitor: Any?
 
     func prepareAndShow(engine: CaptureEngine) async {
+        AreaSelectionDiag.mark("prepareEntry")
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -38,6 +44,7 @@ final class AreaSelectionWindow: NSObject {
             let overlay = SelectionOverlayWindow(screen: screen, mode: mode, frozenImage: nil)
             overlay.selectionHandler = { [weak self] rect, windowID in self?.finish(rect: rect, screen: screen, windowID: windowID) }
             overlay.cancelHandler = { [weak self] in self?.cancel() }
+            overlay.colorPickHandler = { [weak self] hex in self?.finishColorPick(hex) }
             overlay.show()
             overlays.append(overlay)
         }
@@ -52,6 +59,7 @@ final class AreaSelectionWindow: NSObject {
             }
         }
 
+        AreaSelectionDiag.mark("overlaysShown")
         focusFirstOverlay()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             self?.focusFirstOverlay()
@@ -91,6 +99,21 @@ final class AreaSelectionWindow: NSObject {
         finish(rect: rect, screen: screen, windowID: windowID)
     }
 
+    /// Test hooks: drive the color-pick click without synthetic mouse events
+    /// (CGEvent fights the user's physical mouse). Runs the exact mouseDown
+    /// sampling path against the real frozen frame.
+    var uiTestHasFrozenFrame: Bool { overlays.contains { $0.uiTestHasFrozenFrame } }
+    func uiTestPickColor(atScreen screenPoint: NSPoint) {
+        let overlay = overlays.first(where: { $0.frame.contains(screenPoint) }) ?? overlays.first
+        overlay?.uiTestPickColor(atScreen: screenPoint)
+    }
+
+    private func finishColorPick(_ hex: String) {
+        NSCursor.pop()
+        tearDown()
+        onColorPicked?(hex)
+    }
+
     func cancel() {
         NSCursor.pop()
         tearDown()
@@ -109,11 +132,20 @@ final class AreaSelectionWindow: NSObject {
 
 // MARK: - Overlay NSWindow
 
+/// Timeline diagnostics for the hotkey-to-selection path (UI tests read it).
+enum AreaSelectionDiag {
+    nonisolated(unsafe) static var timeline: [String: CFTimeInterval] = [:]
+    static func mark(_ name: String) { timeline[name] = CACurrentMediaTime() }
+}
+
 @MainActor
 private final class SelectionOverlayWindow: NSWindow {
 
     var selectionHandler: ((CGRect, CGWindowID?) -> Void)?
     var cancelHandler: (() -> Void)?
+    var colorPickHandler: ((String) -> Void)? {
+        didSet { overlayView.colorPickHandler = colorPickHandler }
+    }
 
     private let overlayView: SelectionOverlayView
     private let targetScreen: NSScreen
@@ -143,6 +175,11 @@ private final class SelectionOverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 
+    override func becomeKey() {
+        super.becomeKey()
+        if AreaSelectionDiag.timeline["becameKey"] == nil { AreaSelectionDiag.mark("becameKey") }
+    }
+
     /// Late-arriving frozen frame (captured async after the overlay is already
     /// on screen): hands it to the view so the loupe starts sampling.
     func setFrozenImage(_ image: CGImage) {
@@ -151,6 +188,12 @@ private final class SelectionOverlayWindow: NSWindow {
 
     func show() {
         orderFrontRegardless()
+    }
+
+    var uiTestHasFrozenFrame: Bool { overlayView.uiTestHasFrozenFrame }
+    func uiTestPickColor(atScreen screenPoint: NSPoint) {
+        let windowPoint = convertFromScreen(NSRect(origin: screenPoint, size: .zero)).origin
+        overlayView.uiTestPick(at: overlayView.convert(windowPoint, from: nil))
     }
 }
 
@@ -161,6 +204,7 @@ private final class SelectionOverlayView: NSView {
 
     var selectionHandler: ((CGRect, CGWindowID?) -> Void)?
     var cancelHandler:    (() -> Void)?
+    var colorPickHandler: ((String) -> Void)?
 
     private let mode: SelectionMode
     private var startPoint: NSPoint?
@@ -187,6 +231,11 @@ private final class SelectionOverlayView: NSView {
     func setFrozenImage(_ image: CGImage) {
         frozenImage = image
         needsDisplay = true
+    }
+
+    var uiTestHasFrozenFrame: Bool { frozenImage != nil }
+    func uiTestPick(at point: NSPoint) {
+        if let hex = sampledHex(at: point) { colorPickHandler?(hex) } else { cancelHandler?() }
     }
 
     init(mode: SelectionMode, frozenImage: CGImage?) {
@@ -272,14 +321,17 @@ private final class SelectionOverlayView: NSView {
             if let pos = mousePosition {
                 drawMagnifierLoupe(at: pos)
             }
-        } else if mode == .area {
-            // Area mode, pre-drag: near-invisible tint so macOS hit-tests this
-            // region and delivers mouseDown. Fully clear windows pass clicks through.
+        } else if mode == .area || mode == .colorPick {
+            // Pre-drag (area) and color-pick: near-invisible tint so macOS
+            // hit-tests this region and delivers mouseDown. Fully clear windows
+            // pass clicks through.
             NSColor.black.withAlphaComponent(0.001).setFill()
             NSBezierPath.fill(bounds)
             if let pos = mousePosition {
                 drawCrosshair(at: pos)
-                drawCoordinateLabel(at: pos)
+                // The hex pill under the loupe already names the pixel; screen
+                // coordinates would be noise while picking a color.
+                if mode == .area { drawCoordinateLabel(at: pos) }
                 drawMagnifierLoupe(at: pos)
             }
         }
@@ -288,28 +340,28 @@ private final class SelectionOverlayView: NSView {
     // MARK: - Magnifier Loupe
 
     private func drawMagnifierLoupe(at point: NSPoint) {
-        guard let window = window else { return }
-        
-        // Convert cursor point to the AppKit screen coordinate space
-        let screenPoint = window.convertToScreen(NSRect(origin: point, size: .zero)).origin
+        guard let frozenImage else { return }
 
-        // Capture region: 24x24 pixels around cursor
+        // Magnified region: 24x24 points around the cursor.
         let captureSize: CGFloat = 24
-        
-        // Use the frozen screen image to get pixels instantly!
-        // The frozenImage is full-screen, top-left origin (CoreGraphics standard).
-        // screenPoint.y is AppKit bottom-left, so we must invert it to sample the CGImage.
-        let screenHeight = window.screen?.frame.height ?? bounds.height
-        let cgY = screenHeight - screenPoint.y
-        
+
+        // The frozen frame covers exactly this screen and view coords are
+        // already screen-local (the overlay fills the screen), so no global
+        // conversion. The frame comes at the display's native pixel density
+        // (2x on Retina); measure the point-to-pixel factor from the buffer
+        // itself instead of assuming 1:1 — assuming it sampled the wrong
+        // quadrant on Retina and broke entirely on secondary displays.
+        let imgScale = CGFloat(frozenImage.width) / max(bounds.width, 1)
+        let topLeftY = bounds.height - point.y
+
         let captureRect = CGRect(
-            x: screenPoint.x - captureSize / 2,
-            y: cgY - captureSize / 2,
-            width: captureSize,
-            height: captureSize
+            x: (point.x - captureSize / 2) * imgScale,
+            y: (topLeftY - captureSize / 2) * imgScale,
+            width: captureSize * imgScale,
+            height: captureSize * imgScale
         )
 
-        guard let cgImage = frozenImage?.cropping(to: captureRect) else { return }
+        guard let cgImage = frozenImage.cropping(to: captureRect) else { return }
         let loupeSize: CGFloat = 120
         let offset: CGFloat = 20
 
@@ -385,41 +437,19 @@ private final class SelectionOverlayView: NSView {
         drawColorLabel(for: cgImage, below: loupeRect)
     }
 
+    /// Hex of the frozen-frame pixel under a view-space point (the same frame
+    /// the loupe magnifies, so click and loupe always agree). View coords are
+    /// screen-local; the buffer is top-left origin at native pixel density.
+    private func sampledHex(at point: NSPoint) -> String? {
+        guard let frozenImage else { return nil }
+        let imgScale = CGFloat(frozenImage.width) / max(bounds.width, 1)
+        let x = Int((point.x * imgScale).rounded(.down))
+        let y = Int(((bounds.height - point.y) * imgScale).rounded(.down))
+        return PixelSampler.hex(in: frozenImage, x: x, y: y)
+    }
+
     private func drawColorLabel(for image: CGImage, below loupeRect: NSRect) {
-        // Sample the center pixel of the captured image
-        let w = image.width, h = image.height
-        guard w > 0, h > 0 else { return }
-        let centerX = w / 2, centerY = h / 2
-
-        guard let dataProvider = image.dataProvider,
-              let data = dataProvider.data,
-              let ptr = CFDataGetBytePtr(data) else { return }
-
-        let bytesPerRow = image.bytesPerRow
-        let bytesPerPixel = image.bitsPerPixel / 8
-        guard bytesPerPixel >= 3 else { return }
-
-        let offset = centerY * bytesPerRow + centerX * bytesPerPixel
-        guard offset + 2 < CFDataGetLength(data) else { return }
-
-        // Pixel order depends on bitmap info; most CG captures are BGRA or RGBA
-        let alphaInfo = image.alphaInfo
-        let byteOrder = image.bitmapInfo.intersection(.byteOrderMask)
-        let r: UInt8, g: UInt8, b: UInt8
-        if byteOrder == .byteOrder32Little {
-            // BGRA layout
-            b = ptr[offset]
-            g = ptr[offset + 1]
-            r = ptr[offset + 2]
-        } else {
-            // RGBA layout
-            r = ptr[offset]
-            g = ptr[offset + 1]
-            b = ptr[offset + 2]
-        }
-        _ = alphaInfo // silence unused warning
-
-        let hex = String(format: "#%02X%02X%02X", r, g, b)
+        guard let hex = PixelSampler.hex(in: image, x: image.width / 2, y: image.height / 2) else { return }
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium),
             .foregroundColor: NSColor.white
@@ -560,6 +590,18 @@ private final class SelectionOverlayView: NSView {
             }
             return
         }
+        if mode == .colorPick {
+            // Sample the frozen frame (what the loupe shows) and finish. A click
+            // before the frame lands has nothing to sample; cancel rather than
+            // report a wrong color.
+            if let hex = sampledHex(at: event.locationInWindow) {
+                NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
+                colorPickHandler?(hex)
+            } else {
+                cancelHandler?()
+            }
+            return
+        }
         startPoint = event.locationInWindow
         isSelecting = true
         currentRect = .zero
@@ -612,6 +654,7 @@ private final class SelectionOverlayView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        if AreaSelectionDiag.timeline["firstMouseMoved"] == nil { AreaSelectionDiag.mark("firstMouseMoved") }
         if mode == .window {
             let previous = highlightedWindowRect
             let hit = windowUnder(point: event.locationInWindow)
@@ -621,7 +664,7 @@ private final class SelectionOverlayView: NSView {
             if previous != highlightedWindowRect {
                 invalidateWindowHighlight(from: previous, to: highlightedWindowRect)
             }
-        } else if mode == .area && !isSelecting {
+        } else if (mode == .area || mode == .colorPick) && !isSelecting {
             // Invalidate every artifact we paint around the cursor at both
             // the previous and new positions: crosshair strips (full-screen
             // lines), the loupe (120px + shadow/border, flips left or right

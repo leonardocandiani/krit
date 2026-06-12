@@ -71,15 +71,17 @@ final class CaptureEngine {
 
     private func hideDesktopIconsForCaptureIfNeeded() async -> Bool {
         guard Settings.hideDesktopIconsWhileCapturing else { return false }
-        let hiddenByCapture = DesktopIconsManager.hideForCapture()
+        let hiddenByCapture = await DesktopIconsManager.hideForCapture()
         if hiddenByCapture {
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            // One or two frames for the WindowServer to composite the covers;
+            // the old 350ms settle existed for the Finder restart, now gone.
+            try? await Task.sleep(nanoseconds: 80_000_000)
         }
         return hiddenByCapture
     }
 
     private func restoreDesktopIconsIfNeeded(_ hiddenByCapture: Bool) {
-        DesktopIconsManager.showAfterCapture(ifHiddenByCapture: hiddenByCapture)
+        Task { @MainActor in DesktopIconsManager.showAfterCapture(ifHiddenByCapture: hiddenByCapture) }
     }
 
     // Cached SCShareableContent. `SCShareableContent.excludingDesktopWindows`
@@ -137,6 +139,7 @@ final class CaptureEngine {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
         guard areaSelectionWindow == nil else { return } // already selecting
+        AreaSelectionDiag.mark("startAreaCapture")
         // Snapshot the source app BEFORE the overlay activates KRIT and steals focus,
         // so the history thumbnail can badge where the shot came from.
         historyManager.prepareForCapture()
@@ -161,6 +164,32 @@ final class CaptureEngine {
             }
         }
         await areaSelectionWindow?.prepareAndShow(engine: self)
+    }
+
+    // MARK: - Color Pick
+
+    /// Eyedropper: same fullscreen overlay as area capture (loupe over the
+    /// frozen frame), but a click copies the pixel's hex to the clipboard
+    /// instead of starting a drag. Desktop icons stay visible on purpose: the
+    /// user is sampling the screen exactly as it looks.
+    func startColorPick() async {
+        guard PermissionsManager.hasScreenRecordingPermission else {
+            PermissionsManager.showPermissionDeniedAlert(); return
+        }
+        guard areaSelectionWindow == nil else { return } // already selecting
+        let picker = AreaSelectionWindow(mode: .colorPick) { [weak self] _, _, _ in
+            // Cancel path (Esc / click before the frozen frame lands).
+            self?.areaSelectionWindow = nil
+        }
+        picker.onColorPicked = { [weak self] hex in
+            self?.areaSelectionWindow = nil
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(hex, forType: .string)
+            ToastWindow.show(message: "\(hex) copied")
+        }
+        areaSelectionWindow = picker
+        await picker.prepareAndShow(engine: self)
     }
 
     // MARK: - All-in-One
@@ -542,6 +571,9 @@ final class CaptureEngine {
     /// GUI test hook: live dim panel count while a recording runs.
     var uiTestDimPanelCount: Int { recordingEngine.uiTestDimPanelCount }
 
+    /// The in-flight selection overlay (area / window / colorPick), if any.
+    var uiTestActiveSelection: AreaSelectionWindow? { areaSelectionWindow }
+
     /// GUI test hook: outcome of the last recording finish (saved/failed + reason).
     var uiTestRecordingOutcome: String { recordingEngine.uiTestLastFinishOutcome }
 
@@ -841,6 +873,7 @@ final class CaptureEngine {
             let proceed = await runCountdown(countdown, on: screen)
             guard proceed else { return }            // Esc cancels the whole capture
         }
+        captureMoment(rect: rect, on: screen)
         guard let image = await captureRectToImage(rect, on: screen) else {
             clearOnNextCaptureFinished()
             snapAndPasteTarget = nil
@@ -854,13 +887,24 @@ final class CaptureEngine {
         finishCapture(image: image, rect: rect, on: screen, historyManager: historyManager, isWindowCapture: isWindowCapture)
     }
 
-    /// Shared post-capture finishing: sound, haptic, history, auto-actions, and
-    /// the flash/overlay handoff. Both the rect crop (captureRect) and the
-    /// isolated-window grab (captureWindowIsolated) funnel through here so the
-    /// "capture moment" is identical regardless of how the image was produced.
-    private func finishCapture(image: NSImage, rect: CGRect, on screen: NSScreen, historyManager: HistoryManager, isWindowCapture: Bool) {
+    /// The shutter "moment": sound + haptic + white blink, fired BEFORE the SCK
+    /// grab so the response to the gesture is instant. The heavy pipeline (grab
+    /// at supersampling scale, template compose, encodes) runs behind it; the
+    /// blink window is never capturable, so it cannot leak into the shot it
+    /// announces. Both capture funnels (captureRect, captureWindowIsolated)
+    /// call this right before their grab.
+    private func captureMoment(rect: CGRect, on screen: NSScreen) {
         playCaptureSound()
         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
+        CaptureFlash.blink(rect: rect, on: screen)
+    }
+
+    /// Shared post-capture finishing: history, auto-actions, and the
+    /// flash/overlay handoff. Both the rect crop (captureRect) and the
+    /// isolated-window grab (captureWindowIsolated) funnel through here so the
+    /// "capture moment" is identical regardless of how the image was produced.
+    /// Sound/haptic/blink already fired at the gesture (captureMoment).
+    private func finishCapture(image: NSImage, rect: CGRect, on screen: NSScreen, historyManager: HistoryManager, isWindowCapture: Bool) {
         var presented = image
         // Diagnostic trail for the supersampled window-shot reports: one line per
         // capture with the exact point/pixel geometry each stage saw, so a bad
@@ -887,6 +931,24 @@ final class CaptureEngine {
         let item = historyManager.add(image: image, rect: rect, isWindowCapture: isWindowCapture,
                                       presentedImage: presented)
 
+        // The capture "moment", as ONE continuous motion: the card is born
+        // invisible at its real slot, the flash ghost flies INTO that exact slot,
+        // and the card fades in under the ghost's fade-out. (The old order, ghost
+        // flying to a hardcoded 240×150 corner guess on top of an already-sliding
+        // card, was the post-capture grow/shrink flicker.) Runs BEFORE the
+        // clipboard/autosave encodes below: a full-res PNG encode in front of
+        // the handoff read as the flash firing late.
+        if Settings.afterCaptureShowOverlay {
+            let slot = QuickAccessOverlay.show(
+                image: presented, historyItem: item, historyManager: historyManager,
+                screen: screen, entrance: .handoff
+            )
+            let flyTime = CaptureFlash.play(rect: rect, on: screen, image: presented,
+                                            landLeft: Settings.overlayOnLeft, target: slot,
+                                            includeBlink: false)
+            QuickAccessOverlay.revealPendingHandoff(after: max(flyTime - 0.15, 0))
+        }
+
         // One-shot completion (krit:// then= on interactive flows, Snap & Paste).
         // Fires with the PRESENTED image and clears itself so it can't bleed into
         // a later capture.
@@ -902,23 +964,6 @@ final class CaptureEngine {
             let ext = Settings.screenshotFormat
             let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name).\(ext)")
             ImageExporter.save(image: presented, to: url)
-        }
-
-        // The capture "moment", as ONE continuous motion: the card is born
-        // invisible at its real slot, the flash ghost flies INTO that exact slot,
-        // and the card fades in under the ghost's fade-out. (The old order, ghost
-        // flying to a hardcoded 240×150 corner guess on top of an already-sliding
-        // card, was the post-capture grow/shrink flicker.)
-        if Settings.afterCaptureShowOverlay {
-            let slot = QuickAccessOverlay.show(
-                image: presented, historyItem: item, historyManager: historyManager,
-                screen: screen, entrance: .handoff
-            )
-            let flyTime = CaptureFlash.play(rect: rect, on: screen, image: presented,
-                                            landLeft: Settings.overlayOnLeft, target: slot)
-            QuickAccessOverlay.revealPendingHandoff(after: max(flyTime - 0.15, 0))
-        } else {
-            CaptureFlash.play(rect: rect, on: screen, image: nil, landLeft: Settings.overlayOnLeft)
         }
     }
 
@@ -937,6 +982,7 @@ final class CaptureEngine {
             let proceed = await runCountdown(countdown, on: screen)
             guard proceed else { return }
         }
+        captureMoment(rect: rect, on: screen)
 
         // Refresh the live wallpaper cache for this display BEFORE finishing, so
         // windowShotBackground (read synchronously inside finishCapture) composes
