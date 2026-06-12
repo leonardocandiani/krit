@@ -2144,15 +2144,17 @@ private final class QuickAccessWindow: NSWindow {
         setSpaceHintVisible(false)
     }
 
-    /// One-shot affordance: the Space hint shows right when the card lands and
-    /// fades out by itself. It used to follow hover, which nagged on every pass
-    /// of the cursor over the card.
-    private var didShowSpaceHint = false
+    /// Once-per-install affordance: the Space hint shows at the landing of the
+    /// FIRST capture after install and never again (persisted flag). Per card
+    /// or per session it nagged ("aparecer em todos é um saco"); a longer dwell
+    /// compensates for the single appearance.
+    private static let spaceHintShownKey = "KritDidShowSpaceZoomHint"
     private func showSpaceHintOnce() {
-        guard !didShowSpaceHint, !isClosing, !isParked else { return }
-        didShowSpaceHint = true
+        guard !UserDefaults.standard.bool(forKey: Self.spaceHintShownKey),
+              !isClosing, !isParked else { return }
+        UserDefaults.standard.set(true, forKey: Self.spaceHintShownKey)
         setSpaceHintVisible(true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
             self?.setSpaceHintVisible(false)
         }
     }
