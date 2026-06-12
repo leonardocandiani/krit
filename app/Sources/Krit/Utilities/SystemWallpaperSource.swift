@@ -22,11 +22,47 @@ enum SystemWallpaperSource {
         let imageIndex: Int
     }
 
-    private static let searchRoots = [
-        "/System/Library/Desktop Pictures",
-        "/Library/Desktop Pictures"
-    ]
     private static let imageExtensions: Set<String> = ["heic", "heif", "jpg", "jpeg", "png"]
+
+    /// The bundled collection (ported from Snapzy, see THIRD_PARTY_NOTICES.md),
+    /// in display order: the showpieces first, the abstract set after.
+    private static let bundledWallpapers: [(file: String, name: String)] = [
+        ("default-tahoe-light",      "Tahoe Light"),
+        ("default-tahoe-dark",       "Tahoe Dark"),
+        ("default-macbook-pro-blue", "MacBook Pro Blue"),
+        ("default-macbook-pro-m3",   "MacBook Pro M3"),
+        ("default-helios-dark",      "Helios"),
+        ("default-macintosh-light",  "Macintosh Light"),
+        ("default-macintosh-dark",   "Macintosh Dark"),
+        ("default-abstract-amber",   "Abstract Amber"),
+        ("default-abstract-blue",    "Abstract Blue"),
+        ("default-abstract-cyan",    "Abstract Cyan"),
+        ("default-abstract-magenta", "Abstract Magenta"),
+        ("default-abstract-violet",  "Abstract Violet"),
+    ]
+
+    /// Resolves a bundled wallpaper JPG inside Krit_KritKit.bundle, probing the
+    /// same layouts SoundManager does (.app Resources, next to the binary, SPM
+    /// dev bundle). The processed bundle is flat, so a direct filename lookup
+    /// inside each candidate is enough.
+    private static func bundledWallpaperURL(_ file: String) -> URL? {
+        let bundleName = "Krit_KritKit.bundle"
+        var roots: [URL] = []
+        if let resources = Bundle.main.resourceURL {
+            roots.append(resources.appendingPathComponent(bundleName))
+        }
+        roots.append(Bundle.main.bundleURL.appendingPathComponent(bundleName))
+        roots.append(Bundle.module.bundleURL)
+        for root in roots {
+            if let bundle = Bundle(url: root),
+               let url = bundle.url(forResource: file, withExtension: "jpg") {
+                return url
+            }
+            let direct = root.appendingPathComponent("\(file).jpg")
+            if FileManager.default.fileExists(atPath: direct.path) { return direct }
+        }
+        return nil
+    }
     /// Anything smaller than this on its long edge is a thumbnail asset, not a
     /// real wallpaper, too small to sit behind a screenshot.
     private static let minLongEdge = 1200
@@ -384,39 +420,13 @@ enum SystemWallpaperSource {
             }
         }
 
-        for root in searchRoots {
-            // Top-level full-resolution pictures.
-            if let items = try? fm.contentsOfDirectory(atPath: root) {
-                for item in items.sorted() where !item.hasPrefix(".") {
-                    addFile(URL(fileURLWithPath: root).appendingPathComponent(item))
-                }
-            }
-            // One level into the `.wallpapers` bundles (scenic full-res lives here).
-            let bundlesDir = root + "/.wallpapers"
-            if let bundles = try? fm.contentsOfDirectory(atPath: bundlesDir) {
-                for bundle in bundles.sorted() {
-                    let dir = bundlesDir + "/" + bundle
-                    let bundleName = (bundle as NSString).deletingPathExtension
-                    if let items = try? fm.contentsOfDirectory(atPath: dir) {
-                        for item in items.sorted() {
-                            addFile(URL(fileURLWithPath: dir).appendingPathComponent(item), bundleName: bundleName)
-                        }
-                    }
-                }
-            }
-        }
-
-        // Wallpapers da galeria do macOS baixados sob demanda (MobileAsset), só
-        // existem depois que o usuário baixa em Ajustes do Sistema.
-        let assetRoot = URL(fileURLWithPath: "/System/Library/AssetsV2/com_apple_MobileAsset_DesktopPicture")
-        if let walker = fm.enumerator(at: assetRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
-            var visited = 0
-            for case let url as URL in walker {
-                visited += 1
-                if visited > 4000 { break }   // hard stop num asset store gigante
-                if imageExtensions.contains(url.pathExtension.lowercased()) {
-                    addFile(url)
-                }
+        // The curated collection bundled with the app (the Snapzy set; see
+        // THIRD_PARTY_NOTICES.md). This IS the wallpaper section: the old scan
+        // of every system wallpaper produced an unpredictable soup of assets
+        // that varied per machine, which the owner rejected.
+        for (file, display) in bundledWallpapers {
+            if let url = bundledWallpaperURL(file) {
+                addFile(url, displayName: display)
             }
         }
 

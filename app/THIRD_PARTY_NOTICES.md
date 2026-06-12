@@ -54,3 +54,18 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Snapzy bundled wallpapers
+
+The wallpaper collection shipped in `Sources/Krit/Resources/Wallpapers/`
+(`default-*.jpg`) comes from the Snapzy project
+(https://github.com/duongductrong/Snapzy), distributed under the
+BSD-3-Clause license. Some of these images originate from macOS default
+wallpapers; they are redistributed here exactly as Snapzy ships them.
+
+```
+BSD 3-Clause License
+
+Copyright (c) 2025, Duong Duc Trong
+All rights reserved.
+```
