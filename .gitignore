@@ -59,3 +59,5 @@ app/.build/
 
 # reference clones for study (not ours to ship)
 _reference/
+# xcode user state
+app/.swiftpm/xcode/**/xcuserdata/
