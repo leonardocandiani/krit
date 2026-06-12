@@ -181,33 +181,17 @@ final class AnnotationWindowController: NSWindowController {
         }
         let canvasSize = ScreenshotBackgroundComposer.outputPointSize(for: image.size, options: initialBackground)
         let toolbarHeight = Self.toolbarHeight
-        let stageInset = Self.stageInset
 
         // Open the window sized to the image (scaled to fit), not to a fraction of
         // the screen. Limiting width and height independently broke the aspect for
         // extreme ratios: a wide shot in a tall window left a sea of black stage
         // below it (the bug the owner saw). Instead, scale the canvas to fit a
         // moderate envelope and size the window to canvas*scale + chrome, so the
-        // stage padding stays uniform and the window never opens near-fullscreen.
-        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        let minimumEditorHeight = Self.minimumCanvasHeight + toolbarHeight + stageInset + Self.bottomBarHeight
-        let chromeW = stageInset * 2
-        let chromeH = toolbarHeight + stageInset + Self.bottomBarHeight
-        let maxWindowWidth = min(screenFrame.width - Self.initialScreenEdgeInset * 2,
-                                 screenFrame.width * Self.initialScreenWidthFraction)
-        let maxWindowHeight = min(screenFrame.height - Self.initialScreenEdgeInset * 2,
-                                  screenFrame.height * Self.initialScreenHeightFraction)
-        let effectiveMinimumWidth = min(Self.minimumEditorWidth, maxWindowWidth)
-        let effectiveMinimumHeight = min(minimumEditorHeight, maxWindowHeight)
-        // Canvas room inside the envelope, then the largest scale that fits both
-        // axes (never upscaling past 100%). The window follows that scaled size.
-        let availW = max(1, maxWindowWidth - chromeW)
-        let availH = max(1, maxWindowHeight - chromeH)
-        let fitScale = min(1, min(availW / canvasSize.width, availH / canvasSize.height))
-        let shownCanvas = NSSize(width: canvasSize.width * fitScale, height: canvasSize.height * fitScale)
-        let winW = max(shownCanvas.width + chromeW, effectiveMinimumWidth)
-        let winH = max(shownCanvas.height + chromeH, effectiveMinimumHeight)
-        let windowSize = NSSize(width: winW, height: winH)
+        // stage padding stays uniform and the window never opens near-fullscreen
+        // (standardWindowSize, shared with the background on/off resize).
+        let windowSize = Self.standardWindowSize(forCanvas: canvasSize, on: NSScreen.main)
+        let winW = windowSize.width
+        let winH = windowSize.height
 
         let win = EditorKeyWindow(
             contentRect: NSRect(origin: .zero, size: windowSize),
@@ -228,7 +212,7 @@ final class AnnotationWindowController: NSWindowController {
         // Janela normal de documento: .floating prendia o editor acima de TODOS
         // os apps (clicar num app abaixo não o trazia pra frente).
         win.level = .normal
-        win.minSize = NSSize(width: effectiveMinimumWidth, height: effectiveMinimumHeight)
+        win.minSize = Self.minimumWindowSize(on: NSScreen.main)
         win.center()
 
         super.init(window: win)
@@ -890,6 +874,7 @@ final class AnnotationWindowController: NSWindowController {
         // delta so they stay registered with the screenshot they annotate.
         let oldOrigin = imageSlotOrigin(for: backgroundOptions)
         let newOrigin = imageSlotOrigin(for: options)
+        let backgroundToggled = options.isEnabled != backgroundOptions.isEnabled
         backgroundOptions = options
 
         canvas.backgroundOptions = options
@@ -899,10 +884,79 @@ final class AnnotationWindowController: NSWindowController {
         canvas.setNeedsDisplay(canvas.bounds)
         updateCheckerboard()
 
-        // Fit-to-stage: padding/ratio/background mudam o canvas; a janela NÃO
-        // cresce, o canvas re-escala (fit) pra caber no palco visível. O usuário
-        // mantém o tamanho que deu à janela; só o conteúdo encolhe pra caber.
+        if backgroundToggled {
+            // Ligar/desligar o fundo muda a NATUREZA do documento (canvas ganha
+            // moldura + padding): a janela adota o tamanho padrão que teria se
+            // tivesse ABERTO já com esse canvas, senão o wallpaper entra num
+            // palco dimensionado pro shot cru e o layout fica torto (relato do
+            // dono). Ajustes subsequentes (padding/ratio/alinhamento) mantêm a
+            // regra fit-to-stage: janela parada, conteúdo re-escala.
+            resizeWindowToStandard()
+        } else {
+            // Fit-to-stage: padding/ratio mudam o canvas; a janela NÃO cresce,
+            // o canvas re-escala (fit) pra caber no palco visível.
+            refitCanvasToStage()
+        }
+    }
+
+    /// Re-dimensiona a janela pro tamanho padrão de abertura do canvas atual
+    /// (mesma matemática do init), somando a sidebar visível, preservando o
+    /// centro e clampando à tela. Chamado quando o background liga/desliga.
+    private func resizeWindowToStandard() {
+        guard let window else { return }
+        var size = Self.standardWindowSize(forCanvas: canvas.frame.size, on: window.screen)
+        if backgroundSidebar?.isHidden == false { size.width += Self.sidebarWidth }
+        let vf = window.screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        size.width = min(size.width, vf.width)
+        size.height = min(size.height, vf.height)
+
+        var frame = window.frame
+        let center = CGPoint(x: frame.midX, y: frame.midY)
+        frame.size = size
+        frame.origin = CGPoint(x: center.x - size.width / 2, y: center.y - size.height / 2)
+        frame.origin.x = max(vf.minX, min(frame.origin.x, vf.maxX - size.width))
+        frame.origin.y = max(vf.minY, min(frame.origin.y, vf.maxY - size.height))
+        window.setFrame(frame, display: true, animate: true)
         refitCanvasToStage()
+    }
+
+    /// Floor for the editor window (toolbar fits, canvas has working room),
+    /// clamped to the screen envelope. Shared by minSize and standardWindowSize.
+    private static func minimumWindowSize(on screen: NSScreen?) -> NSSize {
+        let screenFrame = (screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let minimumEditorHeight = Self.minimumCanvasHeight + Self.toolbarHeight + Self.stageInset + Self.bottomBarHeight
+        let maxWindowWidth = min(screenFrame.width - Self.initialScreenEdgeInset * 2,
+                                 screenFrame.width * Self.initialScreenWidthFraction)
+        let maxWindowHeight = min(screenFrame.height - Self.initialScreenEdgeInset * 2,
+                                  screenFrame.height * Self.initialScreenHeightFraction)
+        return NSSize(width: min(Self.minimumEditorWidth, maxWindowWidth),
+                      height: min(minimumEditorHeight, maxWindowHeight))
+    }
+
+    /// Standard window size for a composed-canvas size: envelope = fraction of
+    /// the screen, chrome added, content scaled to fit (never upscaled). The
+    /// editor opens with this and re-adopts it when the background toggles.
+    private static func standardWindowSize(forCanvas canvasSize: NSSize, on screen: NSScreen?) -> NSSize {
+        let screenFrame = (screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let toolbarHeight = Self.toolbarHeight
+        let stageInset = Self.stageInset
+        let minimumEditorHeight = Self.minimumCanvasHeight + toolbarHeight + stageInset + Self.bottomBarHeight
+        let chromeW = stageInset * 2
+        let chromeH = toolbarHeight + stageInset + Self.bottomBarHeight
+        let maxWindowWidth = min(screenFrame.width - Self.initialScreenEdgeInset * 2,
+                                 screenFrame.width * Self.initialScreenWidthFraction)
+        let maxWindowHeight = min(screenFrame.height - Self.initialScreenEdgeInset * 2,
+                                  screenFrame.height * Self.initialScreenHeightFraction)
+        let effectiveMinimumWidth = min(Self.minimumEditorWidth, maxWindowWidth)
+        let effectiveMinimumHeight = min(minimumEditorHeight, maxWindowHeight)
+        // Canvas room inside the envelope, then the largest scale that fits both
+        // axes (never upscaling past 100%). The window follows that scaled size.
+        let availW = max(1, maxWindowWidth - chromeW)
+        let availH = max(1, maxWindowHeight - chromeH)
+        let fitScale = min(1, min(availW / max(canvasSize.width, 1), availH / max(canvasSize.height, 1)))
+        let shownCanvas = NSSize(width: canvasSize.width * fitScale, height: canvasSize.height * fitScale)
+        return NSSize(width: max(shownCanvas.width + chromeW, effectiveMinimumWidth),
+                      height: max(shownCanvas.height + chromeH, effectiveMinimumHeight))
     }
 
     /// Fit-to-stage: re-encaixa o canvas inteiro dentro do palco visível atual
@@ -2547,6 +2601,13 @@ extension AnnotationWindowController {
         ]
     }
     var uiTestOptions: ScreenshotBackgroundOptions { backgroundOptions }
+
+    /// Test hook: applies background options through the real sidebar path.
+    func uiTestApplyBackground(_ options: ScreenshotBackgroundOptions) {
+        applyBackgroundOptions(options)
+        toolbar.setBackgroundOptionsExternally(options)
+        backgroundSidebar?.options = options
+    }
     var uiTestSidebar: BackgroundSidebar? { backgroundSidebar }
     func uiTestToggleSidebar() { toggleBackgroundSidebar() }
 

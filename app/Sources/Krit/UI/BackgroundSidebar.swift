@@ -843,13 +843,26 @@ final class BackgroundSidebar: NSView {
             SystemWallpaperSource.backgroundData(for: wallpaper) { [weak self] data in
                 guard let self, self.pendingWallpaperName == wallpaper.name else { return }
                 self.pendingWallpaperName = nil
-                guard let data else { return }
+                // "Current" pode apontar pra um wallpaper dinâmico/aerial cujo
+                // arquivo não decoda (macOS 27 devolve URLs assim): cai pro grab
+                // vivo do desktop, que captura o que o WindowServer pinta de
+                // fato. Falhou tudo, AVISA; o clique silenciosamente morto era o
+                // "clico no wallpaper e fica bugado" do relato.
+                var resolved = data
+                if resolved == nil, wallpaper.name.hasPrefix("Current") {
+                    resolved = SystemWallpaperSource.currentDesktopBackgroundData(for: self.window?.screen)
+                }
+                guard let resolved else {
+                    ToastWindow.show(message: "Couldn't load this wallpaper")
+                    self.updateSelectionHighlight()
+                    return
+                }
                 var next = self.options
                 next.isEnabled = true
                 next.style = .image
                 next.presetName = wallpaper.name
                 next.customImageName = wallpaper.name
-                next.customImageData = data
+                next.customImageData = resolved
                 next.tracksDesktopWallpaper = nil
                 self.commit(next)
             }
