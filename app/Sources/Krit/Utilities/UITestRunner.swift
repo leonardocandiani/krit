@@ -1,4 +1,5 @@
 import AppKit
+import KeyboardShortcuts
 import AudioToolbox
 import os
 
@@ -83,6 +84,10 @@ final class UITestRunner: NSObject {
             case "overlay-entrance": report = await Self.runOverlayEntranceFrames()
             case "area-delay": report = await Self.runAreaSelectionDelay()
             case "overlay-interaction": report = await Self.runOverlayInteraction()
+            case "area-delay-real": report = await Self.runAreaDelayReal()
+            case "overlay-postgesture": report = await Self.runOverlayPostGesture()
+            case "update-check": report = await Self.runUpdateCheck()
+            case "color-pick": report = await Self.runColorPick()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -90,6 +95,96 @@ final class UITestRunner: NSObject {
                 try? data.write(to: URL(fileURLWithPath: outPath))
             }
         }
+    }
+
+    // MARK: - Cenário: color-pick (eyedropper end-to-end)
+
+    /// Prova o eyedropper de ponta a ponta: janela real de cor conhecida na
+    /// tela → startColorPick (overlay + frozen grab SCK reais) → pick no centro
+    /// da janela via o caminho exato do mouseDown → clipboard com o hex. A
+    /// tolerância cobre o color matching sRGB → perfil do display (o sampler
+    /// lê bytes crus do frame capturado, espaço do display por definição).
+    private static func runColorPick() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        let engine = appDelegate.uiTestCaptureEngine
+
+        // Janela alvo: sRGB #3366CC, grande o bastante pra paralaxe de pixel não importar.
+        let target = NSColor(srgbRed: 51.0/255, green: 102.0/255, blue: 204.0/255, alpha: 1)
+        let screen = NSScreen.main ?? NSScreen.screens[0]
+        let winRect = NSRect(x: screen.frame.midX - 120, y: screen.frame.midY - 90, width: 240, height: 180)
+        let win = NSWindow(contentRect: winRect, styleMask: [.borderless], backing: .buffered, defer: false)
+        win.backgroundColor = target
+        win.level = .floating
+        win.sharingType = .readWrite
+        win.orderFrontRegardless()
+        defer { win.orderOut(nil) }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        Task { await engine.startColorPick() }
+        var ready = false
+        for _ in 0..<50 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            if engine.uiTestActiveSelection?.uiTestHasFrozenFrame == true { ready = true; break }
+        }
+        r["overlayReady"] = ready
+        guard ready else {
+            engine.uiTestActiveSelection?.cancel()
+            r["allPass"] = false; return r
+        }
+
+        NSPasteboard.general.clearContents()
+        engine.uiTestActiveSelection?.uiTestPickColor(atScreen: NSPoint(x: winRect.midX, y: winRect.midY))
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        let copied = NSPasteboard.general.string(forType: .string) ?? ""
+        r["copied"] = copied
+        r["pickerClosed"] = engine.uiTestActiveSelection == nil
+
+        // Dois candidatos válidos: bytes em sRGB puro ou no espaço do display.
+        func channels(_ c: NSColor) -> [Int] {
+            [Int(round(c.redComponent * 255)), Int(round(c.greenComponent * 255)), Int(round(c.blueComponent * 255))]
+        }
+        var candidates: [[Int]] = [[51, 102, 204]]
+        if let cs = screen.colorSpace, let display = target.usingColorSpace(cs) {
+            candidates.append(channels(display))
+        }
+        var match = false
+        if copied.count == 7, copied.hasPrefix("#"),
+           let rv = Int(copied.dropFirst().prefix(2), radix: 16),
+           let gv = Int(copied.dropFirst(3).prefix(2), radix: 16),
+           let bv = Int(copied.dropFirst(5).prefix(2), radix: 16) {
+            let got = [rv, gv, bv]
+            r["gotRGB"] = got
+            r["candidates"] = candidates
+            match = candidates.contains { zip($0, got).allSatisfy { abs($0 - $1) <= 12 } }
+        }
+        r["colorMatch"] = match
+        r["allPass"] = ready && match && (engine.uiTestActiveSelection == nil)
+        return r
+    }
+
+    // MARK: - Cenário: update-check (Sparkle background check)
+
+    /// Dispara o check de update do Sparkle em background (o caminho silencioso
+    /// que baixa e instala no quit quando SUAutomaticallyUpdate está ligado).
+    /// A prova de instalação acontece FORA do app: test-update-local.sh espera,
+    /// encerra o processo e lê a versão do bundle reinstalado em /Applications.
+    private static func runUpdateCheck() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let updater = UpdaterManager.shared.updater
+        r["feedOverride"] = UserDefaults.standard.string(forKey: "KritFeedURLOverride") ?? ""
+        r["automaticallyDownloads"] = updater.automaticallyDownloadsUpdates
+        r["canCheck"] = updater.canCheckForUpdates
+        updater.checkForUpdatesInBackground()
+        // sessionInProgress é só informativo: com feed local o ciclo inteiro
+        // (check + download) pode fechar antes do sleep. O gate determinístico
+        // é o updater estar apto; a prova real é a troca do bundle no quit.
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        r["sessionInProgress"] = updater.sessionInProgress
+        r["allPass"] = updater.canCheckForUpdates || updater.sessionInProgress
+        return r
     }
 
     // MARK: - Cenário: smart-redact (OCR real + classificador de segredos)
@@ -690,6 +785,193 @@ final class UITestRunner: NSObject {
         for y in 0..<h where alpha(midX, y) > 250 { top = y; break }
         for y in stride(from: h - 1, through: 0, by: -1) where alpha(midX, y) > 250 { bottom = h - 1 - y; break }
         return (left, right, top, bottom)
+    }
+
+    /// The user's literal sequence: file-drag the card out (and cancel), then
+    /// try to HIDE it (standby gesture); open/close the Space preview, then try
+    /// to DELETE it (edge gesture). Asserts each gesture still works after the
+    /// preceding interaction, which is the reported breakage.
+    private static func runOverlayPostGesture() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        let before = QuickAccessOverlay.uiTestWindows.count
+        let img = NSImage(size: NSSize(width: 300, height: 200))
+        img.lockFocus(); NSColor.systemTeal.setFill()
+        NSRect(x: 0, y: 0, width: 300, height: 200).fill(); img.unlockFocus()
+        let tmpPath = "/tmp/krit-postgesture-test.png"
+        if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: tmpPath))
+        }
+        let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: tmpPath,
+                               thumbnailPath: tmpPath, captureRect: nil)
+        QuickAccessOverlay.show(image: img, historyItem: item,
+                                historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        guard QuickAccessOverlay.uiTestWindows.count > before,
+              let card = QuickAccessOverlay.uiTestWindows.last else {
+            r["error"] = "card did not appear"; r["allPass"] = false; return r
+        }
+
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        func cg(_ p: NSPoint) -> CGPoint { CGPoint(x: p.x, y: primaryH - p.y) }
+        func post(_ type: CGEventType, _ p: CGPoint) {
+            CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+        }
+        func center() -> CGPoint { cg(NSPoint(x: card.frame.midX, y: card.frame.midY)) }
+        func hover() async {
+            post(.mouseMoved, CGPoint(x: center().x - 25, y: center().y))
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            post(.mouseMoved, center())
+            try? await Task.sleep(nanoseconds: 350_000_000)
+        }
+        func dragFrom(_ start: CGPoint, by: CGVector, steps: Int, settleNs: UInt64) async {
+            post(.leftMouseDown, start)
+            try? await Task.sleep(nanoseconds: 60_000_000)
+            var p = start
+            for _ in 0..<steps {
+                p.x += by.dx / CGFloat(steps); p.y += by.dy / CGFloat(steps)
+                post(.leftMouseDragged, p)
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+            post(.leftMouseUp, p)
+            try? await Task.sleep(nanoseconds: settleNs)
+        }
+
+        // 1. FILE-DRAG with regret: pull INTO the screen (clearly horizontal so
+        //    the classifier converts to a file drag), then come back and release
+        //    on the card's own slot, where nothing accepts the drop. This is the
+        //    user's "dragged as a file, gave up" interaction.
+        await hover()
+        let inward: CGFloat = Settings.overlayOnLeft ? 1 : -1
+        let fileStart = center()
+        post(.leftMouseDown, fileStart)
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        var fp = fileStart
+        for _ in 0..<12 {
+            fp.x += inward * 24
+            post(.leftMouseDragged, fp)
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        for _ in 0..<12 {
+            fp.x -= inward * 24
+            post(.leftMouseDragged, fp)
+            try? await Task.sleep(nanoseconds: 16_000_000)
+        }
+        post(.leftMouseUp, fp)
+        try? await Task.sleep(nanoseconds: 1_500_000_000)   // session end + regret slide-back
+        r["afterFileDrag"] = QuickAccessOverlay.uiTestHoverState()
+        r["gestureAfterFileDrag"] = QuickAccessOverlay.uiTestGestureState()
+
+        // 2. HIDE (standby): hover again, drag straight DOWN past 50pt.
+        await hover()
+        await dragFrom(center(), by: CGVector(dx: 0, dy: 90), steps: 8, settleNs: 900_000_000)
+        let standbyStates = QuickAccessOverlay.uiTestStandbyStates()
+        let parked = standbyStates.last == true
+        r["standbyWorkedAfterFileDrag"] = parked
+        r["gestureAfterStandby"] = QuickAccessOverlay.uiTestGestureState()
+
+        // 3. Restore the parked card so the preview/delete phase has a live card.
+        if parked { QuickAccessOverlay.uiTestRestoreAll(on: NSScreen.main) }
+        try? await Task.sleep(nanoseconds: 900_000_000)
+
+        // 4. PREVIEW: Space open + close.
+        await hover()
+        func postKey(_ code: CGKeyCode, down: Bool) {
+            CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)?.post(tap: .cghidEventTap)
+        }
+        postKey(49, down: true); postKey(49, down: false)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        let previewOpened = QuickLookController.shared.isOpen
+        r["previewOpened"] = previewOpened
+        postKey(49, down: true); postKey(49, down: false)
+        try? await Task.sleep(nanoseconds: 600_000_000)
+
+        // 5. DELETE after preview: drag toward the stack edge past 40% width.
+        await hover()
+        let edge: CGFloat = Settings.overlayOnLeft ? -1 : 1
+        let countBeforeDelete = QuickAccessOverlay.uiTestWindows.count
+        await dragFrom(center(), by: CGVector(dx: edge * card.frame.width * 0.7, dy: 0),
+                       steps: 8, settleNs: 1_200_000_000)
+        let deleted = QuickAccessOverlay.uiTestWindows.count < countBeforeDelete
+        r["deleteWorkedAfterPreview"] = deleted
+
+        r["allPass"] = parked && previewOpened && deleted
+        if !deleted { QuickAccessOverlay.uiTestCloseNewest() }
+        return r
+    }
+
+    /// Measures the REAL hotkey path: another app frontmost, the configured
+    /// area shortcut synthesized as CGEvents, cursor wiggling like a user's
+    /// hand. Reports per-link deltas (handler, window, key, first mouseMoved =
+    /// crosshair live) so the perceived "mouse enters selection mode" latency
+    /// is the thing measured, not a proxy.
+    private static func runAreaDelayReal() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let shortcut = KeyboardShortcuts.getShortcut(for: .captureArea),
+              let key = shortcut.key else {
+            r["error"] = "no area shortcut configured"; r["allPass"] = false; return r
+        }
+        AreaSelectionDiag.timeline = [:]
+
+        // Put ANOTHER app frontmost (Finder), the real-world starting state.
+        if let finder = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.finder" }) {
+            finder.activate()
+        }
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        r["frontmostBefore"] = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
+
+        var flags: CGEventFlags = []
+        if shortcut.modifiers.contains(.command) { flags.insert(.maskCommand) }
+        if shortcut.modifiers.contains(.shift) { flags.insert(.maskShift) }
+        if shortcut.modifiers.contains(.option) { flags.insert(.maskAlternate) }
+        if shortcut.modifiers.contains(.control) { flags.insert(.maskControl) }
+        let code = CGKeyCode(key.rawValue)
+
+        let t0 = CACurrentMediaTime()
+        AreaSelectionDiag.timeline["hotkeyDownPosted"] = t0
+        if let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true) {
+            down.flags = flags; down.post(tap: .cghidEventTap)
+        }
+        try? await Task.sleep(nanoseconds: 60_000_000)   // tecla segurada 60ms
+        if let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+            up.flags = flags; up.post(tap: .cghidEventTap)
+        }
+        AreaSelectionDiag.timeline["hotkeyUpPosted"] = CACurrentMediaTime()
+
+        // Wiggle the cursor like a hand so the first delivered mouseMoved (the
+        // moment the crosshair goes live) is part of the timeline.
+        let mouse = NSEvent.mouseLocation
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        var mp = CGPoint(x: mouse.x, y: primaryH - mouse.y)
+        for _ in 0..<240 {   // até ~3s
+            mp.x += (mp.x.truncatingRemainder(dividingBy: 2) == 0 ? 1 : -1)
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: mp, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+            if AreaSelectionDiag.timeline["firstMouseMoved"] != nil { break }
+            try? await Task.sleep(nanoseconds: 12_500_000)
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        // Esc cancela a seleção.
+        if let esc = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true) { esc.post(tap: .cghidEventTap) }
+        if let esc = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false) { esc.post(tap: .cghidEventTap) }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        let tl = AreaSelectionDiag.timeline
+        func delta(_ name: String) -> Int? { tl[name].map { Int(($0 - t0) * 1000) } }
+        var deltas: [String: Int] = [:]
+        for k in ["hotkeyUpPosted", "hotkeyFired", "startAreaCapture", "prepareEntry", "overlaysShown", "becameKey", "firstMouseMoved"] {
+            if let d = delta(k) { deltas[k] = d }
+        }
+        r["timelineMs"] = deltas
+        let ready = deltas["firstMouseMoved"] ?? -1
+        r["selectionLiveMs"] = ready
+        r["allPass"] = ready >= 0 && ready <= 450
+        return r
     }
 
     /// Reproduces the "interaction works once, then I must click elsewhere"
@@ -1311,6 +1593,9 @@ final class UITestRunner: NSObject {
         img.lockFocus()
         NSColor(srgbRed: 0.15, green: 0.17, blue: 0.22, alpha: 1).setFill()
         NSRect(x: 0, y: 0, width: 600, height: 400).fill()
+        // Patch de cor distinta no topo-esquerdo: alvo do probe do eyedropper (2c).
+        NSColor(srgbRed: 0.85, green: 0.30, blue: 0.10, alpha: 1).setFill()
+        NSRect(x: 0, y: 300, width: 100, height: 100).fill()
         img.unlockFocus()
 
         AnnotationWindowController.open(image: img)
@@ -1371,6 +1656,28 @@ final class UITestRunner: NSObject {
         let rdx = rectAnn.bounds.origin.x - rBefore.x, rdy = rectAnn.bounds.origin.y - rBefore.y
         r["rectMoveDelta"] = ["dx": rdx, "dy": rdy]
         r["rectMovePass"] = (abs(rdx + 50) < 10 && abs(rdy - 30) < 10)
+
+        // 2c. Eyedropper: dois cliques mapeiam pros pixels certos da imagem
+        // (patch topo-esquerdo vs base). Ground truth lido dos bytes da PRÓPRIA
+        // imagem com o mesmo sampler: prova o mapeamento view→pixel e a cópia.
+        var eyedropperPass = false
+        if let cgBG = img.bestCGImage {
+            let patchTruth = PixelSampler.hex(in: cgBG, x: cgBG.width / 20, y: cgBG.height / 20)
+            let baseTruth  = PixelSampler.hex(in: cgBG, x: cgBG.width / 2,  y: (cgBG.height * 3) / 4)
+            canvas.activeTool = .eyedropper
+            NSPasteboard.general.clearContents()
+            canvas.uiTestEyedrop(at: CGPoint(x: 30, y: 30))
+            let pickedPatch = NSPasteboard.general.string(forType: .string)
+            NSPasteboard.general.clearContents()
+            canvas.uiTestEyedrop(at: CGPoint(x: 300, y: 300))
+            let pickedBase = NSPasteboard.general.string(forType: .string)
+            canvas.activeTool = .select
+            r["eyedropper"] = ["patch": pickedPatch ?? "", "patchTruth": patchTruth ?? "",
+                               "base": pickedBase ?? "", "baseTruth": baseTruth ?? ""]
+            eyedropperPass = pickedPatch != nil && pickedPatch == patchTruth
+                && pickedBase != nil && pickedBase == baseTruth && pickedPatch != pickedBase
+        }
+        r["eyedropperPass"] = eyedropperPass
 
         // 3. Sidebar: padding aplica e o canvas re-deriva sem distorcer.
         if ctrl.uiTestSidebar == nil || ctrl.uiTestSidebar?.isHidden != false {
@@ -1468,7 +1775,7 @@ final class UITestRunner: NSObject {
         r["editorSnapshot"] = shotOK ? shotPath : "FAILED"
         r["snapshotPass"] = shotOK
 
-        let passes = [r["windowLevelPass"], r["opensWithBackgroundPass"], r["movePass"], r["rectMovePass"], r["paddingPass"], r["aspectAfterPaddingPass"], r["windowFollowsPass"], r["fitPass"], r["wallpaperSelectPass"], r["blurTogglePass"], r["textToolHeaderPass"], r["snapshotPass"]]
+        let passes = [r["windowLevelPass"], r["opensWithBackgroundPass"], r["movePass"], r["rectMovePass"], r["eyedropperPass"], r["paddingPass"], r["aspectAfterPaddingPass"], r["windowFollowsPass"], r["fitPass"], r["wallpaperSelectPass"], r["blurTogglePass"], r["textToolHeaderPass"], r["snapshotPass"]]
         r["allPass"] = passes.allSatisfy { ($0 as? Bool) == true }
         return r
     }
