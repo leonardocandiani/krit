@@ -726,9 +726,11 @@ final class AnnotationWindowController: NSWindowController {
         sidebar.options = backgroundOptions
         toolbar.setBackgroundPanelOpen(showing)   // ES3: icon button selected state
 
-        // Opening the sidebar must not shrink the canvas below a usable width:
-        // widen the window so the sidebar takes new space instead of eating the
-        // canvas. The canvas reflows in lockstep inside layoutStage.
+        // Fase 1 (rara, janela estreita): alarga a janela AINDA FECHADA e
+        // re-assenta todo o chrome no tamanho novo num passo seco. Misturar o
+        // resize da janela com a moção das views era a raiz do "componentes se
+        // movem diferente do fundo": o autoresize do setFrame assentava tudo no
+        // estado final e os animators não tinham mais o que animar (jump cut).
         if showing {
             let needed = Self.minimumWindowWidth(
                 toolbarWidth: toolbar.fittingWidth,
@@ -742,15 +744,27 @@ final class AnnotationWindowController: NSWindowController {
                 // Grow rightward, then nudge left only if it would run off-screen.
                 if frame.maxX > screenMaxX { frame.origin.x = max(0, frame.origin.x - delta) }
                 window.setFrame(frame, display: true, animate: false)
+                layoutStage(sidebarVisible: false, animated: false)
             }
         }
 
-        // ES1: the column slides in from the left edge (off-screen at x:-width) to
-        // x:0 while the canvas reflows beside it; closing slides it back out.
+        // Fase 2: a moção em si, SÓ views (janela parada): a coluna desliza do
+        // off-screen (x:-width) pra x:0 enquanto o canvas reflui ao lado; fechar
+        // desliza de volta. Fechar derruba a parede esquerda do chrome já no
+        // início (a coluna sai com o próprio material por cima do palco); abrir
+        // pousa a parede no fim, debaixo da coluna assentada.
         sidebar.isHidden = false
         if showing {
-            // Seed the off-screen start frame before animating to x:0.
             sidebar.frame = Self.sidebarRect(winH: window.frame.height, visible: false)
+            // Commita o estado seed (recém des-hidden, fora da tela) no render
+            // server ANTES do grupo animado: sem isso o animator não tem estado
+            // de partida apresentado e a coluna teleporta pra x:0 (o slide nunca
+            // rodou de fato).
+            window.contentView?.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            CATransaction.flush()
+        } else {
+            chromeBackdrop?.update(leftArmWidth: 0, bottomArmHeight: Self.bottomBarHeight, topArmHeight: Self.toolbarHeight)
         }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.24
@@ -758,8 +772,14 @@ final class AnnotationWindowController: NSWindowController {
             ctx.allowsImplicitAnimation = true
             layoutStage(sidebarVisible: showing, animated: true)
         }, completionHandler: { [weak self] in
+            guard let self else { return }
             if !showing { sidebar.isHidden = true }
-            self?.canvas.setNeedsDisplay(self?.canvas.bounds ?? .zero)
+            if showing {
+                self.chromeBackdrop?.update(leftArmWidth: Self.sidebarWidth,
+                                            bottomArmHeight: Self.bottomBarHeight,
+                                            topArmHeight: Self.toolbarHeight)
+            }
+            self.canvas.setNeedsDisplay(self.canvas.bounds)
         })
     }
 
@@ -769,10 +789,13 @@ final class AnnotationWindowController: NSWindowController {
     /// sidebar column and the bottom bar from the current window size. The dock
     /// always clears the traffic lights (R6) and the open sidebar; the canvas
     /// takes whatever horizontal space is left so the art is never crammed.
-    private func layoutStage(sidebarVisible: Bool, animated: Bool) {
+    private func layoutStage(sidebarVisible: Bool, animated: Bool, targetSize: NSSize? = nil) {
         guard let container = window?.contentView, let scrollView = editorScrollView else { return }
-        let winW = container.bounds.width
-        let winH = container.bounds.height
+        // Durante um resize animado da janela os bounds do contentView ainda
+        // estão no valor velho; o chamador passa o tamanho ALVO pros frames
+        // finais saírem certos e tudo pousar junto.
+        let winW = targetSize?.width ?? container.bounds.width
+        let winH = targetSize?.height ?? container.bounds.height
 
         // The canvas fills the chrome notch exactly: flush against the sidebar's
         // trailing edge (or the window edge when closed), the header band and the
@@ -798,15 +821,20 @@ final class AnnotationWindowController: NSWindowController {
             backgroundSidebar?.animator().frame = sidebarRect
             toolbar.animator().frame = headerRect
             bottomBar?.animator().frame = barRect
+            // Braços do chrome NÃO mudam aqui: a máscara do backdrop não anima
+            // (troca de path é seca), então quem anima coordena o timing — o
+            // toggle da sidebar atualiza o braço esquerdo no fim da moção ao
+            // abrir (a coluna carrega o próprio material durante o slide) e
+            // imediatamente ao fechar.
         } else {
             scrollView.frame = canvasRect
             backgroundSidebar?.frame = sidebarRect
             toolbar.frame = headerRect
             bottomBar?.frame = barRect
+            // The backdrop redraws its continuous frame from these arm metrics
+            // every layout pass (header + sidebar + footer around the notch).
+            chromeBackdrop?.update(leftArmWidth: leftArm, bottomArmHeight: Self.bottomBarHeight, topArmHeight: Self.toolbarHeight)
         }
-        // The backdrop redraws its continuous frame from these arm metrics every
-        // layout pass (top header + left sidebar + bottom footer around the notch).
-        chromeBackdrop?.update(leftArmWidth: leftArm, bottomArmHeight: Self.bottomBarHeight, topArmHeight: Self.toolbarHeight)
     }
 
     /// Integrated sidebar column frame: flush left (x:0) and full-height between

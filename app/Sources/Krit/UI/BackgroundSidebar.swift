@@ -128,11 +128,18 @@ final class BackgroundSidebar: NSView {
         self.options = options
         super.init(frame: NSRect(x: 0, y: 0, width: Self.preferredWidth, height: 600))
         wantsLayer = true
-        // ES1: the sidebar is the LEFT ARM of one continuous L-shaped chrome
-        // surface (see EditorChromeBackdrop in the controller). It owns NO material,
-        // corners, shadow or border of its own, the shared backdrop provides the
-        // material so the column and the footer read as a single piece. This view
-        // is just the transparent host for the scrolling control column.
+        // ES1: a coluna é o braço esquerdo do chrome em L (EditorChromeBackdrop),
+        // mas carrega o PRÓPRIO material de fundo: durante o slide de abertura a
+        // parede do backdrop ainda não pousou (chega no completion), e sem fundo
+        // próprio os controles deslizavam pelados sobre o palco — o movimento
+        // "descolado do fundo" do relato. Assentada, o material dela se funde ao
+        // do backdrop (mesmo windowBackground), lendo como uma peça só.
+        let material = NSVisualEffectView(frame: bounds)
+        material.material = .windowBackground
+        material.blendingMode = .behindWindow
+        material.state = .followsWindowActiveState
+        material.autoresizingMask = [.width, .height]
+        addSubview(material, positioned: .below, relativeTo: nil)
         buildLayout()
         rebuildThumbnails()
         syncControls()
