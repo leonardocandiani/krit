@@ -92,7 +92,7 @@ fi
 
 # Copy SPM-generated resource bundle (capture sound, etc.) if present
 # Probe flat and arch-subdirectory layouts
-SPM_RESOURCE_BUNDLE="$(find "$BUILD_PATH" -maxdepth 4 -name "Krit_Krit.bundle" -type d | head -1)"
+SPM_RESOURCE_BUNDLE="$(find "$BUILD_PATH" -maxdepth 4 -name "Krit_KritKit.bundle" -type d | head -1)"
 if [ -d "$SPM_RESOURCE_BUNDLE" ]; then
     cp -R "$SPM_RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"
 fi

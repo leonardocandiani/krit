@@ -1046,7 +1046,7 @@ final class CaptureEngine {
     /// build path in /tmp, so it fatalErrors after a reboot wipes /tmp. Resolve the
     /// resource bundle from the locations our layouts actually use instead.
     static let resourceBundle: Bundle = {
-        let bundleName = "Krit_Krit.bundle"
+        let bundleName = "Krit_KritKit.bundle"
         let candidates = [
             Bundle.main.resourceURL,  // .app bundle: Contents/Resources/
             Bundle.main.bundleURL,    // swift build: alongside the binary

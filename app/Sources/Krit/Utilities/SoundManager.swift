@@ -98,7 +98,7 @@ enum SoundManager {
     /// Resolves `<name>.caf` from KRIT's resource bundle without leaning on any
     /// other type. Tries the `.app` and `swift build` layouts, then the SPM dev
     /// bundle. Falls back to a direct file URL inside the bundle, because the
-    /// processed `Krit_Krit.bundle` is a flat directory (no Info.plist), which can
+    /// processed `Krit_KritKit.bundle` is a flat directory (no Info.plist), which can
     /// make `Bundle.url(forResource:)` return nil even though the file is there.
     private static func resourceURL(for name: String) -> URL? {
         for bundleURL in soundBundleURLs {
@@ -116,11 +116,11 @@ enum SoundManager {
         return nil
     }
 
-    /// Candidate locations for `Krit_Krit.bundle`, ordered by likelihood in
+    /// Candidate locations for `Krit_KritKit.bundle`, ordered by likelihood in
     /// production. Resolved once; logs the resolved (or missing) path a single
     /// time so a silenced build is diagnosable from Console.
     private static let soundBundleURLs: [URL] = {
-        let bundleName = "Krit_Krit.bundle"
+        let bundleName = "Krit_KritKit.bundle"
         var urls: [URL] = []
         if let resources = Bundle.main.resourceURL {            // .app: Contents/Resources/
             urls.append(resources.appendingPathComponent(bundleName))
