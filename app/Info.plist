@@ -70,5 +70,11 @@
 	<string>KRIT needs screen access to capture screenshots.</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/leonardocandiani/krit/main/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>jB1NnaiMxZtaXoQeJ8AcUhtrKfIGv2197I+qTGm4f+c=</string>
 </dict>
 </plist>

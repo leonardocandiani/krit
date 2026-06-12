@@ -97,6 +97,25 @@ if [ -d "$SPM_RESOURCE_BUNDLE" ]; then
     cp -R "$SPM_RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"
 fi
 
+# Embed Sparkle.framework (auto-update). SPM links the app against the binary
+# xcframework artifact whose install name is @rpath/Sparkle.framework/…, so the
+# bundle must carry the framework and the binary an rpath that reaches it.
+SPARKLE_FRAMEWORK="$(find "$BUILD_PATH/artifacts" -maxdepth 4 -name "Sparkle.framework" -type d 2>/dev/null | head -1)"
+if [ -z "$SPARKLE_FRAMEWORK" ]; then
+    # Artifacts land in .build/ when the dependency graph was resolved by a
+    # default-path build (swift build without --build-path).
+    SPARKLE_FRAMEWORK="$(find "$SCRIPT_DIR/.build/artifacts" -maxdepth 5 -name "Sparkle.framework" -type d 2>/dev/null | head -1)"
+fi
+if [ -z "$SPARKLE_FRAMEWORK" ]; then
+    echo "✗ Sparkle.framework not found in build artifacts"
+    exit 1
+fi
+echo "▶ Embedding Sparkle.framework…"
+mkdir -p "$APP_BUNDLE/Contents/Frameworks"
+cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
+install_name_tool -add_rpath "@executable_path/../Frameworks" \
+    "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+
 # Strip extended attributes / AppleDouble residue before signing. Files copied
 # from an exFAT source can carry xattrs that make codesign choke.
 xattr -cr "$APP_BUNDLE" 2>/dev/null || true
@@ -115,6 +134,27 @@ else
     codesign --force --sign "$SIGN_IDENTITY" --identifier "com.krit.cli" \
         --options runtime "$APP_BUNDLE/Contents/Helpers/krit"
 fi
+
+# Sparkle ships signed by the Sparkle project; re-sign every nested executable
+# with our identity (inside-out, per Sparkle's sanctioned re-signing order) so
+# the whole bundle carries one identity and library validation stays coherent.
+echo "▶ Re-signing embedded Sparkle.framework…"
+SPARKLE_IN_BUNDLE="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+TS_FLAG=()
+if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
+    TS_FLAG=(--timestamp)
+fi
+codesign --force --sign "$SIGN_IDENTITY" --options runtime "${TS_FLAG[@]}" \
+    "$SPARKLE_IN_BUNDLE/Versions/B/XPCServices/Installer.xpc"
+codesign --force --sign "$SIGN_IDENTITY" --options runtime "${TS_FLAG[@]}" \
+    --preserve-metadata=entitlements \
+    "$SPARKLE_IN_BUNDLE/Versions/B/XPCServices/Downloader.xpc"
+codesign --force --sign "$SIGN_IDENTITY" --options runtime "${TS_FLAG[@]}" \
+    "$SPARKLE_IN_BUNDLE/Versions/B/Autoupdate"
+codesign --force --sign "$SIGN_IDENTITY" --options runtime "${TS_FLAG[@]}" \
+    "$SPARKLE_IN_BUNDLE/Versions/B/Updater.app"
+codesign --force --sign "$SIGN_IDENTITY" --options runtime "${TS_FLAG[@]}" \
+    "$SPARKLE_IN_BUNDLE"
 
 echo "▶ Signing with identity: $SIGN_IDENTITY"
 

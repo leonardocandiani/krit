@@ -192,7 +192,6 @@ bash "$DMG_SCRIPT"
 DMG_SHA="$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')"
 ok "DMG packaged: $DMG_PATH"
 info "DMG sha256: $DMG_SHA"
-info "Update Casks/krit.rb with version \"$VERSION\" and sha256 \"$DMG_SHA\"."
 
 # Publish a checksum file next to the DMG so install.sh can verify the
 # download before mounting it (supply-chain integrity for curl | bash).
@@ -200,14 +199,63 @@ SHA_FILE="$DMG_PATH.sha256"
 printf '%s  %s\n' "$DMG_SHA" "$DMG_NAME" > "$SHA_FILE"
 
 # ---------------------------------------------------------------------------
-# Tag and publish
+# Sparkle: sign the DMG and prepend the appcast item
 # ---------------------------------------------------------------------------
+
+# sign_update ships inside the Sparkle SPM artifact; the EdDSA private key
+# lives in the login keychain (created once with generate_keys). Shipped apps
+# verify the signature against SUPublicEDKey in Info.plist, so a release
+# without a valid signature would be ignored by the updater.
+SIGN_UPDATE="$(find "$APP_DIR/.build/artifacts" /tmp/krit-app-build/artifacts -maxdepth 5 -name "sign_update" -type f -not -path "*old_dsa*" 2>/dev/null | head -1)"
+[ -n "$SIGN_UPDATE" ] || fail "Sparkle sign_update not found. Run a swift build in app/ first."
+chmod +x "$SIGN_UPDATE" 2>/dev/null || true
+
+info "Signing DMG for Sparkle (EdDSA)"
+ED_SIG="$("$SIGN_UPDATE" -p "$DMG_PATH")"
+[ -n "$ED_SIG" ] || fail "sign_update produced no signature. Is the Sparkle key in the keychain?"
+ok "EdDSA signature: $ED_SIG"
+
+# sparkle:version compares against the installed app's CFBundleVersion, which
+# build-app.sh stamps with the build time (YYYYMMDD.HHMM) — monotonic across
+# releases by construction.
+BUILD_NUMBER="$(defaults read /Applications/KRIT.app/Contents/Info CFBundleVersion)"
+
+info "Updating appcast.xml"
+bash "$SCRIPT_DIR/update-appcast.sh" "$VERSION" "$BUILD_NUMBER" "$DMG_PATH" "$ED_SIG" "$REPO_ROOT/appcast.xml"
+
+# ---------------------------------------------------------------------------
+# Bump the Homebrew cask
+# ---------------------------------------------------------------------------
+
+CASK_FILE="$REPO_ROOT/Casks/krit.rb"
+if [ -f "$CASK_FILE" ]; then
+    info "Bumping Casks/krit.rb to $VERSION"
+    sed -i '' -e "s/^  version \".*\"/  version \"$VERSION\"/" \
+              -e "s/^  sha256 \".*\"/  sha256 \"$DMG_SHA\"/" "$CASK_FILE"
+fi
+
+# ---------------------------------------------------------------------------
+# Commit, tag and publish
+# ---------------------------------------------------------------------------
+
+# The tag must point at a commit that already carries the version bump, the
+# appcast entry and the cask digest; shipped apps read appcast.xml from main,
+# so main gets pushed before the release is published.
+info "Committing release metadata"
+git add "$INFO_PLIST" "$REPO_ROOT/appcast.xml" "$CASK_FILE"
+git commit -m "chore: release $TAG
+
+- bump CFBundleShortVersionString to $VERSION
+- appcast entry for the Sparkle in-app update
+- cask digest $DMG_SHA
+
+Autor: Leonardo Candiani"
 
 info "Creating git tag $TAG"
 git tag -a "$TAG" -m "KRIT $TAG"
 
 info "Publishing GitHub release $TAG with $DMG_NAME"
-# Push the tag so gh attaches the release to a commit that exists on the remote.
+git push origin HEAD
 git push origin "$TAG"
 gh release create "$TAG" "$DMG_PATH" "$SHA_FILE" \
     --title "KRIT $TAG" \
@@ -218,5 +266,4 @@ printf '\n'
 printf '  Release:  https://github.com/leonardocandiani/krit/releases/tag/%s\n' "$TAG"
 printf '  DMG:      %s\n' "$DMG_NAME"
 printf '  sha256:   %s\n' "$DMG_SHA"
-printf '\n'
-printf '  Next: bump Casks/krit.rb to version "%s" + sha256 "%s", then commit it.\n' "$VERSION" "$DMG_SHA"
+printf '  appcast:  entry for %s pushed to main (in-app updates live)\n' "$TAG"
