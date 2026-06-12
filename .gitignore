@@ -6,6 +6,7 @@ dist/
 build/
 target/
 *.dmg
+*.dmg.sha256
 *.app
 packages/tokens/build/*.generated.*
 # tauri
