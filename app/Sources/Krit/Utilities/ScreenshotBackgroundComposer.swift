@@ -1153,16 +1153,18 @@ enum ScreenshotBackgroundComposer {
         return CGRect(x: snapped.origin.x, y: topY, width: snapped.width, height: snapped.height)
     }
 
-    // Places a content rect (with `inset` margin from the slot) inside `container`,
-    // honoring the alignment anchor and never letting the content cross the inset.
+    // Places a content rect inside `container` by the alignment anchor, using
+    // the TOTAL free space (Snapzy-style seamless alignment): an edge anchor
+    // makes the shot TOUCH that canvas edge with no gap, which is what gives
+    // the control a visible effect even on the default snug canvas (reserving
+    // the inset on both sides left zero free space there, so the alignment
+    // grid did nothing, the "alignment doesn't work" report). A centered axis
+    // (unit 0.5) lands exactly on the old padded placement.
     private static func alignedOrigin(content: NSSize, inset: CGFloat, container: NSSize, alignment: BackgroundAlignment) -> CGPoint {
-        let freeX = Swift.max(0, container.width - content.width - inset * 2)
-        let freeY = Swift.max(0, container.height - content.height - inset * 2)
+        let freeX = Swift.max(0, container.width - content.width)
+        let freeY = Swift.max(0, container.height - content.height)
         let unit = alignment.unit
-        return CGPoint(
-            x: inset + freeX * unit.x,
-            y: inset + freeY * unit.y
-        )
+        return CGPoint(x: freeX * unit.x, y: freeY * unit.y)
     }
 
     private static func cornerRadius(for rect: CGRect, options: ScreenshotBackgroundOptions, shrink: CGFloat = 1) -> CGFloat {
