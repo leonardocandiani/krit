@@ -140,20 +140,24 @@ final class CaptureEngine {
         // Snapshot the source app BEFORE the overlay activates KRIT and steals focus,
         // so the history thumbnail can badge where the shot came from.
         historyManager.prepareForCapture()
-        let hiddenByCapture = await hideDesktopIconsForCaptureIfNeeded()
+        // Hide the icons in PARALLEL with the selection UI: the 350ms settle
+        // inside hideDesktopIconsForCaptureIfNeeded must never hold the overlay
+        // back (it was part of the seconds-long hotkey delay). The capture only
+        // happens on mouse release, long after the icons are gone.
+        let hideTask = Task { await self.hideDesktopIconsForCaptureIfNeeded() }
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
             self.areaSelectionWindow = nil
             guard let rect else {
                 self.clearOnNextCaptureFinished()
                 self.snapAndPasteTarget = nil
-                self.restoreDesktopIconsIfNeeded(hiddenByCapture)
+                Task { self.restoreDesktopIconsIfNeeded(await hideTask.value) }
                 return
             }
             self.lastCaptureRect = rect
             Task {
                 await self.captureRect(rect, on: screen, historyManager: historyManager)
-                self.restoreDesktopIconsIfNeeded(hiddenByCapture)
+                self.restoreDesktopIconsIfNeeded(await hideTask.value)
             }
         }
         await areaSelectionWindow?.prepareAndShow(engine: self)
@@ -246,14 +250,16 @@ final class CaptureEngine {
         }
         guard areaSelectionWindow == nil else { return }
         historyManager.prepareForCapture()
-        let hiddenByCapture = await hideDesktopIconsForCaptureIfNeeded()
+        // Same as startAreaCapture: never let the icon-hide settle delay the
+        // picker UI; the capture happens on click, long after.
+        let hideTask = Task { await self.hideDesktopIconsForCaptureIfNeeded() }
         areaSelectionWindow = AreaSelectionWindow(mode: .window) { [weak self] rect, screen, windowID in
             guard let self else { return }
             self.areaSelectionWindow = nil
             guard let rect else {
                 self.clearOnNextCaptureFinished()
                 self.snapAndPasteTarget = nil
-                self.restoreDesktopIconsIfNeeded(hiddenByCapture)
+                Task { self.restoreDesktopIconsIfNeeded(await hideTask.value) }
                 return
             }
             Task {
@@ -264,7 +270,7 @@ final class CaptureEngine {
                 } else {
                     await self.captureRect(rect, on: screen, historyManager: historyManager, isWindowCapture: true)
                 }
-                self.restoreDesktopIconsIfNeeded(hiddenByCapture)
+                self.restoreDesktopIconsIfNeeded(await hideTask.value)
             }
         }
         await areaSelectionWindow?.prepareAndShow(engine: self)
@@ -1064,16 +1070,20 @@ final class CaptureEngine {
         SoundManager.warmUp()
     }
 
-    func captureRectToImage(_ rect: CGRect, on screen: NSScreen) async -> NSImage? {
+    /// `nativeScale` skips the user's supersampling multiplier: the frozen
+    /// selection backdrop and other purely-visual grabs only need native pixels,
+    /// and a 3x multiplier on a large display made the area-selection hotkey
+    /// take seconds to show.
+    func captureRectToImage(_ rect: CGRect, on screen: NSScreen, nativeScale: Bool = false) async -> NSImage? {
         if #available(macOS 14.0, *) {
-            return await captureRectSCK(rect, on: screen)
+            return await captureRectSCK(rect, on: screen, nativeScale: nativeScale)
         } else {
             return fallbackCapture(rect: rect)
         }
     }
 
     @available(macOS 14.0, *)
-    private func captureRectSCK(_ rect: CGRect, on screen: NSScreen) async -> NSImage? {
+    private func captureRectSCK(_ rect: CGRect, on screen: NSScreen, nativeScale: Bool = false) async -> NSImage? {
         lastCaptureFailureWasPermission = false
         do {
             // captureRectSCK only needs the display list, no window enumeration.
@@ -1106,7 +1116,7 @@ final class CaptureEngine {
             // Supersample on top of the native scale when the user asks for more
             // density (Settings.captureScale). Clamped so an extreme display +
             // Maximum can't ask SCK for a buffer past its texture limit.
-            let mult = Settings.captureScale.multiplier
+            let mult = nativeScale ? 1 : Settings.captureScale.multiplier
             let pixelW = min(Int(w * s * mult), Self.maxCaptureEdge)
             let pixelH = min(Int(h * s * mult), Self.maxCaptureEdge)
 

@@ -29,15 +29,27 @@ final class AreaSelectionWindow: NSObject {
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
 
+        // Overlays go up IMMEDIATELY so the selection is usable the instant the
+        // hotkey fires. The frozen frames (loupe sampling + legacy crop source)
+        // arrive asynchronously below; the loupe simply stays hidden until its
+        // frame lands. The old order (full-screen grab per display, serial, at
+        // the user's supersampling scale) held the whole UI back for seconds.
         for screen in NSScreen.screens {
-            let image = await engine.captureRectToImage(screen.frame, on: screen)
-            var rect = NSRect(origin: .zero, size: screen.frame.size)
-            let frozenCG = image?.cgImage(forProposedRect: &rect, context: nil, hints: nil)
-            let overlay = SelectionOverlayWindow(screen: screen, mode: mode, frozenImage: frozenCG)
+            let overlay = SelectionOverlayWindow(screen: screen, mode: mode, frozenImage: nil)
             overlay.selectionHandler = { [weak self] rect, windowID in self?.finish(rect: rect, screen: screen, windowID: windowID) }
             overlay.cancelHandler = { [weak self] in self?.cancel() }
             overlay.show()
             overlays.append(overlay)
+        }
+        for (overlay, screen) in zip(overlays, NSScreen.screens) {
+            Task { [weak overlay] in
+                // Native 1x: this frame is for the loupe and fallback crop, the
+                // real capture re-grabs at the configured quality on release.
+                let image = await engine.captureRectToImage(screen.frame, on: screen, nativeScale: true)
+                var rect = NSRect(origin: .zero, size: screen.frame.size)
+                guard let frozenCG = image?.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return }
+                await MainActor.run { overlay?.setFrozenImage(frozenCG) }
+            }
         }
 
         focusFirstOverlay()
@@ -131,6 +143,12 @@ private final class SelectionOverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 
+    /// Late-arriving frozen frame (captured async after the overlay is already
+    /// on screen): hands it to the view so the loupe starts sampling.
+    func setFrozenImage(_ image: CGImage) {
+        overlayView.setFrozenImage(image)
+    }
+
     func show() {
         orderFrontRegardless()
     }
@@ -164,7 +182,12 @@ private final class SelectionOverlayView: NSView {
     private var cachedWindows: [(screenRect: NSRect, windowID: CGWindowID)] = []
     private var lastWindowListRefresh: TimeInterval = 0
 
-    private let frozenImage: CGImage?
+    private var frozenImage: CGImage?
+
+    func setFrozenImage(_ image: CGImage) {
+        frozenImage = image
+        needsDisplay = true
+    }
 
     init(mode: SelectionMode, frozenImage: CGImage?) {
         self.mode = mode
