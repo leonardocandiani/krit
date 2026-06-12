@@ -71,3 +71,22 @@ Decisões técnicas e o porquê de cada uma, pra a razão não se perder com o t
 **Contexto:** Dono pediu fluxo de release de verdade ("amassar com release e updates"), com o Snapzy de referência (115 releases, DMG + install.sh + brew tap servido do próprio repo).
 **Decisão:** scripts/release/release.sh é o caminho oficial (bump no app/Info.plist via PlistBuddy > build-app.sh > make-dmg.sh > tag > gh release create); install.sh na raiz baixa a última release e limpa a quarantine (app ad-hoc, não notarizado, igual ao Snapzy); Casks/krit.rb na RAIZ é o cask canônico do tap (o rascunho app/Casks/krit.rb foi removido pra evitar drift, recuperável no histórico). DMG mantém o nome KRIT-v<versao>-macOS.dmg (convenção que o make-dmg.sh já produzia). Modo Preview: segmented Annotate/Preview no footer; preview esconde o conteúdo de edição das duas faixas (Save as/Done ficam), canvas vira read-only (zoom/pan seguem vivos), sidebar fecha. A altura do chrome NÃO muda no preview (v1): mexer na altura dinâmica arriscaria o sizing recém-estabilizado; evoluir pra stage full se o dono pedir.
 **Consequências:** README reescrito (o antigo descrevia a arquitetura Tauri abandonada); sobras do produto Tauri (apps/, packages/, scripts/macos-release.sh) seguem no repo e merecem limpeza num passe próprio com aval do dono.
+
+## 2026-06-12: Código do app em library (KritKit) + executável fino
+
+**Contexto**: o Xcode não oferece previews nem code snippets dentro de executable
+targets (exigem ENABLE_DEBUG_DYLIB, sem knob no SPM). Todo o código de UI vivia
+no executableTarget KritApp, então o canvas e o RunCodeSnippet ficavam
+bloqueados pra iteração de design.
+
+**Decisão**: todo o código move pro target de library KritKit (product
+.library), e o KritApp vira um main.swift de uma linha chamando
+KritMain.run(). O binário final continua KritApp, build-app.sh intocado no
+fluxo. A migração expôs e corrigiu um bug latente: o bundle de sons era
+resolvido pelo nome fóssil Krit_Krit.bundle, que só funcionava por sobras de
+builds antigos no build path; clone limpo teria som mudo.
+
+**Consequências**: design do chrome iterável direto do Xcode (scheme KritKit +
+RunCodeSnippet renderizando PNGs), preview canvas disponível pra qualquer view,
+e o resolver de resources usa o nome real Krit_KritKit.bundle, provado com
+build do zero.
