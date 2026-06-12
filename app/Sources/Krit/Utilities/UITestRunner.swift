@@ -176,7 +176,13 @@ final class UITestRunner: NSObject {
         guard let win = ctrl.uiTestWindow else {
             r["error"] = "preferences window did not open"; r["allPass"] = false; return r
         }
-        defer { ctrl.uiTestClose() }
+        // A janela do shared controller sobrevive ao close: restaurar o frame,
+        // senão a próxima abertura REAL vem com os 520pt do teste.
+        let originalFrame = win.frame
+        defer {
+            win.setFrame(originalFrame, display: false)
+            ctrl.uiTestClose()
+        }
 
         // Janela curta o bastante pra General PRECISAR rolar.
         var f = win.frame
@@ -639,10 +645,14 @@ final class UITestRunner: NSObject {
         try? await Task.sleep(nanoseconds: 500_000_000)
 
         Task { await engine.startColorPick() }
+        // Espera o frozen frame DO OVERLAY DA TELA DO PICK: com dois monitores o
+        // primeiro freeze a chegar pode ser o da outra tela, e picar antes do
+        // certo congelar cancela silenciosamente (sample nil).
         var ready = false
         for _ in 0..<50 {
             try? await Task.sleep(nanoseconds: 100_000_000)
-            if engine.uiTestActiveSelection?.uiTestHasFrozenFrame == true { ready = true; break }
+            if let diag = engine.uiTestActiveSelection?.uiTestPickDiag(atScreen: NSPoint(x: winRect.midX, y: winRect.midY)),
+               diag["chosenHasFrozen"] as? Bool == true { ready = true; break }
         }
         r["overlayReady"] = ready
         guard ready else {
@@ -651,6 +661,9 @@ final class UITestRunner: NSObject {
         }
 
         NSPasteboard.general.clearContents()
+        if let diag = engine.uiTestActiveSelection?.uiTestPickDiag(atScreen: NSPoint(x: winRect.midX, y: winRect.midY)) {
+            for (k, v) in diag { r["diag_\(k)"] = v }
+        }
         engine.uiTestActiveSelection?.uiTestPickColor(atScreen: NSPoint(x: winRect.midX, y: winRect.midY))
         try? await Task.sleep(nanoseconds: 400_000_000)
         let copied = NSPasteboard.general.string(forType: .string) ?? ""

@@ -110,6 +110,21 @@ final class AreaSelectionWindow: NSObject {
         overlay?.uiTestPickColor(atScreen: screenPoint)
     }
 
+    /// Read-only probe of the pick path: which overlay the point routes to,
+    /// whether it holds a frozen frame and what the sampler returns there.
+    /// Fires no handlers, so a scenario can report WHY a pick failed.
+    func uiTestPickDiag(atScreen screenPoint: NSPoint) -> [String: Any] {
+        var d: [String: Any] = [:]
+        d["overlayCount"] = overlays.count
+        d["frozenFlags"] = overlays.map { $0.uiTestHasFrozenFrame }
+        let chosen = overlays.first(where: { $0.frame.contains(screenPoint) }) ?? overlays.first
+        d["chosenHasFrozen"] = chosen?.uiTestHasFrozenFrame ?? false
+        d["chosenFrame"] = chosen.map { NSStringFromRect($0.frame) } ?? "nil"
+        d["pointInChosen"] = chosen?.frame.contains(screenPoint) ?? false
+        d["probedHex"] = chosen?.uiTestSampleHex(atScreen: screenPoint) ?? "nil"
+        return d
+    }
+
     private func finishColorPick(_ hex: String) {
         NSCursor.pop()
         tearDown()
@@ -203,6 +218,10 @@ private final class SelectionOverlayWindow: NSPanel {
         let windowPoint = convertFromScreen(NSRect(origin: screenPoint, size: .zero)).origin
         overlayView.uiTestPick(at: overlayView.convert(windowPoint, from: nil))
     }
+    func uiTestSampleHex(atScreen screenPoint: NSPoint) -> String? {
+        let windowPoint = convertFromScreen(NSRect(origin: screenPoint, size: .zero)).origin
+        return overlayView.uiTestSample(at: overlayView.convert(windowPoint, from: nil))
+    }
 }
 
 // MARK: - Overlay NSView
@@ -245,6 +264,7 @@ private final class SelectionOverlayView: NSView {
     func uiTestPick(at point: NSPoint) {
         if let hex = sampledHex(at: point) { colorPickHandler?(hex) } else { cancelHandler?() }
     }
+    func uiTestSample(at point: NSPoint) -> String? { sampledHex(at: point) }
 
     init(mode: SelectionMode, frozenImage: CGImage?) {
         self.mode = mode
