@@ -1018,7 +1018,13 @@ final class UITestRunner: NSObject {
             r["error"] = "card did not appear (before=\(before), after=\(cards.count))"
             return r
         }
-        let vf = screen?.visibleFrame ?? .zero
+        // The overlay follows the ACTIVE display (mouse) by design, which on a
+        // multi-monitor setup is not necessarily the screen passed to show().
+        // Judge the card against the visible frame of the screen it actually
+        // landed on, otherwise this scenario false-fails whenever the cursor
+        // sits on another monitor.
+        let cardScreen = NSScreen.screens.first { $0.frame.intersects(card.frame) } ?? screen
+        let vf = cardScreen?.visibleFrame ?? .zero
         r["cardFrame"] = ["x": card.frame.origin.x, "y": card.frame.origin.y,
                           "w": card.frame.width, "h": card.frame.height]
         r["visibleFrame"] = ["x": vf.origin.x, "y": vf.origin.y, "w": vf.width, "h": vf.height]
