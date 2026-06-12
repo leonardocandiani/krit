@@ -52,3 +52,9 @@ packages/tokens/build/
 
 # tauri icon also emits android assets (macOS-only project)
 apps/shell/src-tauri/icons/android/
+
+# swift package build (app/)
+app/.build/
+
+# reference clones for study (not ours to ship)
+_reference/

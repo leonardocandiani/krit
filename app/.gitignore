@@ -1,0 +1,19 @@
+# Credenciais locais — nunca commitar
+.env.local
+
+# Artefatos de build
+.build/
+/tmp/
+
+# Artefatos de distribuição
+*.dmg
+rw.*.dmg
+dmg-mount.*
+dmg-background.png
+
+# Bundle instalado localmente (make-dmg.sh lê de /Applications por padrão)
+KRIT.app/
+
+# macOS
+.DS_Store
+._*

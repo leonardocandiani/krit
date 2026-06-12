@@ -126,6 +126,34 @@ This is **v0.1** — still capture and annotation, built in the open.
 KRIT reimplements features from scratch. It shares no code, assets, or branding
 with CleanShot X or Cap. The table is a comparison, not a lineage.
 
+## Automation (CLI for agents and scripts)
+
+KRIT ships a command line tool at `KRIT.app/Contents/Helpers/krit`. It talks to
+the running app, so captures reuse KRIT's Screen Recording permission, and
+annotation runs headless. Output is a single JSON line per command, which makes
+it directly usable from agents like Claude Code:
+
+```bash
+KRIT=/Applications/KRIT.app/Contents/Helpers/krit
+
+# Capture a region (top-left origin, points) or the full screen
+$KRIT capture --region 300,200,800,500 --out shot.png
+$KRIT capture --fullscreen --out screen.png
+
+# Draw on an existing image (pixel coordinates, top-left origin)
+$KRIT annotate --in shot.png --out annotated.png --spec '[
+  {"type":"arrow","from":[200,800],"to":[700,400],"color":"#ff3b6b","width":8},
+  {"type":"box","rect":[450,120,300,160],"color":"#ff9500","width":5},
+  {"type":"text","at":[460,320],"text":"Look here","size":34,"color":"#ffffff"},
+  {"type":"step","at":[80,100],"number":1},
+  {"type":"blur","rect":[900,600,300,200]}
+]'
+```
+
+Spec types: `arrow`, `box`, `ellipse`, `line`, `text`, `step`, `highlight`,
+`blur`, `pixelate`. Errors come back as `{"ok":false,"error":...,"code":...}`
+with a non-zero exit code.
+
 ## Roadmap
 
 - **v0.1** — region/screen capture + annotation editor *(now)*

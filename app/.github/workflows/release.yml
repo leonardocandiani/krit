@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    # secrets.* is NOT available in step/job `if:` conditions (it resolves to "").
+    # Expose the secrets to job-level env so steps can gate on `env.*` instead.
+    env:
+      HAS_CERT: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+      HAS_NOTARY: ${{ secrets.NOTARY_APPLE_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          # Swift 6.2 / macOS 26 SDK exigem Xcode 16+
+          sudo xcode-select -s /Applications/Xcode_16.app 2>/dev/null \
+            || sudo xcode-select -s /Applications/Xcode.app
+
+      # --- Assinatura com Developer ID (opcional, requer segredos configurados) ---
+      - name: Import Developer ID certificate
+        if: ${{ env.HAS_CERT != '' }}
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/krit-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Exporta a identidade para build-app.sh e make-dmg.sh lerem
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "KRIT_CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build app
+        run: bash build-app.sh
+
+      - name: Create DMG
+        run: bash make-dmg.sh
+
+      # Guard the two decoupled sources of truth: the DMG version comes from
+      # Info.plist (CFBundleShortVersionString) while the cask hardcodes it. Fail
+      # the release if the DMG version doesn't match the tag that triggered it, so a
+      # version bump that forgot the cask/plist can't ship a 404 install URL.
+      - name: Verify DMG version matches tag
+        run: |
+          DMG=$(ls KRIT-v*-macOS.dmg | head -1)
+          DMG_VERSION=$(echo "$DMG" | sed -E 's/^KRIT-v(.*)-macOS\.dmg$/\1/')
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "DMG version: $DMG_VERSION | tag version: $TAG_VERSION"
+          if [ "$DMG_VERSION" != "$TAG_VERSION" ]; then
+            echo "✗ DMG version ($DMG_VERSION) does not match release tag ($TAG_VERSION)."
+            echo "  Bump CFBundleShortVersionString in Info.plist and Casks/krit.rb together."
+            exit 1
+          fi
+
+      # --- Notarização (opcional) ---
+      # Requer AMBOS: cert Developer ID (build assinado) E credenciais de notarização.
+      # Notarizar um build ad-hoc falha (ad-hoc não pode ser notarizado), então só
+      # roda quando HÁ assinatura Developer ID além das credenciais de notarização.
+      - name: Notarize DMG
+        if: ${{ env.HAS_CERT != '' && env.HAS_NOTARY != '' }}
+        env:
+          KRIT_NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          KRIT_NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          KRIT_NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+        run: |
+          DMG=$(ls KRIT-v*-macOS.dmg | head -1)
+          # Use direct Apple ID auth (no store-credentials) so there is no implicit
+          # coupling to which keychain is default — the cert-import step swaps the
+          # default keychain, which could otherwise hide a stored profile.
+          bash notarize-dmg.sh "$DMG"
+
+      - name: Print DMG sha256
+        run: |
+          DMG=$(ls KRIT-v*-macOS.dmg | head -1)
+          echo "### DMG sha256" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          shasum -a 256 "$DMG" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Cole o valor acima em Casks/krit.rb (campo sha256) antes de publicar o tap." >> "$GITHUB_STEP_SUMMARY"
+          shasum -a 256 "$DMG"
+
+      - name: Upload DMG to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: KRIT-v*-macOS.dmg
