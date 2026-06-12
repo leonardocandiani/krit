@@ -42,7 +42,7 @@ fail() { printf "%b✖%b %s\n" "${RED}" "${RESET}" "$*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || fail "KRIT is a macOS app. This script only works on macOS."
 
-for cmd in curl hdiutil xattr; do
+for cmd in curl hdiutil xattr shasum; do
     command -v "$cmd" >/dev/null 2>&1 || fail "Required command not found: $cmd"
 done
 
@@ -64,6 +64,10 @@ fi
 # Strip a leading "v" if present.
 VERSION="${VERSION#v}"
 
+# Reject anything that is not plain semver before using it in URLs and paths.
+printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || fail "Invalid version: ${VERSION} (expected MAJOR.MINOR.PATCH, e.g. 0.16.0)"
+
 DMG_NAME="KRIT-v${VERSION}-macOS.dmg"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${DMG_NAME}"
 
@@ -83,6 +87,23 @@ if ! curl -fSL --progress-bar -o "$DMG_PATH" "$DOWNLOAD_URL"; then
     fail "Download failed. Check the version number and your network connection."
 fi
 ok "Downloaded ${DMG_NAME}"
+
+# ---------------------------------------------------------------------------
+# Verify integrity
+# ---------------------------------------------------------------------------
+
+# Each release ships a .sha256 next to the DMG. Verify the download against it
+# before mounting anything, so a tampered DMG is rejected up front.
+SHA_NAME="${DMG_NAME}.sha256"
+SHA_PATH="${TMPDIR_INSTALL}/${SHA_NAME}"
+
+info "Verifying checksum…"
+if ! curl -fsSL -o "$SHA_PATH" "https://github.com/${REPO}/releases/download/v${VERSION}/${SHA_NAME}"; then
+    fail "Could not download the checksum file (${SHA_NAME}). Refusing to install an unverified DMG."
+fi
+(cd "$TMPDIR_INSTALL" && shasum -a 256 -c "$SHA_NAME" >/dev/null 2>&1) \
+    || fail "Checksum verification FAILED. The DMG does not match the published sha256. Aborting."
+ok "Checksum verified"
 
 # ---------------------------------------------------------------------------
 # Mount, copy, unmount

@@ -194,6 +194,11 @@ ok "DMG packaged: $DMG_PATH"
 info "DMG sha256: $DMG_SHA"
 info "Update Casks/krit.rb with version \"$VERSION\" and sha256 \"$DMG_SHA\"."
 
+# Publish a checksum file next to the DMG so install.sh can verify the
+# download before mounting it (supply-chain integrity for curl | bash).
+SHA_FILE="$DMG_PATH.sha256"
+printf '%s  %s\n' "$DMG_SHA" "$DMG_NAME" > "$SHA_FILE"
+
 # ---------------------------------------------------------------------------
 # Tag and publish
 # ---------------------------------------------------------------------------
@@ -204,7 +209,7 @@ git tag -a "$TAG" -m "KRIT $TAG"
 info "Publishing GitHub release $TAG with $DMG_NAME"
 # Push the tag so gh attaches the release to a commit that exists on the remote.
 git push origin "$TAG"
-gh release create "$TAG" "$DMG_PATH" \
+gh release create "$TAG" "$DMG_PATH" "$SHA_FILE" \
     --title "KRIT $TAG" \
     --notes-file "$NOTES_TMP"
 
