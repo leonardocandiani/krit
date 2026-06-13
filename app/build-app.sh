@@ -68,24 +68,38 @@ swift build -c release --product krit "${ARCH_FLAGS[@]}" --build-path "$CLI_BUIL
 #   - flat llbuild:        $BUILD_PATH/release/KritApp
 #   - arch-triple llbuild: $BUILD_PATH/<triple>/release/KritApp   (explicit --build-path)
 #   - multi-arch xcbuild:  $BUILD_PATH/apple/Products/Release/KritApp   (--arch a --arch b)
-# A single case-insensitive `-ipath "*/release/KritApp"` matches all three (the
-# xcbuild layout capitalizes "Release"). dSYM bundles carry a same-named binary,
-# so exclude them.
-BINARY="$BUILD_PATH/release/KritApp"
-if [ ! -f "$BINARY" ]; then
-    BINARY="$(find "$BUILD_PATH" -name "KritApp" -type f -ipath "*/release/KritApp" ! -path "*.dSYM/*" 2>/dev/null | head -1)"
-fi
+# The layout is DECIDED by how this run invoked swift build: with --arch flags
+# the product lands in the xcbuild layout, without them in an llbuild layout.
+# Probe the current run's layout FIRST — a shared build dir keeps artifacts from
+# previous runs in the other layouts, and probing those first hands back a stale
+# binary (e.g. an arm64-only KritApp from an earlier llbuild build, which then
+# trips the arch assert with a misleading "missing arch" instead of being the
+# wrong file). The find fallback covers the arch-triple layout; dSYM bundles
+# carry a same-named binary, so exclude them.
+locate_product() {
+    local root="$1" name="$2"
+    local primary
+    if [ ${#ARCH_FLAGS[@]} -gt 0 ]; then
+        primary="$root/apple/Products/Release/$name"
+    else
+        primary="$root/release/$name"
+    fi
+    if [ -f "$primary" ]; then
+        echo "$primary"
+        return
+    fi
+    find "$root" -name "$name" -type f -ipath "*/release/$name" ! -path "*.dSYM/*" 2>/dev/null | head -1
+}
+
+BINARY="$(locate_product "$BUILD_PATH" "KritApp")"
 if [ ! -f "$BINARY" ]; then
     echo "✗ Build failed — binary not found under $BUILD_PATH"
     exit 1
 fi
 assert_archs "KritApp" "$BINARY"
 
-# Locate the krit CLI binary from its dedicated build path (same three layouts).
-CLI_BINARY="$CLI_BUILD_PATH/release/krit"
-if [ ! -f "$CLI_BINARY" ]; then
-    CLI_BINARY="$(find "$CLI_BUILD_PATH" -name "krit" -type f -ipath "*/release/krit" ! -path "*.dSYM/*" 2>/dev/null | head -1)"
-fi
+# Locate the krit CLI binary from its dedicated build path (same layout rules).
+CLI_BINARY="$(locate_product "$CLI_BUILD_PATH" "krit")"
 if [ ! -f "$CLI_BINARY" ]; then
     echo "✗ Build failed — krit CLI binary not found under $BUILD_PATH"
     exit 1
@@ -125,9 +139,17 @@ if [ -f "$SCRIPT_DIR/THIRD_PARTY_NOTICES.md" ]; then
     cp "$SCRIPT_DIR/THIRD_PARTY_NOTICES.md" "$APP_BUNDLE/Contents/Resources/THIRD_PARTY_NOTICES.md"
 fi
 
-# Copy SPM-generated resource bundle (capture sound, etc.) if present.
-# No maxdepth: the multi-arch xcbuild layout nests it under apple/Products/Release/.
-SPM_RESOURCE_BUNDLE="$(find "$BUILD_PATH" -name "Krit_KritKit.bundle" -type d 2>/dev/null | head -1)"
+# Copy SPM-generated resource bundle (capture sound, etc.) if present. Same
+# layout rule as the binaries: prefer the CURRENT run's layout, or a stale
+# bundle from a previous build in the other layout ships instead.
+if [ ${#ARCH_FLAGS[@]} -gt 0 ]; then
+    SPM_RESOURCE_BUNDLE="$BUILD_PATH/apple/Products/Release/Krit_KritKit.bundle"
+else
+    SPM_RESOURCE_BUNDLE="$BUILD_PATH/release/Krit_KritKit.bundle"
+fi
+if [ ! -d "$SPM_RESOURCE_BUNDLE" ]; then
+    SPM_RESOURCE_BUNDLE="$(find "$BUILD_PATH" -name "Krit_KritKit.bundle" -type d 2>/dev/null | head -1)"
+fi
 if [ -d "$SPM_RESOURCE_BUNDLE" ]; then
     cp -R "$SPM_RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"
 fi
