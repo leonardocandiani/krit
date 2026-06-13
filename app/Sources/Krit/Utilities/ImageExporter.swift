@@ -66,7 +66,7 @@ enum ImageExporter {
         let panel = NSSavePanel()
         let preferredExt = Settings.screenshotFormat
         panel.nameFieldStringValue = "\(suggestedName).\(preferredExt)"
-        panel.allowedContentTypes = [.png, .jpeg, UTType("org.webmproject.webp") ?? .data]
+        panel.allowedContentTypes = [.png, .jpeg, UTType("org.webmproject.webp") ?? .data, .pdf]
         panel.canCreateDirectories = true
         panel.canSelectHiddenExtension = true
         panel.isExtensionHidden = false
@@ -144,6 +144,7 @@ enum ImageExporter {
                 outputURL = url.deletingPathExtension().appendingPathExtension("png")
                 data = pngData(from: cg)
             }
+        case "pdf":         data = pdfData(from: cg)
         default:            data = pngData(from: cg)
         }
         guard let data else {
@@ -197,6 +198,23 @@ enum ImageExporter {
         return data as Data
     }
 
+    /// Single-page PDF wrapping the capture at its native pixel size (1 PDF point
+    /// = 1 px). Lossless: the bitmap is embedded as-is, not re-rendered, so a PDF
+    /// export is pixel-for-pixel the PNG, just inside a document container — handy
+    /// for reports, printing, and apps that accept PDFs but not raw images.
+    static func pdfData(from cg: CGImage) -> Data? {
+        guard cg.width > 0, cg.height > 0 else { return nil }
+        let data = NSMutableData()
+        guard let consumer = CGDataConsumer(data: data as CFMutableData) else { return nil }
+        var mediaBox = CGRect(x: 0, y: 0, width: cg.width, height: cg.height)
+        guard let ctx = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else { return nil }
+        ctx.beginPDFPage(nil)
+        ctx.draw(cg, in: mediaBox)
+        ctx.endPDFPage()
+        ctx.closePDF()
+        return data as Data
+    }
+
     private static var isWebPSupported: Bool {
         let identifiers = CGImageDestinationCopyTypeIdentifiers() as NSArray
         return identifiers.contains(webpUTI)
@@ -215,6 +233,11 @@ enum ImageExporter {
     static func webpData(from image: NSImage, quality: CGFloat = 0.90) -> Data? {
         guard let cg = image.bestCGImage else { return nil }
         return webpData(from: cg, quality: quality)
+    }
+
+    static func pdfData(from image: NSImage) -> Data? {
+        guard let cg = image.bestCGImage else { return nil }
+        return pdfData(from: cg)
     }
 }
 

@@ -182,6 +182,7 @@ private struct CaptureForm: View {
                 Text("PNG").tag("png")
                 Text("JPEG").tag("jpeg")
                 Text("WebP").tag("webp")
+                Text("PDF").tag("pdf")
             }
             .onChange(of: format) { Settings.screenshotFormat = $0 }
 
