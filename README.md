@@ -155,28 +155,45 @@ the result locally with Vision), and `inspect_ui`.
 
 ## Build from source
 
-You need Xcode 15 or later (Swift 5.9+) on macOS 13 or later.
+Building requires a full **Xcode 26 or later** — not the bare Command Line Tools —
+on two counts: the app compiles against the **macOS 26 SDK** (it uses Liquid Glass
+symbols like `NSGlassEffectView`, gated at runtime by `#available(macOS 26, *)`),
+and `build-app.sh` produces a **universal binary** (arm64 + x86_64) via
+`swift build --arch arm64 --arch x86_64`, whose multi-arch build delegates to
+`xcbuild` (full-Xcode only). The built app still **runs** on macOS 13 or later.
 
 ```bash
 git clone https://github.com/leonardocandiani/krit.git
 cd krit/app
 
-# Build the app and the krit CLI, assemble and sign the bundle, copy to /Applications
+# Build the universal app and krit CLI, assemble and sign the bundle, copy to /Applications
 ./build-app.sh
 ```
 
-To build the targets by hand:
+The result runs natively on both Apple Silicon and Intel Macs. Verify with:
 
 ```bash
-cd app
-swift build -c release --product KritApp   # the menu-bar app
-swift build -c release --product krit       # the CLI / MCP binary
+lipo -archs /Applications/KRIT.app/Contents/MacOS/KRIT   # -> arm64 x86_64
 ```
 
 `build-app.sh` builds both targets into separate paths (the `krit` CLI and the
 `KritApp` binary would otherwise collide on a case-insensitive volume),
-assembles the `.app`, ad-hoc signs it, and installs it. To package a DMG, run
-`./make-dmg.sh` afterward.
+assembles the `.app`, ad-hoc signs it, and installs it. It fails loudly if any
+shipped binary is missing an arch slice. To package a DMG, run `./make-dmg.sh`
+afterward.
+
+To build a single arch (faster local iteration — still needs full Xcode, since
+the macOS 26 SDK is required either way):
+
+```bash
+cd app
+KRIT_ARCHS="arm64" ./build-app.sh                # single-arch app + CLI (still via xcbuild)
+KRIT_ARCHS=""      ./build-app.sh                # plain swift build, no --arch (host arch)
+
+# Or just the raw binaries, no .app bundle:
+swift build -c release --product KritApp         # the menu-bar app (host arch)
+swift build -c release --product krit            # the CLI / MCP binary (host arch)
+```
 
 ## Permissions
 

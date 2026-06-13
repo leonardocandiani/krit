@@ -49,8 +49,11 @@ echo "▶ Creating DMG installer…"
 rm -f "$DMG_PATH" "$RW_DMG_PATH"
 
 echo "▶ Creating writable disk image…"
+# 128m headroom: a universal (arm64+x86_64) app roughly doubles the Mach-O sizes
+# of a single-arch build. The final UDZO image is compressed and content-driven,
+# so the extra staging slack costs nothing.
 hdiutil create \
-    -size 64m \
+    -size 128m \
     -volname "$APP_NAME" \
     -fs HFS+ \
     -fsargs "-c c=64,a=16,e=16" \
