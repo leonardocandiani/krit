@@ -1,0 +1,76 @@
+name: Build Check
+
+# Builds KRIT from source on a full-Xcode runner and proves the shipped binaries
+# are UNIVERSAL (arm64 + x86_64). This is the regression guard for the universal
+# build: build-app.sh emits a multi-arch app, and this job fails the PR if any
+# shipped Mach-O drops a slice — the exact failure that would leave KRIT unable
+# to launch on Intel (or, going forward, on Apple Silicon).
+#
+# Scoped to app/** so doc/asset-only PRs skip the ~minutes-long native build.
+# Lives at the repo ROOT (.github/workflows) — GitHub ignores workflow files
+# nested under subdirectories like app/.github/workflows.
+
+on:
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/build-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  universal-build:
+    # macos-26 carries Xcode 26 (the macOS 26 SDK). REQUIRED on two counts:
+    #   1. The app references macOS 26 symbols (NSGlassEffectView, …) guarded only
+    #      at runtime, so it must COMPILE against the macOS 26 SDK = Xcode 26+.
+    #   2. Multi-arch `swift build --arch arm64 --arch x86_64` delegates to xcbuild,
+    #      which ships only with a full Xcode (not the Command Line Tools).
+    # macos-14/15 cap at Xcode 16 (macOS 15 SDK) and fail at compile time.
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26 (macOS 26 SDK)
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)" 2>/dev/null || true
+          xcodebuild -version
+          swift --version
+
+      - name: Build app (universal, ad-hoc signed)
+        working-directory: app
+        run: bash build-app.sh
+
+      - name: Assert universal binaries (arm64 + x86_64)
+        run: |
+          set -euo pipefail
+          APP="/Applications/KRIT.app"
+          fail=0
+          assert() {
+            local path="$1"
+            if [ ! -f "$path" ]; then
+              echo "::error::missing binary: $path"; fail=1; return
+            fi
+            local archs; archs="$(lipo -archs "$path" 2>/dev/null || true)"
+            echo "• $path -> ${archs:-<none>}"
+            for want in arm64 x86_64; do
+              case " $archs " in
+                *" $want "*) ;;
+                *) echo "::error::$path is missing arch '$want' (has: ${archs:-none})"; fail=1;;
+              esac
+            done
+          }
+          assert "$APP/Contents/MacOS/KRIT"
+          assert "$APP/Contents/Helpers/krit"
+          assert "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+          if [ "$fail" -ne 0 ]; then
+            echo "✗ One or more shipped binaries are not universal."
+            exit 1
+          fi
+          echo "✓ All shipped binaries are universal (arm64 + x86_64)."
