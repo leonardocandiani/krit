@@ -31,6 +31,7 @@ enum ImageExporter {
 
     private static let webpUTI = "org.webmproject.webp" as CFString
     private static var activeSavePanels: [NSSavePanel] = []
+    private static var activeSaveAccessories: [SaveFormatPicker] = []
 
     // MARK: - Clipboard
 
@@ -67,7 +68,7 @@ enum ImageExporter {
         presentingWindow?.orderFrontRegardless()
 
         let panel = NSSavePanel()
-        let preferredExt = Settings.screenshotFormat
+        let preferredExt = preferredFormat().ext
         panel.nameFieldStringValue = "\(suggestedName).\(preferredExt)"
         panel.allowedContentTypes = [.png, .jpeg, UTType("org.webmproject.webp") ?? .data, .pdf]
         panel.canCreateDirectories = true
@@ -75,10 +76,19 @@ enum ImageExporter {
         panel.isExtensionHidden = false
         panel.directoryURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
 
+        // A format picker in the panel itself, so choosing PDF (or JPEG/WebP) is
+        // obvious here instead of buried in Preferences. Changing it rewrites the
+        // filename extension; save() keys off that extension, so the chosen format
+        // is what gets written.
+        let formatPicker = SaveFormatPicker(panel: panel, baseName: suggestedName, currentExt: preferredExt)
+        panel.accessoryView = formatPicker.view
+        activeSaveAccessories.append(formatPicker)
+
         activeSavePanels.append(panel)
 
         let handler: (NSApplication.ModalResponse) -> Void = { response in
             activeSavePanels.removeAll { $0 === panel }
+            activeSaveAccessories.removeAll { $0 === formatPicker }
 
             guard response == .OK else {
                 completion?(.cancelled)
@@ -290,6 +300,58 @@ enum ImageExporter {
         guard let cg = image.bestCGImage else { return nil }
         let pts = (image.size.width >= 1 && image.size.height >= 1) ? image.size : nil
         return pdfData(from: cg, pointSize: pts)
+    }
+}
+
+/// The "File Format" row shown inside the Save panel: a label plus a popup of the
+/// supported formats. Picking one rewrites the panel's filename extension so the
+/// save path (which keys off the extension) writes that format. Retained by
+/// `ImageExporter.activeSaveAccessories` for the panel's lifetime.
+@MainActor
+final class SaveFormatPicker: NSObject {
+    private static let formats: [(label: String, ext: String)] = [
+        ("PNG", "png"), ("JPEG", "jpg"), ("WebP", "webp"), ("PDF", "pdf"),
+    ]
+
+    private weak var panel: NSSavePanel?
+    private let baseName: String
+    let view: NSView
+
+    init(panel: NSSavePanel, baseName: String, currentExt: String) {
+        self.panel = panel
+        self.baseName = baseName
+
+        let label = NSTextField(labelWithString: "File Format:")
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        popup.addItems(withTitles: Self.formats.map(\.label))
+        let normalized = currentExt == "jpeg" ? "jpg" : currentExt
+        popup.selectItem(at: Self.formats.firstIndex { $0.ext == normalized } ?? 0)
+
+        let container = NSView()
+        container.addSubview(label)
+        container.addSubview(popup)
+        self.view = container
+        super.init()
+
+        popup.target = self
+        popup.action = #selector(formatChanged(_:))
+
+        NSLayoutConstraint.activate([
+            container.heightAnchor.constraint(equalToConstant: 48),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
+            popup.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            popup.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
+            popup.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -20),
+        ])
+    }
+
+    @objc private func formatChanged(_ sender: NSPopUpButton) {
+        let ext = Self.formats[sender.indexOfSelectedItem].ext
+        panel?.nameFieldStringValue = "\(baseName).\(ext)"
     }
 }
 
