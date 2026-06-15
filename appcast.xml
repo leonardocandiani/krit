@@ -6,6 +6,19 @@
     <description>KRIT update feed</description>
     <language>en</language>
     <item>
+      <title>Version 0.20.0</title>
+      <sparkle:version>20260615.1859</sparkle:version>
+      <sparkle:shortVersionString>0.20.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Mon, 15 Jun 2026 22:00:13 +0000</pubDate>
+      <link>https://github.com/leonardocandiani/krit/releases/tag/v0.20.0</link>
+      <enclosure
+        url="https://github.com/leonardocandiani/krit/releases/download/v0.20.0/KRIT-v0.20.0-macOS.dmg"
+        sparkle:edSignature="PBL05cnjZJf0Y6Pb9B6UVgUBzK5XER+aYmClRp0OxY2wFfXfj9cFCMVBDck1fzldRi6TB/4ZMGfp85yNjR4XBA=="
+        length="39624234"
+        type="application/octet-stream"/>
+    </item>
+    <item>
       <title>Version 0.19.0</title>
       <sparkle:version>20260615.1444</sparkle:version>
       <sparkle:shortVersionString>0.19.0</sparkle:shortVersionString>
