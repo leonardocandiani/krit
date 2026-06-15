@@ -7,7 +7,19 @@ final class AnnotationCanvas: NSView {
 
     // MARK: - State
 
-    var backgroundImage: NSImage?
+    var backgroundImage: NSImage? {
+        didSet {
+            // The default annotation weight scales with the capture size, so an
+            // arrow reads the same relative thickness on a 4K shot as on a small
+            // region (the fixed 13pt looked tiny on large captures). Only the
+            // untouched default re-scales; a width the user dialed in per tool is
+            // kept.
+            if toolLineWidths[activeTool] == nil {
+                activeLineWidth = lineWidth(for: activeTool)
+                onActiveLineWidthChanged?(activeLineWidth)
+            }
+        }
+    }
     var objects: [any AnnotationObject] = []
     var selectedObjects: [any AnnotationObject] = []
     var activeTool: AnnotationTool = .arrow {
@@ -57,9 +69,19 @@ final class AnnotationCanvas: NSView {
     /// The default thickness for a freshly opened tool. The arrow uses the full
     /// global default (bold, its signature); every other stroke tool starts at
     /// 60% of it, floored at 2pt, so lines/rects/ellipses/freehand read finer.
+    /// Scales the default annotation weight to the capture so an arrow keeps the
+    /// same visual proportion at any resolution. Reference ~1400pt (where the
+    /// 13pt default reads well); clamped so a small region never shrinks below
+    /// the default and a huge capture doesn't explode the stroke.
+    private var captureThicknessFactor: CGFloat {
+        let longEdge = max(backgroundImage?.size.width ?? 0, backgroundImage?.size.height ?? 0)
+        guard longEdge > 0 else { return 1 }
+        return min(max(longEdge / 1400, 1.0), 3.5)
+    }
+
     private func lineWidth(for tool: AnnotationTool) -> CGFloat {
         if let remembered = toolLineWidths[tool] { return remembered }
-        let base = CGFloat(Settings.annotationLineWidth)
+        let base = CGFloat(Settings.annotationLineWidth) * captureThicknessFactor
         switch tool {
         case .arrow:
             return base
@@ -148,6 +170,21 @@ final class AnnotationCanvas: NSView {
     private var cachedPresentationSource: NSImage?
     private var cachedPresentationOptions: ScreenshotBackgroundOptions?
     private var cachedPresentationSize: NSSize = .zero
+
+    // The background composite (mesh + shadow + clip) is a CPU render that costs
+    // 2-9s for a retina/supersampled capture, and the cache misses on every
+    // padding/inset/wallpaper change and every window resize. Run synchronously
+    // from draw() that froze the editor for seconds per slider tick. The live
+    // editor now composes OFF the main thread (stale-while-revalidate): it paints
+    // the previous composite, or the raw shot, until the new one lands, so the UI
+    // never blocks. Export (flatten) still composes synchronously at full res.
+    private struct ComposeKey: Equatable {
+        let source: ObjectIdentifier
+        let options: ScreenshotBackgroundOptions
+        let size: NSSize
+    }
+    private var pendingComposeKey: ComposeKey?
+
 
     // MARK: - Init
 
@@ -316,9 +353,14 @@ final class AnnotationCanvas: NSView {
         ctx.restoreGState()
     }
 
-    private func drawBackgroundImage(_ image: NSImage, ctx: CGContext) {
+    private func drawBackgroundImage(_ image: NSImage, ctx: CGContext, synchronous: Bool = false) {
         // High-quality resampling so a small or zoomed-in capture renders smooth
         // instead of blocky when the canvas scales it past its native pixels.
+        // The system clips this draw to the current dirty rect, so invalidating
+        // only the dragged annotation's region (not bounds) keeps the per-frame
+        // cost proportional to that slice, not the whole 4K image. .high is also
+        // the FAST path for the big downscale the fit view does (CG's optimized
+        // mipmap), measured ~30x quicker than .low, so never drop quality here.
         ctx.interpolationQuality = .high
         NSGraphicsContext.current?.imageInterpolation = .high
 
@@ -327,10 +369,23 @@ final class AnnotationCanvas: NSView {
             return
         }
 
-        presentationImage(for: image).draw(in: bounds)
+        if let composed = presentationImage(for: image, synchronous: synchronous) {
+            composed.draw(in: bounds)
+        } else {
+            // No composite ready yet (first enable, composing off-main): paint a
+            // neutral field plus the raw shot in its slot so the canvas is never
+            // blank while the real backdrop renders.
+            ScreenshotBackgroundComposer.color(from: backgroundOptions.gradientStartHex).setFill()
+            bounds.fill()
+            image.draw(in: backgroundImageRect(for: image))
+        }
     }
 
-    private func presentationImage(for image: NSImage) -> NSImage {
+    /// The composed backdrop for `image`. A cache hit returns instantly. On a miss:
+    /// `synchronous` (export) composes now at full resolution; otherwise the live
+    /// editor kicks the compose to a background queue and returns the stale
+    /// composite (or nil) so the main thread never blocks on the multi-second render.
+    private func presentationImage(for image: NSImage, synchronous: Bool) -> NSImage? {
         if let cachedPresentationImage,
            cachedPresentationSource === image,
            cachedPresentationOptions == backgroundOptions,
@@ -338,12 +393,62 @@ final class AnnotationCanvas: NSView {
             return cachedPresentationImage
         }
 
-        let composed = ScreenshotBackgroundComposer.composeIfNeeded(image, options: backgroundOptions)
-        cachedPresentationImage = composed
-        cachedPresentationSource = image
-        cachedPresentationOptions = backgroundOptions
-        cachedPresentationSize = bounds.size
-        return composed
+        if synchronous {
+            let composed = ScreenshotBackgroundComposer.composeIfNeeded(image, options: backgroundOptions)
+            cachedPresentationImage = composed
+            cachedPresentationSource = image
+            cachedPresentationOptions = backgroundOptions
+            cachedPresentationSize = bounds.size
+            pendingComposeKey = nil
+            return composed
+        }
+
+        requestAsyncComposite(for: image, options: backgroundOptions, size: bounds.size)
+        return cachedPresentationImage
+    }
+
+    /// Compose `image` for (`options`, `size`) off the main thread, coalescing so a
+    /// fast slider drag only keeps the latest request. Adopts the result only if it
+    /// still matches the live state; a superseded result just triggers a redraw that
+    /// requests the current state.
+    private func requestAsyncComposite(for image: NSImage, options: ScreenshotBackgroundOptions, size: NSSize) {
+        let key = ComposeKey(source: ObjectIdentifier(image), options: options, size: size)
+        if pendingComposeKey == key { return }
+        pendingComposeKey = key
+        // Realize the source bitmap on the main thread so the background compose
+        // only reads an already-decoded, immutable CGImage (no rep mutation race).
+        _ = image.bestCGImage
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let composed = ScreenshotBackgroundComposer.composeIfNeeded(image, options: options, quality: .display)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard self.backgroundImage === image,
+                      self.backgroundOptions == options,
+                      self.bounds.size == size else {
+                    // State moved on while composing: drop this one and let the next
+                    // draw request the now-current backdrop.
+                    if self.pendingComposeKey == key { self.pendingComposeKey = nil }
+                    self.setNeedsDisplay(self.bounds)
+                    return
+                }
+                self.cachedPresentationImage = composed
+                self.cachedPresentationSource = image
+                self.cachedPresentationOptions = options
+                self.cachedPresentationSize = size
+                self.pendingComposeKey = nil
+                self.setNeedsDisplay(self.bounds)
+            }
+        }
+    }
+
+    /// Test-only: drop the composed-backdrop cache so the next draw takes the miss
+    /// path, letting the harness time the main-thread cost of an option/size change.
+    func uiTestInvalidatePresentationCache() {
+        cachedPresentationImage = nil
+        cachedPresentationSource = nil
+        cachedPresentationOptions = nil
+        cachedPresentationSize = .zero
+        pendingComposeKey = nil
     }
 
     private func backgroundImageRect(for image: NSImage) -> CGRect {
@@ -3007,9 +3112,10 @@ final class AnnotationCanvas: NSView {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
 
-        // Same draw order as draw(_:), minus all editing chrome.
+        // Same draw order as draw(_:), minus all editing chrome. Export composes
+        // the backdrop synchronously at full resolution (never the stale live one).
         if let img = backgroundImage {
-            drawBackgroundImage(img, ctx: ctx)
+            drawBackgroundImage(img, ctx: ctx, synchronous: true)
         }
         // Item 3, export-side guarantee: clip every annotation to the canvas so
         // nothing renders past the final image edges, even if a stray object

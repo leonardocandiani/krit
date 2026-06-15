@@ -194,6 +194,19 @@ enum ScreenshotBackgroundComposer {
 
     private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
+    // Test-only phase profiler: when `uiTestProfiling` is on, each compose sub-step
+    // accumulates its wall time here so the harness can see exactly where the
+    // multi-second composite goes (shadow vs mesh vs grain vs source draw).
+    nonisolated(unsafe) static var uiTestProfiling = false
+    nonisolated(unsafe) static var uiTestPhaseTimings: [String: Double] = [:]
+    @inline(__always) private static func profile<T>(_ name: String, _ body: () -> T) -> T {
+        guard uiTestProfiling else { return body() }
+        let t = CACurrentMediaTime()
+        let out = body()
+        uiTestPhaseTimings[name, default: 0] += (CACurrentMediaTime() - t) * 1000
+        return out
+    }
+
     /// Point-size of the composed canvas for `image` under `options`, honoring
     /// inset, padding and the aspect preset exactly as `composeIfNeeded` does.
     /// The editor sizes its canvas frame from this so the flattened export never
@@ -233,18 +246,30 @@ enum ScreenshotBackgroundComposer {
         return inset * (renderMin / shotMin)
     }
 
-    static func composeIfNeeded(_ image: NSImage, options: ScreenshotBackgroundOptions) -> NSImage {
+    /// `export` renders the backdrop at full capture resolution with every pass
+    /// (the saved/copied image). `display` is the fast proxy the live editor canvas
+    /// shows: capped at screen pixel density and skipping the invisible anti-band
+    /// grain, so swapping a wallpaper recomposes in a fraction of the time. The two
+    /// are pixel-identical to the eye at fit zoom; export is always the source of truth.
+    enum ComposeQuality { case export, display }
+
+    /// Above this pixel-per-point density the editor preview gains nothing the screen
+    /// can show, so `display` caps here while `export` keeps the capture's full scale.
+    private static let displayMaxScale: CGFloat = 2.5
+
+    static func composeIfNeeded(_ image: NSImage, options: ScreenshotBackgroundOptions, quality: ComposeQuality = .export) -> NSImage {
         guard options.isEnabled else { return image }
         guard let source = image.bestCGImage else { return image }
 
         let sourcePointSize = image.size
         guard sourcePointSize.width > 0, sourcePointSize.height > 0 else { return image }
 
-        let scale = max(
+        let rawScale = max(
             CGFloat(source.width) / sourcePointSize.width,
             CGFloat(source.height) / sourcePointSize.height,
             1
         )
+        let scale = quality == .display ? min(rawScale, displayMaxScale) : rawScale
         let padding = clamped(options.padding, min: 0, max: 240)
         let inset = clamped(options.inset, min: 0, max: 240)
 
@@ -280,7 +305,7 @@ enum ScreenshotBackgroundComposer {
         let outputRect = CGRect(origin: .zero, size: outputPointSize)
         // Pass the screenshot so the .blurredImage style can use it as its blur
         // source when no wallpaper is chosen (CleanShot's default print-blur look).
-        drawBackground(in: context, rect: outputRect, options: options, sourceImage: source)
+        profile("drawBackground") { drawBackground(in: context, rect: outputRect, options: options, sourceImage: source, skipGrain: quality == .display) }
 
         // Single source of slot geometry: the exact rect the screenshot is drawn
         // into, computed in bottom-left CG space (this context is NOT flipped) and
@@ -316,7 +341,7 @@ enum ScreenshotBackgroundComposer {
             : radius
 
         let shadowIntensity = clamped(options.shadow, min: 0, max: 1) * clamped(options.shadowStrength, min: 0, max: 3)
-        drawShadow(in: context, container: outputRect, rect: outerRect, radius: outerRadius, intensity: shadowIntensity)
+        profile("drawShadow") { drawShadow(in: context, container: outputRect, rect: outerRect, radius: outerRadius, intensity: shadowIntensity) }
 
         if border > 0 {
             // Fill the outer rounded rect with the dominant color, then the shot is
@@ -331,18 +356,20 @@ enum ScreenshotBackgroundComposer {
             context.restoreGState()
         }
 
-        context.saveGState()
-        context.setAllowsAntialiasing(true)
-        context.setShouldAntialias(true)
-        context.addPath(roundedPath(for: imageRect, radius: radius))
-        context.clip()
-        context.draw(source, in: imageRect)
-        context.restoreGState()
+        profile("drawSource") {
+            context.saveGState()
+            context.setAllowsAntialiasing(true)
+            context.setShouldAntialias(true)
+            context.addPath(roundedPath(for: imageRect, radius: radius))
+            context.clip()
+            context.draw(source, in: imageRect)
+            context.restoreGState()
+        }
         // Hairline goes on the OUTER edge of the framed card (or the shot itself when
         // there is no inset frame) so the whole unit gets the crisp rim.
         drawEdgeStroke(in: context, rect: outerRect, radius: outerRadius, scale: scale)
 
-        guard let composed = context.makeImage() else { return image }
+        guard let composed = profile("makeImage", { context.makeImage() }) else { return image }
         let rep = NSBitmapImageRep(cgImage: composed)
         rep.size = outputPointSize
         let output = NSImage(size: outputPointSize)
@@ -437,14 +464,14 @@ enum ScreenshotBackgroundComposer {
     // The preview paths pass nil, so the sidebar tiles keep previewing the preset.
     // The generated background carries NO vignette: the dono was explicit that the
     // background must not have a shadow on its own edges.
-    private static func drawBackground(in context: CGContext, rect: CGRect, options: ScreenshotBackgroundOptions, sourceImage: CGImage? = nil) {
+    private static func drawBackground(in context: CGContext, rect: CGRect, options: ScreenshotBackgroundOptions, sourceImage: CGImage? = nil, skipGrain: Bool = false) {
         if options.style == .blurredImage {
             drawBlurredImageBackground(in: context, rect: rect, options: options, sourceImage: sourceImage)
             return
         }
 
         if options.style == .image {
-            drawImageBackground(in: context, rect: rect, options: options)
+            drawImageBackground(in: context, rect: rect, options: options, skipGrain: skipGrain)
             return
         }
 
@@ -452,7 +479,7 @@ enum ScreenshotBackgroundComposer {
             let start = color(from: options.gradientStartHex)
             let end = color(from: options.gradientEndHex)
             let accents = options.accentHexes.isEmpty ? [end, start] : options.accentHexes.map(color(from:))
-            drawMesh(in: context, rect: rect, start: start, end: end, accents: accents)
+            drawMesh(in: context, rect: rect, start: start, end: end, accents: accents, skipGrain: skipGrain)
             return
         }
 
@@ -460,7 +487,7 @@ enum ScreenshotBackgroundComposer {
         context.fill(rect)
     }
 
-    private static func drawImageBackground(in context: CGContext, rect: CGRect, options: ScreenshotBackgroundOptions) {
+    private static func drawImageBackground(in context: CGContext, rect: CGRect, options: ScreenshotBackgroundOptions, skipGrain: Bool = false) {
         if let data = options.customImageData,
            let image = NSImage(data: data),
            let cgImage = image.bestCGImage {
@@ -470,7 +497,7 @@ enum ScreenshotBackgroundComposer {
 
         let preset = ScreenshotBackgroundOptions.imagePresets.first { $0.name == options.presetName }
             ?? ScreenshotBackgroundOptions.imagePresets[0]
-        drawPresetImageBackground(in: context, rect: rect, preset: preset)
+        drawPresetImageBackground(in: context, rect: rect, preset: preset, skipGrain: skipGrain)
     }
 
     private static func drawBlurredImageBackground(in context: CGContext, rect: CGRect, options: ScreenshotBackgroundOptions, sourceImage: CGImage? = nil) {
@@ -539,14 +566,15 @@ enum ScreenshotBackgroundComposer {
         return ciContext.createCGImage(cropped, from: input.extent)
     }
 
-    private static func drawPresetImageBackground(in context: CGContext, rect: CGRect, preset: ScreenshotBackgroundImagePreset) {
+    private static func drawPresetImageBackground(in context: CGContext, rect: CGRect, preset: ScreenshotBackgroundImagePreset, skipGrain: Bool = false) {
         drawMesh(
             in: context,
             rect: rect,
             start: color(from: preset.startHex),
             end: color(from: preset.endHex),
             accents: preset.accentHexes.map(color(from:)),
-            waves: preset.waves
+            waves: preset.waves,
+            skipGrain: skipGrain
         )
     }
 
@@ -558,7 +586,7 @@ enum ScreenshotBackgroundComposer {
     // blobs, an overhead sheen, a gentle corner vignette for real depth, and a
     // fine dither that erases 8-bit banding even on 2000px+ canvases. Every layer
     // is keyed off the base luminance so light and dark palettes both stay clean.
-    private static func drawMesh(in context: CGContext, rect: CGRect, start: NSColor, end: NSColor, accents: [NSColor], waves: Bool = false) {
+    private static func drawMesh(in context: CGContext, rect: CGRect, start: NSColor, end: NSColor, accents: [NSColor], waves: Bool = false, skipGrain: Bool = false) {
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         let maxDim = max(rect.width, rect.height)
         let light = isLightBase(start, end)
@@ -614,14 +642,16 @@ enum ScreenshotBackgroundComposer {
             ? [(1.05, 0.52), (0.95, 0.44), (0.86, 0.36)]
             : [(1.10, 0.66), (1.00, 0.56), (0.90, 0.46)])
             .map { (radius: $0.0, alpha: $0.1 * fieldDamp) }
-        for (index, accent) in accents.prefix(3).enumerated() {
-            let center = anchors[index % anchors.count]
-            let spec = fieldSpec[index]
-            context.saveGState()
-            context.setBlendMode(.normal)
-            drawGradientGlow(in: context, rect: rect, color: saturated(accent, by: 1.25),
-                             center: center, radius: maxDim * spec.radius, alpha: spec.alpha)
-            context.restoreGState()
+        profile("mesh.accents") {
+            for (index, accent) in accents.prefix(3).enumerated() {
+                let center = anchors[index % anchors.count]
+                let spec = fieldSpec[index]
+                context.saveGState()
+                context.setBlendMode(.normal)
+                drawGradientGlow(in: context, rect: rect, color: saturated(accent, by: 1.25),
+                                 center: center, radius: maxDim * spec.radius, alpha: spec.alpha)
+                context.restoreGState()
+            }
         }
 
         // 2b. Luminous lift on the brightest accent: a screen pass over the same
@@ -664,12 +694,16 @@ enum ScreenshotBackgroundComposer {
         //    edges, kept subtle so it grounds the composition without darkening the
         //    print's surroundings into a frame. This is the wallpaper depth the
         //    backdrop needs; it is NOT the print's drop shadow.
-        drawVignette(in: context, rect: rect, strength: light ? 0.10 : 0.18)
+        profile("mesh.vignette") { drawVignette(in: context, rect: rect, strength: light ? 0.10 : 0.18) }
 
         // 5. Dither pass to kill 8-bit banding. Stronger on the smooth lower band
         //    where the eye catches steps most; it shifts luminance by under a code
-        //    value, invisible as texture but enough to dissolve the contours.
-        drawGrain(in: context, rect: rect, alpha: light ? 0.030 : 0.045)
+        //    value, invisible as texture but enough to dissolve the contours. The
+        //    softLight tiling is the second-heaviest pass, so the live display proxy
+        //    skips it (the dither is imperceptible on screen); export keeps it.
+        if !skipGrain {
+            profile("mesh.grain") { drawGrain(in: context, rect: rect, alpha: light ? 0.030 : 0.045) }
+        }
     }
 
     // Layered flowing waves. Each layer is a closed path: in from the left edge,
