@@ -19,7 +19,6 @@ enum SoundManager {
         case captureBigSur
         case captureClassic
         case copy
-        case save
         case pin
         case toggle
         case ocr
@@ -34,7 +33,6 @@ enum SoundManager {
             case .captureBigSur:  return "capture-bigsur"
             case .captureClassic: return "capture-classic"
             case .copy:           return "copy"
-            case .save:           return "save"
             case .pin:            return "pin"
             case .toggle:         return "toggle"
             case .ocr:            return "ocr"

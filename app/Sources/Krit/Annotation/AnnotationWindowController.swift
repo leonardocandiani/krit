@@ -611,7 +611,6 @@ final class AnnotationWindowController: NSWindowController {
         }
         // Non-destructive edits also land in Capture History as their own entry.
         historyManager?.add(image: flat, rect: historyItem?.captureRect?.cgRect)
-        SoundManager.play(.save)
         ToastWindow.show(message: Self.savedScreenshotMessage(for: url), duration: 3.0)
     }
 
@@ -649,7 +648,6 @@ final class AnnotationWindowController: NSWindowController {
             self.bringEditorToFront()
             guard case .saved(let url) = result else { return }
             self.historyManager?.add(image: flat, rect: self.historyItem?.captureRect?.cgRect)
-            SoundManager.play(.save)
             ToastWindow.show(message: Self.savedScreenshotMessage(for: url), duration: 3.0)
         }
     }
