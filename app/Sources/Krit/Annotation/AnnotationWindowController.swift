@@ -674,7 +674,8 @@ final class AnnotationWindowController: NSWindowController {
         canvas.commitTextField()
         let flat = exportImage()
         let items: [Any]
-        if let png = ImageExporter.pngData(from: flat), let url = DragFileVault.makeFile(data: png) {
+        if let export = ImageExporter.encodedForExport(flat),
+           let url = DragFileVault.makeFile(data: export.data, ext: export.ext) {
             DragFileVault.scheduleCleanup(url)
             items = [url]
         } else {
@@ -2502,8 +2503,8 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
         guard abs(current.x - origin.x) > 3 || abs(current.y - origin.y) > 3 else { return }
         dragOrigin = nil
 
-        guard let png = ImageExporter.pngData(from: dragImg),
-              let fileURL = DragFileVault.makeFile(data: png) else { return }
+        guard let export = ImageExporter.encodedForExport(dragImg),
+              let fileURL = DragFileVault.makeFile(data: export.data, ext: export.ext) else { return }
         activeDragFileURL = fileURL
 
         // The drag preview reads as a file card, not a raw bitmap: rounded
@@ -2522,7 +2523,7 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
 
         let fileItem = NSDraggingItem(pasteboardWriter: fileURL as NSURL)
         fileItem.setDraggingFrame(bounds, contents: preview)
-        let promise = NSFilePromiseProvider(fileType: "public.png", delegate: BottomBarFilePromiseDelegate(image: dragImg))
+        let promise = NSFilePromiseProvider(fileType: export.uti, delegate: BottomBarFilePromiseDelegate(image: dragImg))
         let promiseItem = NSDraggingItem(pasteboardWriter: promise)
         promiseItem.setDraggingFrame(bounds, contents: preview)
 
@@ -2561,16 +2562,16 @@ private final class BottomBarFilePromiseDelegate: NSObject, NSFilePromiseProvide
     init(image: NSImage) { self.image = image }
 
     func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
-        "\(ImageExporter.timestampedName).png"
+        "\(ImageExporter.timestampedName).\(ImageExporter.preferredFormat().ext)"
     }
 
     func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler handler: @escaping (Error?) -> Void) {
         do {
-            guard let png = ImageExporter.pngData(from: image) else {
-                handler(ImageExporter.ExportError.pngEncodingFailed)
+            guard let export = ImageExporter.encodedForExport(image) else {
+                handler(ImageExporter.ExportError.encodingFailed(format: ImageExporter.preferredFormat().ext))
                 return
             }
-            try png.write(to: url, options: .atomic)
+            try export.data.write(to: url, options: .atomic)
             handler(nil)
         } catch {
             handler(error)

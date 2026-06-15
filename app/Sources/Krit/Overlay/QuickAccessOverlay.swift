@@ -2881,9 +2881,10 @@ private final class DraggableImageView: NSView, NSDraggingSource {
         let generation = dragFileGeneration
         guard fileURLOverride == nil, let cg = dragImage?.bestCGImage else { return }
         nonisolated(unsafe) let frame = cg
+        let pts = dragImage?.size ?? CGSize(width: cg.width, height: cg.height)
         Task.detached(priority: .utility) {
-            guard let png = ImageExporter.pngData(from: frame),
-                  let url = Self.makeTemporaryDragFile(data: png) else { return }
+            guard let export = ImageExporter.encodedForExport(cg: frame, pointSize: pts),
+                  let url = Self.makeTemporaryDragFile(data: export.data, ext: export.ext) else { return }
             await MainActor.run { [weak self] in
                 guard let self, self.dragFileGeneration == generation else {
                     try? FileManager.default.removeItem(at: url)
@@ -2976,7 +2977,7 @@ private final class DraggableImageView: NSView, NSDraggingSource {
         // File-promise for apps (Slack, Mail, VS Code, browsers) that request a
         // promised file instead of reading the URL directly.
         let promise = NSFilePromiseProvider(
-            fileType: "public.png",
+            fileType: ImageExporter.preferredFormat().uti,
             delegate: OverlayImageFilePromiseDelegate(image: dragImg)
         )
         let promiseItem = NSDraggingItem(pasteboardWriter: promise)
@@ -3007,9 +3008,9 @@ private final class DraggableImageView: NSView, NSDraggingSource {
         return ["ms": (CACurrentMediaTime() - t0) * 1000, "mode": mode]
     }
 
-    nonisolated private static func makeTemporaryDragFile(data: Data) -> URL? {
+    nonisolated private static func makeTemporaryDragFile(data: Data, ext: String = "png") -> URL? {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("KritDrag", isDirectory: true)
-        let filename = "\(ImageExporter.timestampedName)-\(UUID().uuidString.prefix(8)).png"
+        let filename = "\(ImageExporter.timestampedName)-\(UUID().uuidString.prefix(8)).\(ext)"
         let url = directory.appendingPathComponent(filename)
 
         do {
@@ -3075,16 +3076,16 @@ private final class OverlayImageFilePromiseDelegate: NSObject, NSFilePromiseProv
     }
 
     func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
-        "\(ImageExporter.timestampedName).png"
+        "\(ImageExporter.timestampedName).\(ImageExporter.preferredFormat().ext)"
     }
 
     func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler handler: @escaping (Error?) -> Void) {
         do {
-            guard let png = ImageExporter.pngData(from: image) else {
-                handler(ImageExporter.ExportError.pngEncodingFailed)
+            guard let export = ImageExporter.encodedForExport(image) else {
+                handler(ImageExporter.ExportError.encodingFailed(format: ImageExporter.preferredFormat().ext))
                 return
             }
-            try png.write(to: url, options: .atomic)
+            try export.data.write(to: url, options: .atomic)
             handler(nil)
         } catch {
             handler(error)

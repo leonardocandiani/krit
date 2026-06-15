@@ -218,9 +218,9 @@ enum DragFileVault {
     private static let cleanupDelay: TimeInterval = 300
 
     @MainActor
-    static func makeFile(data: Data) -> URL? {
+    static func makeFile(data: Data, ext: String = "png") -> URL? {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("KritDrag", isDirectory: true)
-        let filename = "\(ImageExporter.timestampedName)-\(UUID().uuidString.prefix(8)).png"
+        let filename = "\(ImageExporter.timestampedName)-\(UUID().uuidString.prefix(8)).\(ext)"
         let url = directory.appendingPathComponent(filename)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
