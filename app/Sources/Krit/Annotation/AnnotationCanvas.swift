@@ -69,14 +69,16 @@ final class AnnotationCanvas: NSView {
     /// The default thickness for a freshly opened tool. The arrow uses the full
     /// global default (bold, its signature); every other stroke tool starts at
     /// 60% of it, floored at 2pt, so lines/rects/ellipses/freehand read finer.
-    /// Scales the default annotation weight to the capture so an arrow keeps the
-    /// same visual proportion at any resolution. Reference ~1400pt (where the
-    /// 13pt default reads well); clamped so a small region never shrinks below
-    /// the default and a huge capture doesn't explode the stroke.
-    private var captureThicknessFactor: CGFloat {
+    /// A GENTLE bump keeps an arrow from looking hairline on a big capture without
+    /// blowing it up: full size up to a ~2400pt reference, then a slow climb capped
+    /// at 1.5×. The old 1400/3.5× curve opened arrows near the slider's 20pt max on
+    /// an external/4K shot, so every capture had to be shrunk by hand. The slider
+    /// stores the DE-SCALED base (see `lineWidthChanged`), so a chosen thickness
+    /// also sticks across captures of the same size instead of re-inflating.
+    var captureThicknessFactor: CGFloat {
         let longEdge = max(backgroundImage?.size.width ?? 0, backgroundImage?.size.height ?? 0)
         guard longEdge > 0 else { return 1 }
-        return min(max(longEdge / 1400, 1.0), 3.5)
+        return min(max(longEdge / 2400, 1.0), 1.5)
     }
 
     private func lineWidth(for tool: AnnotationTool) -> CGFloat {

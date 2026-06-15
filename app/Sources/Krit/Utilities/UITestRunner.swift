@@ -66,6 +66,7 @@ final class UITestRunner: NSObject {
             case "blur-map":     report = await Self.runBlurMapSuite()
             case "overlay-trace": report = await Self.runOverlayCaptureTrace()
             case "window-capture": report = await Self.runWindowCaptureSuite()
+            case "history-restore": report = await Self.runHistoryRestoreSuite()
             case "ocr":          report = await Self.runOCRSuite()
             case "shadow-sweep": report = Self.runShadowSweep()
             case "window-editor": report = await Self.runWindowEditorSuite()
@@ -77,7 +78,6 @@ final class UITestRunner: NSObject {
             case "default-template": report = await Self.runDefaultTemplateSuite()
             case "editor-fit-large": report = await Self.runEditorFitLargeSuite()
             case "editor-fit-tall": report = await Self.runEditorFitTallSuite()
-            case "capture-scale": report = await Self.runCaptureScaleSuite()
             case "chooser-visual": report = await Self.runChooserVisual()
             case "compose-scale": report = await Self.runComposeScaleSuite()
             case "wallpaper-dump": report = await Self.runWallpaperDump()
@@ -1205,78 +1205,57 @@ final class UITestRunner: NSObject {
         return r
     }
 
-    /// Proves Settings.captureScale changes the captured pixel density: grabs the
-    /// SAME window through the real isolated path at Standard then High and checks
-    /// High yields ~2x the linear pixels. This is the empirical backing for the
-    /// "max quality / configurable resolution" feature, no UI overlay involved.
-    private static func runCaptureScaleSuite() async -> [String: Any] {
+    // MARK: - Cenário: history-restore (restaurar floata o resultado COMPOSTO)
+    //
+    // Prova a queixa "restaurei e veio sem o background/edição": pega o primeiro
+    // item REAL da history que tem presentedPath (window shot / preset / editado),
+    // floata via o caminho EXATO do restore (QuickAccessOverlay.show com
+    // item.presentedImage) e asserta que presentedImage resolve pro frame composto,
+    // NÃO pro raw imagePath. Snapshot do card em /tmp/krit-history pro gate visual.
+
+    private static func runHistoryRestoreSuite() async -> [String: Any] {
         var r: [String: Any] = [:]
-        guard #available(macOS 14.0, *) else {
-            r["skipped"] = "needs macOS 14+"; r["allPass"] = false; return r
-        }
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
             r["error"] = "no app delegate"; r["allPass"] = false; return r
         }
+        let manager = appDelegate.historyManager!
 
-        let ctrl = PreferencesWindowController.shared
-        ctrl.uiTestForceShow()
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        guard let win = ctrl.uiTestWindow, win.windowNumber > 0 else {
-            r["error"] = "preferences window did not open"; r["allPass"] = false; return r
-        }
-        let windowID = CGWindowID(win.windowNumber)
-        let engine = appDelegate.uiTestCaptureEngine
-        let original = Settings.captureScale
-        defer { Settings.captureScale = original }
-
-        func pixels(at scale: CaptureScale) async -> (w: Int, h: Int)? {
-            Settings.captureScale = scale
-            guard let image = await engine.uiTestIsolatedWindowImage(windowID: windowID),
-                  let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
-                  cg.width > 0, cg.height > 0 else { return nil }
-            try? FileManager.default.createDirectory(atPath: "/tmp/krit-capture-scale", withIntermediateDirectories: true)
-            if let data = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
-                try? data.write(to: URL(fileURLWithPath: "/tmp/krit-capture-scale/\(scale.rawValue).png"))
-            }
-            return (cg.width, cg.height)
+        // O primeiro item com presentedPath é o caso quebrado (thumbnail mostrava o
+        // background, restore floatava o raw). Sem nenhum, não há o que provar aqui.
+        guard let item = manager.items.first(where: { $0.presentedPath != nil }) else {
+            r["skipped"] = "no history item with a presentedPath (capture a window shot first)"
+            r["allPass"] = false
+            return r
         }
 
-        guard let std = await pixels(at: .standard) else {
-            r["skipped"] = "isolated grab returned nil (Screen Recording consent or SCK unavailable)"
-            r["allPass"] = false; ctrl.uiTestClose(); return r
-        }
-        guard let high = await pixels(at: .high) else {
-            r["skipped"] = "high-scale grab returned nil"; r["allPass"] = false; ctrl.uiTestClose(); return r
+        let presented = item.presentedImage
+        let raw = item.fullImage
+        let pPx = presented.bestCGImage.map { "\($0.width)x\($0.height)" } ?? "?"
+        let rPx = raw.bestCGImage.map { "\($0.width)x\($0.height)" } ?? "?"
+        r["presentedPixels"] = pPx
+        r["rawPixels"] = rPx
+        // A prova central: o restore agora floata o frame COMPOSTO, que para um
+        // window shot/preset é um bitmap diferente (maior, com background) do raw.
+        let usesPresented = (presented.bestCGImage?.width ?? 0) != (raw.bestCGImage?.width ?? -1)
+            || (presented.bestCGImage?.height ?? 0) != (raw.bestCGImage?.height ?? -1)
+        r["usesPresentedFrame"] = usesPresented
+
+        let before = QuickAccessOverlay.uiTestWindows.count
+        // Caminho IDÊNTICO ao onRestore do HistoryPanelController.
+        QuickAccessOverlay.show(image: item.presentedImage, historyItem: item,
+                                historyManager: manager, screen: NSScreen.main)
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        defer { if QuickAccessOverlay.uiTestWindows.count > before { QuickAccessOverlay.uiTestCloseNewest() } }
+
+        let floated = QuickAccessOverlay.uiTestWindows.count > before
+        r["overlayFloated"] = floated
+        if floated, let win = QuickAccessOverlay.uiTestWindows.last {
+            try? FileManager.default.createDirectory(atPath: "/tmp/krit-history", withIntermediateDirectories: true)
+            let path = "/tmp/krit-history/restore.png"
+            r["snapshot"] = Self.snapshotWindow(win, to: path) ? path : "FAILED"
         }
 
-        r["standardPixels"] = ["w": std.w, "h": std.h]
-        r["highPixels"] = ["w": high.w, "h": high.h]
-        let ratioW = Double(high.w) / Double(max(std.w, 1))
-        let ratioH = Double(high.h) / Double(max(std.h, 1))
-        r["ratioW"] = ratioW
-        r["ratioH"] = ratioH
-        // High is 2x the native scale: expect ~2x linear pixels (tolerance for
-        // integer rounding and any texture clamp on very large windows).
-        let scalePass = ratioW > 1.85 && ratioW < 2.15 && ratioH > 1.85 && ratioH < 2.15
-        r["scalePass"] = scalePass
-
-        // CONTENT proof, not just buffer math: downscale both grabs to the same
-        // small grid and diff them. If the high grab really is the SAME window
-        // supersampled, the images converge (low diff). The scalesToFit bug
-        // (content cropped/anchored inside a bigger buffer) yields a huge diff.
-        var contentPass = false
-        if let stdImg = NSImage(contentsOfFile: "/tmp/krit-capture-scale/standard.png"),
-           let highImg = NSImage(contentsOfFile: "/tmp/krit-capture-scale/high.png"),
-           let stdCG = stdImg.cgImage(forProposedRect: nil, context: nil, hints: nil),
-           let highCG = highImg.cgImage(forProposedRect: nil, context: nil, hints: nil),
-           let diff = Self.meanAbsDiff(stdCG, highCG) {
-            r["contentDiff"] = diff
-            contentPass = diff < 12
-        }
-        r["contentPass"] = contentPass
-
-        ctrl.uiTestClose()
-        r["allPass"] = scalePass && contentPass
+        r["allPass"] = usesPresented && floated
         return r
     }
 
@@ -1300,9 +1279,6 @@ final class UITestRunner: NSObject {
             r["error"] = "preferences window did not open"; r["allPass"] = false; return r
         }
         let engine = appDelegate.uiTestCaptureEngine
-        let original = Settings.captureScale
-        Settings.captureScale = .maximum
-        defer { Settings.captureScale = original }
 
         let realRect = win.frame
         guard let image = await engine.uiTestIsolatedWindowImage(windowID: CGWindowID(win.windowNumber)) else {
@@ -1659,22 +1635,50 @@ final class UITestRunner: NSObject {
 
     private static func runArrowScale() async -> [String: Any] {
         var r: [String: Any] = [:]
+        // Deterministic base so the assertions don't ride on whatever the user last
+        // set; restore it after so the test never mutates real preferences.
+        let savedBase = Settings.annotationLineWidth
+        Settings.annotationLineWidth = 8
+        defer { Settings.annotationLineWidth = savedBase }
+
         func openWidth(_ size: NSSize) async -> CGFloat {
             let img = NSImage(size: size)
             img.lockFocus(); NSColor.gray.setFill(); NSRect(origin: .zero, size: size).fill(); img.unlockFocus()
             AnnotationWindowController.open(image: img)
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            // A large capture's editor takes longer to settle on the arrow tool; read
+            // too early and it's still on the non-arrow (0.6×) default. Give it room.
+            try? await Task.sleep(nanoseconds: 1_300_000_000)
             let w = AnnotationWindowController.uiTestLastController?.uiTestCanvas.activeLineWidth ?? -1
             AnnotationWindowController.uiTestLastController?.close()
             try? await Task.sleep(nanoseconds: 300_000_000)
             return w
         }
-        let big = await openWidth(NSSize(width: 3840, height: 2160))
+        // 4K (≥ the 2400 reference, factor clamps at 1.5×), the external UWQHD the
+        // owner annotates on (3440 → 1.43×), the built-in (≤ reference → 1.0×), and
+        // a small area (1.0×).
+        let k4 = await openWidth(NSSize(width: 3840, height: 2160))
+        let ext = await openWidth(NSSize(width: 3440, height: 1440))
+        let builtin = await openWidth(NSSize(width: 1800, height: 1169))
         let small = await openWidth(NSSize(width: 600, height: 400))
-        r["bigArrowWidth"] = big
-        r["smallArrowWidth"] = small
-        // 3840/1400 ≈ 2.74 → big should be ~2.7× the small (clamped) default.
-        r["allPass"] = big > small && big > 0 && small > 0
+        r["arrow4K"] = k4
+        r["arrowExternal"] = ext
+        r["arrowBuiltin"] = builtin
+        r["arrowSmall"] = small
+
+        // The fix: the gentle factor (cap 1.5×) keeps every default comfortably in
+        // the lower half of the 1–20 slider. The old 1400/3.5× curve opened the 4K
+        // arrow near 28pt and the external one near 20pt, so each shot had to be
+        // shrunk by hand. base 8 → 4K ≈ 12, external ≈ 11.4, built-in/small = 8.
+        let gentle4K = abs(k4 - 12.0) < 0.6          // 8 × 1.5
+        let gentleExt = abs(ext - 11.43) < 0.6       // 8 × (3440/2400)
+        let baseKept = abs(builtin - 8.0) < 0.4 && abs(small - 8.0) < 0.4
+        let underSliderMax = k4 < 15 && ext < 15     // never crowd the 20pt ceiling
+        let scalesUp = k4 > small                      // big captures still bump up
+        r["gentle4K"] = gentle4K
+        r["gentleExternal"] = gentleExt
+        r["baseKept"] = baseKept
+        r["underSliderMax"] = underSliderMax
+        r["allPass"] = gentle4K && gentleExt && baseKept && underSliderMax && scalesUp
         return r
     }
 
@@ -1752,9 +1756,7 @@ final class UITestRunner: NSObject {
         // The background composite (mesh + shadow + grain) is a heavy CPU render.
         // composeIfNeeded re-runs it whole on every padding/inset/wallpaper change
         // and window resize. Measured here to document the cost the async path moves
-        // off the main thread; it scales with source pixels, which captureScale=high
-        // (2x) doubles each axis.
-        r["captureScaleSetting"] = Settings.captureScale.rawValue
+        // off the main thread; it scales with source pixels.
         var composeOpts = bg
         composeOpts.padding = 41
         ScreenshotBackgroundComposer.uiTestPhaseTimings = [:]
@@ -1770,10 +1772,10 @@ final class UITestRunner: NSObject {
         _ = ScreenshotBackgroundComposer.composeIfNeeded(img, options: composeOpts, quality: .display)
         r["recomposeDisplayMs"] = (CACurrentMediaTime() - tDisp) * 1000
 
-        // Repro the user's real condition: captureScale=high makes a 2x-supersampled
-        // shot (point size small, pixels 4x). The display cap then bites hard. Measure
-        // export vs display at scale 4, and DUMP both composites so the appearance can
-        // be compared by eye (grain-skip + res-cap must look the same at fit zoom).
+        // Repro a heavy condition: a small-point shot whose pixels are 4x (a dense
+        // Retina grab). The display cap then bites hard. Measure export vs display at
+        // scale 4, and DUMP both composites so the appearance can be compared by eye
+        // (grain-skip + res-cap must look the same at fit zoom).
         let superPts = NSSize(width: 1100, height: 690)
         if let cs = CGColorSpace(name: CGColorSpace.sRGB),
            let sctx = CGContext(data: nil, width: 4400, height: 2760, bitsPerComponent: 8,

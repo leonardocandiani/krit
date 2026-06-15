@@ -282,7 +282,18 @@ final class AnnotationWindowController: NSWindowController {
             self?.ensureWindowFitsToolbar()
         }
         toolbar.onColorChanged    = { [weak self] color in self?.canvas.setActiveColor(color) }
-        toolbar.onLineWidthChanged = { [weak self] w   in self?.canvas.setActiveLineWidth(w) }
+        toolbar.onLineWidthChanged = { [weak self] w in
+            guard let self else { return }
+            // Only the arrow drives the persisted global default (its bold weight is
+            // the editor's signature). Store the DE-SCALED base: divide the slider's
+            // scaled value by the capture factor so the chosen visual thickness
+            // sticks across captures of the same size instead of re-inflating.
+            if self.canvas.activeTool == .arrow {
+                let factor = max(self.canvas.captureThicknessFactor, 0.0001)
+                Settings.annotationLineWidth = Double(w) / Double(factor)
+            }
+            self.canvas.setActiveLineWidth(w)
+        }
         toolbar.onFontFamilyChanged = { [weak self] family in
             self?.canvas.activeFontFamily = family
             self?.applyToSelectedTexts { $0.fontFamily = family }
@@ -1941,13 +1952,9 @@ final class AnnotationToolbar: NSView {
     }
 
     @objc private func lineWidthChanged(_ sender: NSSlider) {
-        // Item 4: only the arrow drives the persisted global default (its bold size
-        // is the editor's signature). Other tools keep their thickness in the
-        // canvas's in-session per-tool memory, set via onLineWidthChanged, so they
-        // don't overwrite the arrow's saved default.
-        if selectedTool == .arrow {
-            Settings.annotationLineWidth = sender.doubleValue
-        }
+        // The controller owns persistence: it has the canvas (and its capture
+        // thickness factor) so it can store the DE-SCALED base, which the toolbar
+        // can't see from here.
         onLineWidthChanged?(CGFloat(sender.doubleValue))
     }
     @objc private func fontFamilyChanged(_ sender: NSPopUpButton) {
