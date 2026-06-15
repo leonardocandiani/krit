@@ -32,10 +32,19 @@ final class AreaSelectionWindow: NSObject {
 
     func prepareAndShow(engine: CaptureEngine) async {
         AreaSelectionDiag.mark("prepareEntry")
-        // NUNCA ativar o KRIT aqui: o overlay é um painel não-ativante que vira
-        // key sozinho. Ativar o app desativava o app do usuário no instante do
-        // atalho, mudando seleção de texto/realce/aparência de foco exatamente
-        // no estado que ele queria fotografar (o bug "tira de seleção onde estou").
+        // KRIT is an LSUIElement accessory app: while another app is frontmost it
+        // stays inactive, and a non-activating panel of an inactive accessory app
+        // does NOT reliably order in front of the active app's window — the
+        // overlay "didn't show up" when any app was in front. Activating KRIT
+        // makes the overlay appear and take the drag on every app. The capture
+        // re-grabs the live screen on mouse-up (at the configured supersampling),
+        // so the result is the screen at release time. Trade-off: the target
+        // app's focus appearance changes during selection (the #30 concern); the
+        // robust both-ways fix is a frozen-frame pipeline (capture on hotkey,
+        // crop from the freeze), which would fix that at the cost of the
+        // configurable capture scale — a separate product call.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
 
         // Overlays go up IMMEDIATELY so the selection is usable the instant the
         // hotkey fires. The frozen frames (loupe sampling + legacy crop source)
@@ -110,6 +119,35 @@ final class AreaSelectionWindow: NSObject {
         overlay?.uiTestPickColor(atScreen: screenPoint)
     }
 
+    /// Read-only: is every overlay genuinely on screen? A non-activating panel
+    /// of an inactive accessory app can be ordered but not actually visible /
+    /// occluded behind the active app's window. Reports per-overlay flags and an
+    /// allOnScreen verdict (visible && unoccluded && on the active Space).
+    func uiTestOverlayVisibility() -> [String: Any] {
+        var d: [String: Any] = [:]
+        d["overlayCount"] = overlays.count
+        var visibleFlags: [Bool] = []
+        var unoccludedFlags: [Bool] = []
+        var onActiveSpaceFlags: [Bool] = []
+        var keyFlags: [Bool] = []
+        var levels: [Int] = []
+        for o in overlays {
+            visibleFlags.append(o.isVisible)
+            unoccludedFlags.append(o.occlusionState.contains(.visible))
+            onActiveSpaceFlags.append(o.isOnActiveSpace)
+            keyFlags.append(o.isKeyWindow)
+            levels.append(o.level.rawValue)
+        }
+        d["visible"] = visibleFlags
+        d["unoccluded"] = unoccludedFlags
+        d["onActiveSpace"] = onActiveSpaceFlags
+        d["isKey"] = keyFlags
+        d["levels"] = levels
+        d["allOnScreen"] = !overlays.isEmpty
+            && zip(visibleFlags, zip(unoccludedFlags, onActiveSpaceFlags)).allSatisfy { $0 && $1.0 && $1.1 }
+        return d
+    }
+
     /// Read-only probe of the pick path: which overlay the point routes to,
     /// whether it holds a frozen frame and what the sampler returns there.
     /// Fires no handlers, so a scenario can report WHY a pick failed.
@@ -142,9 +180,9 @@ final class AreaSelectionWindow: NSObject {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         overlays.forEach { $0.orderOut(nil) }
         overlays.removeAll()
-        // Sem restore de activation policy: este fluxo nunca escala o policy
-        // (painel não-ativante), então restaurar aqui só atropelaria outro fluxo
-        // que esteja legitimamente em .accessory (Preferences abertas, etc).
+        // Drop the dock presence raised in prepareAndShow back to the menu-bar
+        // accessory state, unless another KRIT window legitimately needs .regular.
+        NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded()
     }
 }
 
