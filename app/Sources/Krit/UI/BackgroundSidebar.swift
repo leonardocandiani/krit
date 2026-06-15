@@ -285,7 +285,12 @@ final class BackgroundSidebar: NSView {
 
         let presets = TemplateStore.all()
         for preset in presets {
-            let item = NSMenuItem(title: preset.name, action: #selector(selectPresetMenu(_:)), keyEquivalent: "")
+            // A pin glyph marks the preset that auto-applies to every new capture,
+            // so "which one is the default" reads at a glance; the checkmark stays
+            // reserved for the currently-selected preset.
+            let isDefault = TemplateStore.isDefault(id: preset.id)
+            let item = NSMenuItem(title: isDefault ? "\(preset.name)  \u{1F4CC} Default" : preset.name,
+                                  action: #selector(selectPresetMenu(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = preset.id
             item.image = swatchImage(for: preset.background)
@@ -295,12 +300,31 @@ final class BackgroundSidebar: NSView {
         }
         if !presets.isEmpty { menu.addItem(.separator()) }
 
+        // Manage the selected preset right where it's created: pin it as the default
+        // for every new capture, or remove it. Both act on the active preset and are
+        // disabled on the "Custom" (unsaved) state.
+        let activeIsDefault = active.map { TemplateStore.isDefault(id: $0.id) } ?? false
+        let setDefault = NSMenuItem(
+            title: activeIsDefault ? "Unset as Default" : "Set as Default for New Captures",
+            action: #selector(toggleActivePresetDefaultMenu), keyEquivalent: "")
+        setDefault.target = self
+        setDefault.isEnabled = active != nil
+        setDefault.state = activeIsDefault ? .on : .off
+        menu.addItem(setDefault)
+
+        let removeItem = NSMenuItem(title: "Remove Preset", action: #selector(deleteActivePresetTapped), keyEquivalent: "")
+        removeItem.target = self
+        removeItem.isEnabled = active != nil
+        menu.addItem(removeItem)
+
+        menu.addItem(.separator())
+
         let previous = NSMenuItem(title: "Apply Previous Settings", action: #selector(applyPreviousSettingsMenu), keyEquivalent: "")
         previous.target = self
         previous.isEnabled = TemplateStore.previousOptions != nil
         menu.addItem(previous)
 
-        let defaultPreset = NSMenuItem(title: "Default Preset", action: #selector(applyDefaultPresetMenu), keyEquivalent: "")
+        let defaultPreset = NSMenuItem(title: "Apply Built-in Background", action: #selector(applyDefaultPresetMenu), keyEquivalent: "")
         defaultPreset.target = self
         defaultPreset.isEnabled = true
         menu.addItem(defaultPreset)
@@ -415,11 +439,21 @@ final class BackgroundSidebar: NSView {
         reloadPresetBar()
     }
 
-    /// Trash button: deletes the selected preset (no-op when the dropdown is on a
-    /// custom, unsaved state).
+    /// Trash button / "Remove Preset": deletes the selected preset (no-op when the
+    /// dropdown is on a custom, unsaved state).
     @objc private func deleteActivePresetTapped() {
         guard let active = TemplateStore.activePreset else { return }
         TemplateStore.delete(id: active.id)
+        reloadPresetBar()
+    }
+
+    /// Pins the selected preset as the default applied to every new capture, or
+    /// clears the default when it is already the one pinned. Mirrors the Default
+    /// template picker in Preferences (same `Settings.defaultTemplateName`).
+    @objc private func toggleActivePresetDefaultMenu() {
+        guard let active = TemplateStore.activePreset else { return }
+        let alreadyDefault = TemplateStore.isDefault(id: active.id)
+        TemplateStore.setDefault(name: alreadyDefault ? nil : active.name)
         reloadPresetBar()
     }
 
