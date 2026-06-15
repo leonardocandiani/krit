@@ -36,6 +36,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Generate background image
+BG_PATH="$SCRIPT_DIR/dmg-background.png"
+if [ -f "$SCRIPT_DIR/make-dmg-bg.swift" ]; then
+    echo "▶ Generating DMG background…"
+    (cd "$SCRIPT_DIR" && swift make-dmg-bg.swift 2>/dev/null) || true
+fi
+
 echo "▶ Creating DMG installer…"
 
 # Clean previous
@@ -59,16 +66,24 @@ echo "▶ Copying app and installer assets…"
 ditto --rsrc --extattr "$APP_PATH" "$MOUNT_DIR/$APP_NAME.app"
 ln -s /Applications "$MOUNT_DIR/Applications"
 
-# No background image or custom volume icon on purpose: a "show all files" Finder
-# reveals every support file (.background, .VolumeIcon.icns) in the installer
-# window, which looks cluttered. Keeping only the app and the Applications symlink
-# means the window stays clean for everyone, regardless of that setting.
+if [ -f "$BG_PATH" ]; then
+    mkdir -p "$MOUNT_DIR/.background"
+    cp "$BG_PATH" "$MOUNT_DIR/.background/$(basename "$BG_PATH")"
+fi
+
+# No custom volume icon on purpose: it would add a second support file
+# (.VolumeIcon.icns) that a "show all files" Finder reveals in the window. The
+# background art needs its own .background folder (unavoidable for a Finder
+# background), so we keep the clutter to that single folder and drop the volume
+# icon. Regular users (show-all off) see neither.
 
 echo "▶ Styling Finder window (best-effort; skipped on headless CI)…"
 /usr/bin/osascript <<EOF || true
 on run
     set mountPath to "$MOUNT_DIR"
     set appName to "$APP_NAME"
+    set backgroundName to "$(basename "$BG_PATH")"
+    set backgroundAlias to POSIX file (mountPath & "/.background/" & backgroundName) as alias
 
     tell application "Finder"
         set dmgFolder to POSIX file mountPath as alias
@@ -86,6 +101,7 @@ on run
                 set icon size to 128
                 set text size to 16
                 set arrangement to not arranged
+                set background picture to backgroundAlias
             end tell
 
             set position of item (appName & ".app") to {120, 175}
