@@ -34,6 +34,20 @@ struct HistoryItem: Codable, Identifiable {
     var fullImage: NSImage { HistoryImageCache.fullImage(for: imagePath) }
     var thumbnail: NSImage { HistoryImageCache.thumbnail(for: thumbnailPath) }
 
+    /// The finished image to FLOAT on restore and to preview: the composed frame
+    /// (preset / window background / edited result) when one exists, otherwise the
+    /// raw shot. The thumbnail and the drag already prefer the presented file, so
+    /// restoring a window shot or an edited capture must show the SAME background,
+    /// not the raw `imagePath`. Re-editing still opens from the raw `imagePath`
+    /// (the overlay's edit action reads it directly), so a window background is
+    /// reapplied live instead of double-composed.
+    var presentedImage: NSImage {
+        if let presentedPath, FileManager.default.fileExists(atPath: presentedPath) {
+            return HistoryImageCache.fullImage(for: presentedPath)
+        }
+        return fullImage
+    }
+
     /// The file to hand off on drag / copy-as-file: the composed image (with the
     /// preset) when one exists, otherwise the raw shot. This is what the user sees
     /// in the band, so it is what they expect to drag out.

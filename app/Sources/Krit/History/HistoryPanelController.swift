@@ -96,6 +96,13 @@ private final class HistoryBandWindow: NSWindow {
     private var localClickMonitor: Any?
     private var isClosing = false
 
+    /// The card the cursor is currently over, so Space can Quick-Look it (the same
+    /// gesture the post-capture overlay uses). Cleared on exit.
+    private var hoveredItem: HistoryItem?
+    /// Large centered Quick Look of the hovered capture, toggled by Space. Floats
+    /// above the band over a dimmed backdrop; Space/Esc/click dismisses it.
+    private var previewWindow: HistoryPreviewWindow?
+
     init(historyManager: HistoryManager, screen: NSScreen, bandHeight: CGFloat, onClose: @escaping () -> Void) {
         self.historyManager = historyManager
         self.bandScreen = screen
@@ -279,6 +286,7 @@ private final class HistoryBandWindow: NSWindow {
     func dismiss() {
         guard !isClosing else { return }
         isClosing = true
+        closeQuickLook()
         removeMonitors()
 
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -337,17 +345,27 @@ private final class HistoryBandWindow: NSWindow {
     private func installMonitors() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, !self.isClosing else { return event }
-            if event.keyCode == 53 { self.dismiss(); return nil }  // Esc
+            // Space Quick-Looks the hovered card (matches the post-capture overlay);
+            // a second Space, Esc, or any click collapses it.
+            if event.keyCode == 49 { self.toggleQuickLook(); return nil }  // Space
+            if event.keyCode == 53 {                                       // Esc
+                if self.previewWindow != nil { self.closeQuickLook() } else { self.dismiss() }
+                return nil
+            }
             return event
         }
 
         // A mouse-down outside the band (in another app or on the desktop) closes it.
+        // While a Quick Look is up the click collapses the preview instead, so the
+        // band stays open underneath.
         globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             guard let self, !self.isClosing else { return }
+            if self.previewWindow != nil { self.closeQuickLook(); return }
             if !self.frame.contains(NSEvent.mouseLocation) { self.dismiss() }
         }
         localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
             guard let self, !self.isClosing else { return event }
+            if self.previewWindow != nil { self.closeQuickLook(); return nil }
             if !self.frame.contains(NSEvent.mouseLocation) { self.dismiss() }
             return event
         }
@@ -357,6 +375,24 @@ private final class HistoryBandWindow: NSWindow {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         if let m = globalClickMonitor { NSEvent.removeMonitor(m); globalClickMonitor = nil }
         if let m = localClickMonitor { NSEvent.removeMonitor(m); localClickMonitor = nil }
+    }
+
+    // MARK: - Quick Look (Space)
+
+    /// Open the large preview for the hovered card, or collapse it if already up.
+    /// Mirrors the post-capture overlay's Space gesture so the two surfaces feel
+    /// the same. No-op when the cursor isn't over a card.
+    private func toggleQuickLook() {
+        if previewWindow != nil { closeQuickLook(); return }
+        guard let item = hoveredItem else { return }
+        let preview = HistoryPreviewWindow(image: item.presentedImage, screen: bandScreen)
+        previewWindow = preview
+        preview.present()
+    }
+
+    private func closeQuickLook() {
+        previewWindow?.dismiss()
+        previewWindow = nil
     }
 }
 
@@ -377,14 +413,25 @@ extension HistoryBandWindow: NSCollectionViewDataSource {
             onRestore: { [weak self] in
                 guard let self else { return }
                 self.dismiss()
-                QuickAccessOverlay.show(image: item.fullImage, historyItem: item, historyManager: self.historyManager)
+                QuickAccessOverlay.show(image: item.presentedImage, historyItem: item, historyManager: self.historyManager)
             },
             onOpenEditor: { [weak self] in
                 guard let self else { return }
                 self.dismiss()
                 AnnotationWindowController.open(image: item.fullImage, historyItem: item, historyManager: self.historyManager)
             },
-            onDelete: { [weak self] in self?.deleteAndRefresh(item) }
+            onDelete: { [weak self] in self?.deleteAndRefresh(item) },
+            onHover: { [weak self] hovering in
+                guard let self else { return }
+                if hovering {
+                    self.hoveredItem = item
+                    // Live-swap the Quick Look to the card now under the cursor, so
+                    // moving across the row updates the preview without re-pressing.
+                    if self.previewWindow != nil { self.previewWindow?.update(image: item.presentedImage) }
+                } else if self.hoveredItem?.id == item.id {
+                    self.hoveredItem = nil
+                }
+            }
         )
         return cell
     }
@@ -465,6 +512,7 @@ private final class HistoryCardItem: NSCollectionViewItem {
     private var onRestore: (() -> Void)?
     private var onOpenEditor: (() -> Void)?
     private var onDelete: (() -> Void)?
+    private var onHover: ((Bool) -> Void)?
 
     private let thumbView = NSImageView()
     private let ageLabel = NSTextField(labelWithString: "")
@@ -559,13 +607,15 @@ private final class HistoryCardItem: NSCollectionViewItem {
         historyManager: HistoryManager,
         onRestore: @escaping () -> Void,
         onOpenEditor: @escaping () -> Void,
-        onDelete: @escaping () -> Void
+        onDelete: @escaping () -> Void,
+        onHover: @escaping (Bool) -> Void
     ) {
         self.historyItem = item
         self.historyManager = historyManager
         self.onRestore = onRestore
         self.onOpenEditor = onOpenEditor
         self.onDelete = onDelete
+        self.onHover = onHover
         thumbView.image = historyManager.cachedThumbnail(for: item) ?? item.thumbnail
         ageLabel.stringValue = Self.relativeFormatter.localizedString(for: item.createdAt, relativeTo: Date())
         sourceBadge.icon = item.sourceAppIcon
@@ -593,6 +643,7 @@ private final class HistoryCardItem: NSCollectionViewItem {
     /// highlight signals the entire thumbnail is the target, not just the pill.
     private func setHovered(_ hovered: Bool) {
         restorePill.isHidden = !hovered
+        onHover?(hovered)
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.12
             ctx.allowsImplicitAnimation = true
@@ -833,4 +884,138 @@ private final class SourceAppBadge: NSView {
     // Let clicks fall through to the card underneath so the badge never blocks
     // a restore/drag on the thumbnail it sits on.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+// MARK: - Quick Look preview (Space)
+
+/// Full-screen Quick Look of a history card, opened with Space (mirrors the
+/// post-capture overlay's companion preview). The capture shows large and
+/// centered with rounded corners + a drop shadow over a dimmed, softly blurred
+/// copy of itself. Dismissal (Space / Esc / click) is driven by the band's own
+/// event monitors, so this window only renders and animates.
+@MainActor
+private final class HistoryPreviewWindow: NSWindow {
+
+    private let cardView = NSImageView()
+    private let backdropView = NSView()
+    private let hintLabel = NSTextField(labelWithString: "Space or Esc to close")
+    private var cardWidth: NSLayoutConstraint?
+    private var cardHeight: NSLayoutConstraint?
+
+    /// Largest fraction of the screen the preview card may occupy.
+    private static let fillFraction: CGFloat = 0.85
+    /// Cap upscaling of small captures so a tiny area shot stays comfortable
+    /// without blowing up into a blurry wall.
+    private static let maxUpscale: CGFloat = 2.5
+
+    init(image: NSImage, screen: NSScreen) {
+        super.init(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        // Above the band (which sits at statusBar - 1), so the preview reads as a
+        // modal layer dimming the whole strip.
+        level = NSWindow.Level.statusBar
+        hasShadow = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        sharingType = .none  // never leak the preview into a capture
+
+        let root = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        root.wantsLayer = true
+        contentView = root
+
+        // Softly blurred copy of the image fills the backdrop, then a dark scrim
+        // on top keeps the centered card the focus (same recipe as the overlay).
+        backdropView.frame = root.bounds
+        backdropView.wantsLayer = true
+        backdropView.autoresizingMask = [.width, .height]
+        if let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            backdropView.layer?.contents = cg
+            backdropView.layer?.contentsGravity = .resizeAspectFill
+            backdropView.layer?.contentsScale = screen.backingScaleFactor
+            if let blur = CIFilter(name: "CIGaussianBlur") {
+                blur.setValue(40, forKey: kCIInputRadiusKey)
+                backdropView.layer?.filters = [blur]
+            }
+            backdropView.layer?.opacity = 0.22
+        }
+        root.addSubview(backdropView)
+
+        let scrim = NSView(frame: root.bounds)
+        scrim.wantsLayer = true
+        scrim.autoresizingMask = [.width, .height]
+        scrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+        root.addSubview(scrim)
+
+        cardView.imageScaling = .scaleProportionallyUpOrDown
+        cardView.wantsLayer = true
+        cardView.layer?.cornerRadius = 14
+        cardView.layer?.cornerCurve = .continuous
+        cardView.layer?.shadowColor = NSColor.black.cgColor
+        cardView.layer?.shadowOpacity = 0.5
+        cardView.layer?.shadowRadius = 44
+        cardView.layer?.shadowOffset = CGSize(width: 0, height: -18)
+        cardView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(cardView)
+
+        let w = cardView.widthAnchor.constraint(equalToConstant: 10)
+        let h = cardView.heightAnchor.constraint(equalToConstant: 10)
+        cardWidth = w
+        cardHeight = h
+        NSLayoutConstraint.activate([
+            cardView.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            cardView.centerYAnchor.constraint(equalTo: root.centerYAnchor),
+            w, h,
+        ])
+
+        hintLabel.font = .systemFont(ofSize: 12.5, weight: .medium)
+        hintLabel.textColor = NSColor.white.withAlphaComponent(0.55)
+        hintLabel.alignment = .center
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(hintLabel)
+        NSLayoutConstraint.activate([
+            hintLabel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            hintLabel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -28),
+        ])
+
+        update(image: image)
+        alphaValue = 0
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var canBecomeKey: Bool { true }
+
+    /// Swap the previewed capture (used when the cursor moves to another card
+    /// while the preview is open) and refit the card to it.
+    func update(image: NSImage) {
+        cardView.image = image
+        if let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            backdropView.layer?.contents = cg
+        }
+        let size = image.size
+        guard size.width > 0, size.height > 0 else { return }
+        let maxW = frame.width * Self.fillFraction
+        let maxH = frame.height * Self.fillFraction
+        let scale = min(min(maxW / size.width, maxH / size.height), Self.maxUpscale)
+        cardWidth?.constant = (size.width * scale).rounded()
+        cardHeight?.constant = (size.height * scale).rounded()
+    }
+
+    func present() {
+        makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.16
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.animator().alphaValue = 1
+        }
+    }
+
+    func dismiss() {
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            self.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            self?.orderOut(nil)
+        })
+    }
 }
