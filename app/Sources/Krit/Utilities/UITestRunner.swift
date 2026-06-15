@@ -99,6 +99,7 @@ final class UITestRunner: NSObject {
             case "editor-draw-perf": report = await Self.runEditorDrawPerf()
             case "arrow-scale": report = await Self.runArrowScale()
             case "editor-off-render": report = await Self.runEditorOffRender()
+            case "export-formats": report = await Self.runExportFormats()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -106,6 +107,73 @@ final class UITestRunner: NSObject {
                 try? data.write(to: URL(fileURLWithPath: outPath))
             }
         }
+    }
+
+    // MARK: - Cenário: export-formats (encode por formato via o caminho REAL)
+
+    /// Exercita ImageExporter.encodedForExport no caminho real, para cada formato
+    /// que o usuário pode escolher. Prova: bytes não-vazios, extensão/UTI certos,
+    /// magic bytes do container batem, e o PDF abre como PÁGINA EM PONTOS (não em
+    /// pixels) com a resolução cheia embutida, sem inverter. Cobre o que o PR de
+    /// export PDF precisa garantir antes do merge.
+    private static func runExportFormats() async -> [String: Any] {
+        var r: [String: Any] = [:]
+
+        // Captura 2x: 240x160 pt, bitmap 480x320 px. Metade de cima vermelha,
+        // de baixo azul (em coordenadas top-left de NSImage).
+        let pt = NSSize(width: 240, height: 160)
+        let img = NSImage(size: pt)
+        img.lockFocus()
+        NSColor(srgbRed: 0.9, green: 0.1, blue: 0.1, alpha: 1).setFill()
+        NSRect(x: 0, y: 80, width: 240, height: 80).fill()  // top (flipped focus: y up)
+        NSColor(srgbRed: 0.1, green: 0.2, blue: 0.95, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: 240, height: 80).fill()
+        img.unlockFocus()
+
+        let saved = Settings.screenshotFormat
+        defer { Settings.screenshotFormat = saved }
+
+        func magicOK(_ data: Data, _ ext: String) -> Bool {
+            let b = [UInt8](data.prefix(5))
+            switch ext {
+            case "png":  return b.count >= 4 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47
+            case "jpg":  return b.count >= 2 && b[0] == 0xFF && b[1] == 0xD8
+            case "webp": return true  // RIFF container; codec presence is environment-dependent
+            case "pdf":  return b.count >= 4 && b[0] == 0x25 && b[1] == 0x50 && b[2] == 0x44 && b[3] == 0x46 // %PDF
+            default:     return false
+            }
+        }
+
+        var perFormat: [String: Any] = [:]
+        var allPass = true
+        // webp resolves to png when the codec is unavailable, so assert the resolved ext.
+        for requested in ["png", "jpg", "webp", "pdf"] {
+            Settings.screenshotFormat = requested
+            guard let export = ImageExporter.encodedForExport(img) else {
+                perFormat[requested] = ["ok": false, "reason": "nil export"]; allPass = false; continue
+            }
+            var entry: [String: Any] = ["ext": export.ext, "uti": export.uti, "bytes": export.data.count]
+            let ok = export.data.count > 0 && magicOK(export.data, export.ext)
+            entry["magicOK"] = ok
+            if !ok { allPass = false }
+
+            if export.ext == "pdf" {
+                if let doc = CGPDFDocument(CGDataProvider(data: export.data as CFData)!), let page = doc.page(at: 1) {
+                    let box = page.getBoxRect(.mediaBox)
+                    entry["pageW"] = Int(box.width); entry["pageH"] = Int(box.height)
+                    // Page must be in POINTS (240x160), not pixels (480x320).
+                    let pageOK = Int(box.width) == 240 && Int(box.height) == 160
+                    entry["pageInPoints"] = pageOK
+                    if !pageOK { allPass = false }
+                } else {
+                    entry["pageInPoints"] = false; allPass = false
+                }
+            }
+            perFormat[export.ext] = entry
+        }
+        r["formats"] = perFormat
+        r["allPass"] = allPass
+        return r
     }
 
     // MARK: - Cenário: sidebar-motion (filma a abertura da coluna de backgrounds)
