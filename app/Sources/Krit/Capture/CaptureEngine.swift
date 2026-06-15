@@ -910,7 +910,7 @@ final class CaptureEngine {
         // capture with the exact point/pixel geometry each stage saw, so a bad
         // presented PNG can be traced to its stage from `log show` after the fact.
         let rawCG = image.bestCGImage
-        Self.captureLog.info("finishCapture: window=\(isWindowCapture) pointSize=\(String(describing: image.size)) pixels=\(rawCG?.width ?? -1)x\(rawCG?.height ?? -1) rect=\(String(describing: rect)) screen=\(screen.localizedName, privacy: .public) scaleSetting=\(Settings.captureScale.rawValue, privacy: .public)")
+        Self.captureLog.info("finishCapture: window=\(isWindowCapture) pointSize=\(String(describing: image.size)) pixels=\(rawCG?.width ?? -1)x\(rawCG?.height ?? -1) rect=\(String(describing: rect)) screen=\(screen.localizedName, privacy: .public)")
         if isWindowCapture {
             let options = AnnotationWindowController.windowShotBackground(for: image, captureRect: rect)
             if options.isEnabled {
@@ -1025,19 +1025,49 @@ final class CaptureEngine {
                 Self.captureLog.error("isolatedWindowImage: window \(windowID) not in shareable content; falling back")
                 return nil
             }
+
+            // Bring the target window forward so the grab catches it ACTIVE (colored
+            // traffic lights, full-contrast chrome) instead of the dimmed inactive
+            // look it fell into when KRIT's picker took focus. For another app,
+            // activating it makes its front window key; for our own window, raise it
+            // directly. A short settle lets the window server repaint the active
+            // state before SCK reads the frame. KRIT regains focus when the editor
+            // opens right after.
+            if let pid = window.owningApplication?.processID {
+                await MainActor.run {
+                    if pid == ProcessInfo.processInfo.processIdentifier {
+                        NSApp.activate(ignoringOtherApps: true)
+                        NSApp.windows.first { $0.windowNumber == Int(windowID) }?.makeKeyAndOrderFront(nil)
+                    } else {
+                        NSRunningApplication(processIdentifier: pid)?.activate()
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 180_000_000)
+            }
+
             let filter = SCContentFilter(desktopIndependentWindow: window)
-            let scale = CGFloat(filter.pointPixelScale)
-            let mult = Settings.captureScale.multiplier
             let logicalSize = window.frame.size
+            // Real backing scale of the display the window sits on, not
+            // filter.pointPixelScale (which can report 2 on a 1x external display
+            // and leave the grab anchored in a half-empty buffer). SCWindow.frame
+            // is in CoreGraphics coords (top-left origin); convert its center to
+            // AppKit to find the host NSScreen.
+            let scale: CGFloat = {
+                let winFrame = window.frame
+                guard let primaryH = NSScreen.screens.first?.frame.height else { return 2 }
+                let centerAppKit = CGPoint(x: winFrame.midX, y: primaryH - winFrame.midY)
+                let host = NSScreen.screens.first { NSPointInRect(centerAppKit, $0.frame) }
+                return host?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+            }()
             let config = SCStreamConfiguration()
-            config.width = min(max(1, Int(logicalSize.width * scale * mult)), Self.maxCaptureEdge)
-            config.height = min(max(1, Int(logicalSize.height * scale * mult)), Self.maxCaptureEdge)
-            // Supersampled buffer: SCK must scale the window content INTO the
-            // larger buffer. With scalesToFit false the content keeps its native
-            // pixel size and the grab comes out cropped/anchored with the rest
-            // of the buffer empty (the white-border window shots). The native 1x
-            // path keeps false, exactly the long-proven configuration.
-            config.scalesToFit = mult > 1
+            // Native pixel-exact grab: the buffer matches the window's on-screen
+            // pixels. Screen content has no detail beyond the display's native
+            // density, so upscaling it would only soften the result and bloat the
+            // file, native is the sharpest a screen grab can be. scalesToFit stays
+            // false so SCK never anchors the content inside a larger buffer.
+            config.width = min(max(1, Int(logicalSize.width * scale)), Self.maxCaptureEdge)
+            config.height = min(max(1, Int(logicalSize.height * scale)), Self.maxCaptureEdge)
+            config.scalesToFit = false
             config.showsCursor = false
             config.captureResolution = .best
             // The default opaque background would fill the rounded corners and
@@ -1116,20 +1146,20 @@ final class CaptureEngine {
         SoundManager.warmUp()
     }
 
-    /// `nativeScale` skips the user's supersampling multiplier: the frozen
-    /// selection backdrop and other purely-visual grabs only need native pixels,
-    /// and a 3x multiplier on a large display made the area-selection hotkey
-    /// take seconds to show.
-    func captureRectToImage(_ rect: CGRect, on screen: NSScreen, nativeScale: Bool = false) async -> NSImage? {
+    /// Grabs `rect` at the display's native pixel density (pixel-exact). There is
+    /// no quality knob: the screen content has no detail past its native density,
+    /// so the native grab is always the sharpest possible and any upscale would
+    /// only soften it.
+    func captureRectToImage(_ rect: CGRect, on screen: NSScreen) async -> NSImage? {
         if #available(macOS 14.0, *) {
-            return await captureRectSCK(rect, on: screen, nativeScale: nativeScale)
+            return await captureRectSCK(rect, on: screen)
         } else {
             return fallbackCapture(rect: rect)
         }
     }
 
     @available(macOS 14.0, *)
-    private func captureRectSCK(_ rect: CGRect, on screen: NSScreen, nativeScale: Bool = false) async -> NSImage? {
+    private func captureRectSCK(_ rect: CGRect, on screen: NSScreen) async -> NSImage? {
         lastCaptureFailureWasPermission = false
         do {
             // captureRectSCK only needs the display list, no window enumeration.
@@ -1145,7 +1175,13 @@ final class CaptureEngine {
                 return fallbackCapture(rect: rect)
             }
             let filter = SCContentFilter(display: display, excludingWindows: [])
-            let s: CGFloat = CGFloat(filter.pointPixelScale)
+            // Use the display's REAL backing scale, not filter.pointPixelScale: on
+            // a non-Retina external display SCK can report pointPixelScale 2 while
+            // the panel is genuinely 1x. That sized the buffer at 2x the content SCK
+            // actually delivers, leaving the grab anchored in a half-empty frame.
+            // backingScaleFactor matches the pixels SCK hands back, so the native
+            // buffer is exact (1:1) and the grab fills it.
+            let s: CGFloat = screen.backingScaleFactor
 
             // Snap rect to integer pixel boundaries to avoid subpixel sampling.
             // Fractional sourceRect coords cause SCK to interpolate between pixels,
@@ -1159,20 +1195,18 @@ final class CaptureEngine {
             let screenHeight = screen.frame.height
             let sckRect = CGRect(x: ox, y: screenHeight - oy - h, width: w, height: h)
 
-            // Supersample on top of the native scale when the user asks for more
-            // density (Settings.captureScale). Clamped so an extreme display +
-            // Maximum can't ask SCK for a buffer past its texture limit.
-            let mult = nativeScale ? 1 : Settings.captureScale.multiplier
-            let pixelW = min(Int(w * s * mult), Self.maxCaptureEdge)
-            let pixelH = min(Int(h * s * mult), Self.maxCaptureEdge)
+            // Native pixel-exact: the buffer matches the source rect's on-screen
+            // pixels. Screen content carries no detail past the display's native
+            // density, so we never upscale (only clamp to SCK's texture limit).
+            let pixelW = min(Int(w * s), Self.maxCaptureEdge)
+            let pixelH = min(Int(h * s), Self.maxCaptureEdge)
 
             let config = SCStreamConfiguration()
             config.sourceRect = sckRect
             config.width = pixelW
             config.height = pixelH
-            // Same supersampling rule as the window path: only a buffer larger
-            // than the native sourceRect pixels needs scalesToFit.
-            config.scalesToFit = mult > 1
+            // Native buffer == sourceRect pixels, so no fitting needed.
+            config.scalesToFit = false
             config.showsCursor = false
             config.captureResolution = .best
             // Don't set colorSpaceName, SCK defaults to the display's native

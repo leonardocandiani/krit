@@ -61,9 +61,10 @@ final class AreaSelectionWindow: NSObject {
         }
         for (overlay, screen) in zip(overlays, NSScreen.screens) {
             Task { [weak overlay] in
-                // Native 1x: this frame is for the loupe and fallback crop, the
-                // real capture re-grabs at the configured quality on release.
-                let image = await engine.captureRectToImage(screen.frame, on: screen, nativeScale: true)
+                // This frame backs the loupe and the fallback crop; the real
+                // capture re-grabs the selected rect on release. Both are native
+                // pixel-exact now, so they match.
+                let image = await engine.captureRectToImage(screen.frame, on: screen)
                 var rect = NSRect(origin: .zero, size: screen.frame.size)
                 guard let frozenCG = image?.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return }
                 await MainActor.run { overlay?.setFrozenImage(frozenCG) }
@@ -830,6 +831,7 @@ private final class SelectionOverlayView: NSView {
         // (bottom-left, same anchor) uses the PRIMARY display height for every
         // window regardless of which monitor it sits on.
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        let screenFrames = NSScreen.screens.map { $0.frame }
         cachedWindows = windowList.compactMap { info in
             guard
                 let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
@@ -848,6 +850,20 @@ private final class SelectionOverlayView: NSView {
                 width: bounds.width,
                 height: bounds.height
             )
+            // Skip windows that cover an entire display. A window matching a full
+            // screen frame (Screen Sharing / screen-mirroring fullscreen mirror,
+            // and similar) is never a meaningful single-window target, capturing
+            // it is identical to screen/area mode. Without this the picker would
+            // grab the mirror on every click ("window shot = the whole screen"),
+            // and a full-bleed shot composes with no margin so its shadow has
+            // nowhere to fall. The match is tight (2px) and against the full
+            // frame, not visibleFrame, so a maximized app window (which leaves
+            // the menu bar) stays pickable.
+            let coversDisplay = screenFrames.contains { f in
+                abs(f.minX - screenRect.minX) < 2 && abs(f.minY - screenRect.minY) < 2 &&
+                abs(f.width - screenRect.width) < 2 && abs(f.height - screenRect.height) < 2
+            }
+            if coversDisplay { return nil }
             return (screenRect, CGWindowID(windowNumber))
         }
     }

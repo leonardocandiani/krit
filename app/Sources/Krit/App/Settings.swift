@@ -272,17 +272,6 @@ enum Settings {
         set { defaults.set(min(max(newValue, 0), 10), forKey: "captureCountdownSeconds") }
     }
 
-    /// Supersampling multiplier applied on top of the display's native pixel
-    /// scale when grabbing a screenshot. `.standard` (1×) captures exactly the
-    /// screen's physical pixels; `.high` (2×) and `.maximum` (3×) render the grab
-    /// into a larger buffer so small captures carry more pixels and stay smooth
-    /// when enlarged. Higher settings make bigger files and do NOT invent detail
-    /// beyond what the screen shows, they bake in high-quality upscaling.
-    static var captureScale: CaptureScale {
-        get { CaptureScale(rawValue: defaults.string(forKey: "captureScale") ?? "") ?? .standard }
-        set { defaults.set(newValue.rawValue, forKey: "captureScale") }
-    }
-
     /// What the editor opens a window capture with. Defaults to the current
     /// desktop wallpaper so window shots arrive composed out of the box.
     static var windowCaptureBackground: WindowCaptureBackground {
@@ -360,39 +349,6 @@ enum Settings {
     }
 }
 
-/// Screenshot capture density. The multiplier rides on top of the display's
-/// native pixel scale (so `.high` on a 2× Retina display grabs at 4× the point
-/// size). `.standard` is a pixel-exact native grab; higher tiers supersample so
-/// small captures keep more pixels and enlarge cleanly, at the cost of file size.
-enum CaptureScale: String, CaseIterable, Identifiable {
-    case standard, high, maximum
-    var id: String { rawValue }
-
-    /// Factor applied over the native pixel scale during capture.
-    var multiplier: CGFloat {
-        switch self {
-        case .standard: return 1
-        case .high:     return 2
-        case .maximum:  return 3
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .standard: return "Standard"
-        case .high:     return "High (2×)"
-        case .maximum:  return "Maximum (3×)"
-        }
-    }
-
-    var detail: String {
-        switch self {
-        case .standard: return "Native screen resolution, exact pixels."
-        case .high:     return "2× supersampling, sharper when enlarged, larger files."
-        case .maximum:  return "3× supersampling, the crispest enlargements, largest files."
-        }
-    }
-}
 
 /// The three appearance choices, mirroring the macOS System Settings control:
 /// follow the system, or pin Light / Dark regardless of the OS setting.

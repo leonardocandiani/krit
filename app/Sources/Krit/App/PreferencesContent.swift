@@ -157,7 +157,6 @@ private struct GeneralForm: View {
 // MARK: - Capture
 
 private struct CaptureForm: View {
-    @State private var captureScale = Settings.captureScale
     @State private var format = Settings.screenshotFormat
     @State private var jpegQuality = Settings.jpegQuality
     @State private var countdown = Settings.captureCountdownSeconds
@@ -165,18 +164,6 @@ private struct CaptureForm: View {
     @State private var windowBackground = Settings.windowCaptureBackground
 
     var body: some View {
-        Section("Quality") {
-            Picker(selection: $captureScale) {
-                ForEach(CaptureScale.allCases) { scale in
-                    Text(scale.label).tag(scale)
-                }
-            } label: {
-                Text("Capture resolution")
-                Text(captureScale.detail)
-            }
-            .onChange(of: captureScale) { Settings.captureScale = $0 }
-        }
-
         Section("Export format") {
             Picker("File format", selection: $format) {
                 Text("PNG").tag("png")
