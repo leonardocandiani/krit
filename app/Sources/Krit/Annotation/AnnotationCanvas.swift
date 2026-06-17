@@ -514,6 +514,22 @@ final class AnnotationCanvas: NSView {
     /// Test hook: runs the eyedropper click path at a canvas-space point.
     func uiTestEyedrop(at point: CGPoint) { handleEyedropperDown(at: point) }
 
+    /// Test hooks for the highlighter OCR snap. Warm the detector, read the full
+    /// detected line rects (what the snap clamps against), and run the real snap for
+    /// a band between two view points, so a scenario can prove a partial swipe
+    /// highlights only the swept span instead of the whole line.
+    func uiTestWarmTextDetection() async {
+        guard let backgroundImage else { return }
+        _ = await textRegionDetector.recognizedLines(for: backgroundImage)
+    }
+    func uiTestDetectedLineRects() -> [CGRect] {
+        guard let backgroundImage, let lines = textRegionDetector.lines(for: backgroundImage) else { return [] }
+        return lines.compactMap { textLineViewRect($0.normalizedBox) }
+    }
+    func uiTestSnappedHighlightRects(from start: CGPoint, to end: CGPoint) -> [CGRect] {
+        snappedTextHighlightRects(for: HighlighterAnnotation(start: start, end: end))
+    }
+
     // MARK: - Highlighter OCR snapping
 
     /// Warm the text-detection cache for the current image (called when the
@@ -572,8 +588,17 @@ final class AnnotationCanvas: NSView {
         for line in lines {
             guard let lineRect = textLineViewRect(line.normalizedBox) else { continue }
             guard lineRect.intersects(bandRect) else { continue }
-            let padded = lineRect.insetBy(dx: 0, dy: -textHighlightVerticalPadding)
-            rects.append(clampRectToCanvas(padded))
+            // Snap the HEIGHT to the text line (clean baseline), but bound the WIDTH
+            // to the span the user actually swept, like a real marker: drag over a
+            // few words and only those get highlighted, not the whole line. The X is
+            // intersected with the line's own text extent, so over-swiping into the
+            // margin never paints past the writing.
+            let minX = max(lineRect.minX, bandRect.minX)
+            let maxX = min(lineRect.maxX, bandRect.maxX)
+            guard maxX > minX else { continue }
+            let swept = CGRect(x: minX, y: lineRect.minY, width: maxX - minX, height: lineRect.height)
+                .insetBy(dx: 0, dy: -textHighlightVerticalPadding)
+            rects.append(clampRectToCanvas(swept))
         }
         return rects
     }
