@@ -762,22 +762,31 @@ private final class SelectionOverlayView: NSView {
                 invalidateWindowHighlight(from: previous, to: highlightedWindowRect)
             }
         } else if (mode == .area || mode == .colorPick) && !isSelecting {
-            // With the magnifier hidden (default, no Control), paint NOTHING per
-            // move: just track the position. The crosshair cursor follows natively,
-            // so there is zero per-move redraw and the selection stays snappy.
-            guard showsLoupeArtifacts else {
+            // Force the crosshair cursor on every move: the selection panel is
+            // INACTIVE, so NSCursor.push()/cursorUpdate don't reliably stick and the
+            // pointer would stay an arrow. This is the aiming target by default,
+            // when the magnifier is hidden.
+            NSCursor.crosshair.set()
+            // Read Control from the global modifier state (the inactive panel never
+            // gets flagsChanged), so the magnifier toggles live while moving.
+            let wasShowing = showsLoupeArtifacts
+            controlHeld = NSEvent.modifierFlags.contains(.control)
+            let isShowing = showsLoupeArtifacts
+
+            // Magnifier hidden: paint NOTHING per move, just track the position, so
+            // there is zero per-move redraw and the selection stays snappy.
+            guard isShowing || wasShowing else {
                 mousePosition = event.locationInWindow
                 return
             }
-            // Magnifier active: invalidate every artifact we paint around the cursor
-            // at both the previous and new positions: crosshair strips (full-screen
-            // lines), the loupe (120px + shadow/border, flips near screen edges),
-            // the hex pill below the loupe, and the coordinate label.
+            // Active (or just released): invalidate the artifacts at both the old and
+            // new positions: crosshair strips (full-screen lines), the loupe (120px
+            // + shadow/border, flips near screen edges), the hex pill and the label.
             if let old = mousePosition {
                 invalidateCursorArtifacts(at: old)
             }
             mousePosition = event.locationInWindow
-            invalidateCursorArtifacts(at: mousePosition!)
+            if isShowing { invalidateCursorArtifacts(at: mousePosition!) }
         } else {
             setNeedsDisplay(bounds)
         }
