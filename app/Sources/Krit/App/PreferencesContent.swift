@@ -77,6 +77,7 @@ private struct GeneralForm: View {
     @State private var hideDesktopIcons = Settings.hideDesktopIconsWhileCapturing
     @State private var copyToClipboard = Settings.afterCaptureCopyToClipboard
     @State private var saveAutomatically = Settings.afterCaptureSaveAutomatically
+    @State private var magnifierOnControl = Settings.magnifierRequiresControl
     @State private var appearance = Settings.appearanceMode
 
     var body: some View {
@@ -150,6 +151,14 @@ private struct GeneralForm: View {
                 Text("Write each capture to the save location without asking.")
             }
             .onChange(of: saveAutomatically) { Settings.afterCaptureSaveAutomatically = $0 }
+        }
+
+        Section("Selection") {
+            Toggle(isOn: $magnifierOnControl) {
+                Text("Show magnifier only while holding Control")
+                Text("Keeps the crosshair light; hold ⌃ for the zoom loupe and guide lines.")
+            }
+            .onChange(of: magnifierOnControl) { Settings.magnifierRequiresControl = $0 }
         }
     }
 }

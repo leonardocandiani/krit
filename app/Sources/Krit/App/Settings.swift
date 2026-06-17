@@ -55,6 +55,18 @@ enum Settings {
         set { defaults.set(newValue, forKey: "overlayOnLeft") }
     }
 
+    /// When true, the area-selection magnifier loupe + crosshair guides only
+    /// appear while holding Control (CleanShot-style). Off = always show them.
+    /// Default on: a plain crosshair cursor follows the mouse with zero per-move
+    /// redraw, so selection stays snappy.
+    static var magnifierRequiresControl: Bool {
+        get {
+            if defaults.object(forKey: "magnifierRequiresControl") == nil { return true }
+            return defaults.bool(forKey: "magnifierRequiresControl")
+        }
+        set { defaults.set(newValue, forKey: "magnifierRequiresControl") }
+    }
+
     /// Size of the Quick Access overlay card (Small / Medium / Large). Default .medium.
     static var overlaySize: OverlaySize {
         get { OverlaySize(rawValue: defaults.string(forKey: "overlaySize") ?? "") ?? .medium }

@@ -286,6 +286,25 @@ private final class SelectionOverlayView: NSView {
     // For area mode: track mouse position for crosshair before drag starts
     private var mousePosition: NSPoint?
 
+    // CleanShot-style: the magnifier loupe + crosshair guides only appear while
+    // holding Control (when the setting is on). Color-pick always shows the loupe
+    // (it IS the eyedropper). Default off keeps selection snappy: nothing heavy is
+    // repainted per mouse move, the plain crosshair cursor does the aiming.
+    private var controlHeld = false
+    private var showsLoupeArtifacts: Bool {
+        if mode == .colorPick { return true }
+        return !Settings.magnifierRequiresControl || controlHeld
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        let held = event.modifierFlags.contains(.control)
+        if held != controlHeld {
+            controlHeld = held
+            if let pos = mousePosition { invalidateCursorArtifacts(at: pos) } else { needsDisplay = true }
+        }
+        super.flagsChanged(with: event)
+    }
+
     // For window mode
     private var highlightedWindowRect: NSRect?
     // The highlighted window's frame in AppKit screen coordinates (bottom-left,
@@ -394,11 +413,9 @@ private final class SelectionOverlayView: NSView {
 
             drawCornerHandles(for: currentRect)
             drawDimensionLabel(near: currentRect)
-            // Keep the loupe live during the drag, it samples the in-memory
-            // frozen image (zero per-frame capture cost), so the user gets
-            // pixel-precise feedback exactly when sizing the rect, which is the
-            // moment it matters most. Anchored at the active drag corner.
-            if let pos = mousePosition {
+            // Loupe during the drag: pixel-precise feedback while sizing the rect,
+            // but only when the magnifier is active (Control held, or always-on).
+            if showsLoupeArtifacts, let pos = mousePosition {
                 drawMagnifierLoupe(at: pos)
             }
         } else if mode == .area || mode == .colorPick {
@@ -407,7 +424,7 @@ private final class SelectionOverlayView: NSView {
             // pass clicks through.
             NSColor.black.withAlphaComponent(0.001).setFill()
             NSBezierPath.fill(bounds)
-            if let pos = mousePosition {
+            if showsLoupeArtifacts, let pos = mousePosition {
                 drawCrosshair(at: pos)
                 // The hex pill under the loupe already names the pixel; screen
                 // coordinates would be noise while picking a color.
@@ -745,11 +762,17 @@ private final class SelectionOverlayView: NSView {
                 invalidateWindowHighlight(from: previous, to: highlightedWindowRect)
             }
         } else if (mode == .area || mode == .colorPick) && !isSelecting {
-            // Invalidate every artifact we paint around the cursor at both
-            // the previous and new positions: crosshair strips (full-screen
-            // lines), the loupe (120px + shadow/border, flips left or right
-            // and up or down near screen edges), the hex color pill below
-            // the loupe, and the coordinate label offset from the cursor.
+            // With the magnifier hidden (default, no Control), paint NOTHING per
+            // move: just track the position. The crosshair cursor follows natively,
+            // so there is zero per-move redraw and the selection stays snappy.
+            guard showsLoupeArtifacts else {
+                mousePosition = event.locationInWindow
+                return
+            }
+            // Magnifier active: invalidate every artifact we paint around the cursor
+            // at both the previous and new positions: crosshair strips (full-screen
+            // lines), the loupe (120px + shadow/border, flips near screen edges),
+            // the hex pill below the loupe, and the coordinate label.
             if let old = mousePosition {
                 invalidateCursorArtifacts(at: old)
             }
