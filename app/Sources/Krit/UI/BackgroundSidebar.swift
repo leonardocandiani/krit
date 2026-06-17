@@ -275,13 +275,38 @@ final class BackgroundSidebar: NSView {
         // otherwise force every item with a valid target on).
         menu.autoenablesItems = false
         let active = TemplateStore.activePreset
+        let base = TemplateStore.editingBase
+        // "Edited" = the user picked a saved preset and then hand-tweaked it, so the
+        // live background no longer matches what's stored. We keep the base preset's
+        // identity (unlike `active`, which already dropped to nil) so we can offer to
+        // save the changes back into it.
+        let isEdited = active == nil && base != nil && base!.background != options
         // The pull-down's title item (index 0) is what shows when the menu is shut:
-        // the active preset's swatch + name, or a neutral "Custom" when none is set.
+        // the active preset's swatch + name, "<name> (edited)" with the live swatch
+        // when tweaked, or a neutral "Custom" when there's no base at all.
         let titleItem = NSMenuItem()
-        titleItem.title = active?.name ?? "Custom"
-        titleItem.image = active.map { swatchImage(for: $0.background) }
+        if isEdited, let base {
+            titleItem.title = "\(base.name) (edited)"
+            titleItem.image = swatchImage(for: options)
+        } else {
+            titleItem.title = active?.name ?? "Custom"
+            titleItem.image = active.map { swatchImage(for: $0.background) }
+        }
         titleItem.isEnabled = true
         menu.addItem(titleItem)
+
+        // Save the hand-edits back into the preset they came from. Top of the menu so
+        // "I tweaked my preset, now save it" is the first thing the user sees.
+        if isEdited, let base {
+            menu.addItem(.separator())
+            // No key equivalent: the editor already owns Cmd+S for saving the image
+            // to disk, so this stays a click-only action to avoid a clash.
+            let save = NSMenuItem(title: "Save Changes to \u{201C}\(base.name)\u{201D}",
+                                  action: #selector(saveChangesToBaseTapped), keyEquivalent: "")
+            save.target = self
+            save.isEnabled = true
+            menu.addItem(save)
+        }
 
         let presets = TemplateStore.all()
         for preset in presets {
@@ -301,20 +326,22 @@ final class BackgroundSidebar: NSView {
         if !presets.isEmpty { menu.addItem(.separator()) }
 
         // Manage the selected preset right where it's created: pin it as the default
-        // for every new capture, or remove it. Both act on the active preset and are
-        // disabled on the "Custom" (unsaved) state.
-        let activeIsDefault = active.map { TemplateStore.isDefault(id: $0.id) } ?? false
+        // for every new capture, or remove it. These act on the selected preset, or
+        // on the edit base while it's tweaked; only the true "Custom" (no base) state
+        // disables them.
+        let managed = active ?? base
+        let activeIsDefault = managed.map { TemplateStore.isDefault(id: $0.id) } ?? false
         let setDefault = NSMenuItem(
             title: activeIsDefault ? "Unset as Default" : "Set as Default for New Captures",
             action: #selector(toggleActivePresetDefaultMenu), keyEquivalent: "")
         setDefault.target = self
-        setDefault.isEnabled = active != nil
+        setDefault.isEnabled = managed != nil
         setDefault.state = activeIsDefault ? .on : .off
         menu.addItem(setDefault)
 
         let removeItem = NSMenuItem(title: "Remove Preset", action: #selector(deleteActivePresetTapped), keyEquivalent: "")
         removeItem.target = self
-        removeItem.isEnabled = active != nil
+        removeItem.isEnabled = managed != nil
         menu.addItem(removeItem)
 
         menu.addItem(.separator())
@@ -338,8 +365,16 @@ final class BackgroundSidebar: NSView {
 
         presetPopup.menu = menu
         presetPopup.selectItem(at: 0)
-        presetDeleteButton.isEnabled = active != nil
-        presetDeleteButton.contentTintColor = active != nil ? .secondaryLabelColor : .tertiaryLabelColor
+        presetDeleteButton.isEnabled = managed != nil
+        presetDeleteButton.contentTintColor = managed != nil ? .secondaryLabelColor : .tertiaryLabelColor
+    }
+
+    /// Test hook: rebuild the preset dropdown from the live state and return its
+    /// item titles, so a scenario can assert the "(edited)" badge and the
+    /// "Save Changes to <name>" action appear when a saved preset is hand-edited.
+    func uiTestPresetMenuTitles() -> [String] {
+        reloadPresetBar()
+        return presetPopup.menu?.items.map { $0.title } ?? []
     }
 
     /// A small rounded swatch image for a preset, rendering the ACTUAL background
@@ -400,6 +435,9 @@ final class BackgroundSidebar: NSView {
               let preset = TemplateStore.all().first(where: { $0.id == id }) else { return }
         TemplateStore.recordPrevious(options)
         TemplateStore.setActive(name: preset.name)
+        // Remember this preset as the edit base so later hand-edits can be saved
+        // back into it ("Save Changes to <name>"), not only forked into a copy.
+        TemplateStore.setEditingBase(name: preset.name)
         commit(preset.background)
         reloadPresetBar()
     }
@@ -410,6 +448,7 @@ final class BackgroundSidebar: NSView {
         // user expects "previous" to behave.
         TemplateStore.recordPrevious(options)
         TemplateStore.setActive(name: nil)
+        TemplateStore.setEditingBase(name: nil)
         commit(previous)
         reloadPresetBar()
     }
@@ -417,6 +456,7 @@ final class BackgroundSidebar: NSView {
     @objc private func applyDefaultPresetMenu() {
         TemplateStore.recordPrevious(options)
         TemplateStore.setActive(name: nil)
+        TemplateStore.setEditingBase(name: nil)
         commit(defaultPresetOptions)
         reloadPresetBar()
     }
@@ -436,14 +476,29 @@ final class BackgroundSidebar: NSView {
         // duplicating.
         TemplateStore.add(name: name, background: options)
         TemplateStore.setActive(name: name)
+        TemplateStore.setEditingBase(name: name)
+        reloadPresetBar()
+    }
+
+    /// "Save Changes to <name>": writes the current (hand-edited) background back
+    /// into the preset the user started from, so editing a preset updates it in
+    /// place. Only shown while editing a saved preset; a built-in gradient has no
+    /// template to update and saves via "Add New Preset" instead.
+    @objc private func saveChangesToBaseTapped() {
+        guard let base = TemplateStore.editingBase else { return }
+        _ = TemplateStore.update(id: base.id, background: options)
+        // Options now match the saved config, so the dropdown re-selects the preset
+        // and the "(edited)" state clears.
+        TemplateStore.setActive(name: base.name)
         reloadPresetBar()
     }
 
     /// Trash button / "Remove Preset": deletes the selected preset (no-op when the
     /// dropdown is on a custom, unsaved state).
     @objc private func deleteActivePresetTapped() {
-        guard let active = TemplateStore.activePreset else { return }
+        guard let active = TemplateStore.activePreset ?? TemplateStore.editingBase else { return }
         TemplateStore.delete(id: active.id)
+        TemplateStore.setEditingBase(name: nil)
         reloadPresetBar()
     }
 
@@ -451,7 +506,7 @@ final class BackgroundSidebar: NSView {
     /// clears the default when it is already the one pinned. Mirrors the Default
     /// template picker in Preferences (same `Settings.defaultTemplateName`).
     @objc private func toggleActivePresetDefaultMenu() {
-        guard let active = TemplateStore.activePreset else { return }
+        guard let active = TemplateStore.activePreset ?? TemplateStore.editingBase else { return }
         let alreadyDefault = TemplateStore.isDefault(id: active.id)
         TemplateStore.setDefault(name: alreadyDefault ? nil : active.name)
         reloadPresetBar()
@@ -894,6 +949,9 @@ final class BackgroundSidebar: NSView {
         next.customImageData = nil
         next.customImageName = nil
         next.tracksDesktopWallpaper = nil
+        // A built-in gradient is a fresh starting point, not a saved preset to
+        // update; clear the edit base so saving forks a new preset.
+        TemplateStore.setEditingBase(name: nil)
         commit(next)
     }
 
@@ -927,6 +985,7 @@ final class BackgroundSidebar: NSView {
                 next.customImageName = wallpaper.name
                 next.customImageData = resolved
                 next.tracksDesktopWallpaper = nil
+                TemplateStore.setEditingBase(name: nil)
                 self.commit(next)
             }
             return
@@ -941,6 +1000,7 @@ final class BackgroundSidebar: NSView {
         next.customImageData = nil
         next.customImageName = nil
         next.tracksDesktopWallpaper = nil
+        TemplateStore.setEditingBase(name: nil)
         commit(next)
     }
 
@@ -958,6 +1018,7 @@ final class BackgroundSidebar: NSView {
         next.customImageName = "Current wallpaper"
         next.customImageData = data
         next.tracksDesktopWallpaper = true
+        TemplateStore.setEditingBase(name: nil)
         commit(next)
     }
 
@@ -1121,10 +1182,20 @@ final class BackgroundSidebar: NSView {
     /// selection drops back to "Custom". Only rebuilds the popup when the selected
     /// state actually changes, so a continuous slider drag stays cheap.
     private func syncActivePreset() {
-        guard let active = TemplateStore.activePreset else { return }
-        guard active.background != options else { return }
-        TemplateStore.setActive(name: nil)
-        reloadPresetBar()
+        if let active = TemplateStore.activePreset {
+            guard active.background != options else { return }
+            // Diverged from the saved preset: drop to the "(edited)" state, which
+            // reloadPresetBar renders from the retained edit base.
+            TemplateStore.setActive(name: nil)
+            reloadPresetBar()
+            return
+        }
+        // No active preset. If the live background drifted back to exactly the base
+        // preset being edited, re-select it so the "(edited)" badge clears on its own.
+        if let base = TemplateStore.editingBase, base.background == options {
+            TemplateStore.setActive(name: base.name)
+            reloadPresetBar()
+        }
     }
 
     private func updateValueLabels(for opts: ScreenshotBackgroundOptions) {

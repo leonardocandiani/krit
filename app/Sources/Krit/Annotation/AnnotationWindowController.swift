@@ -172,12 +172,21 @@ final class AnnotationWindowController: NSWindowController {
         // wallpaper, saved template, or none), which takes precedence for windows.
         let isWindowShot = historyItem?.isWindowCapture == true
         let initialBackground: ScreenshotBackgroundOptions
+        // The named preset the editor opens with, so the dropdown shows it SELECTED
+        // (and as the edit base). A shot composed from the user's default preset must
+        // read as that preset, not "Custom", or editing it forks a new template
+        // instead of offering "Save Changes to <name>" (the dono's bug).
+        let openingPresetName: String?
         if isWindowShot {
             initialBackground = Self.windowShotBackground(for: image, captureRect: historyItem?.captureRect?.cgRect)
-        } else if let defaultOptions = TemplateStore.defaultBackgroundOptions(for: Self.screenContaining(historyItem?.captureRect?.cgRect)) {
-            initialBackground = defaultOptions   // default template: open composed
+            openingPresetName = nil
+        } else if let defaultTemplate = TemplateStore.defaultTemplate, defaultTemplate.background.isEnabled {
+            initialBackground = defaultTemplate.background
+                .resolvingDesktopWallpaper(for: Self.screenContaining(historyItem?.captureRect?.cgRect))
+            openingPresetName = defaultTemplate.name
         } else {
             initialBackground = .editorDefault   // isEnabled == false: raw shot
+            openingPresetName = nil
         }
         let canvasSize = ScreenshotBackgroundComposer.outputPointSize(for: image.size, options: initialBackground)
         let toolbarHeight = Self.toolbarHeight
@@ -221,6 +230,13 @@ final class AnnotationWindowController: NSWindowController {
         // initial `options`); the canvas is resized to the composed size below,
         // after the view hierarchy exists.
         backgroundOptions = initialBackground
+
+        // Reflect what the editor opened with in the preset dropdown: a shot composed
+        // from the default preset opens with that preset SELECTED and as the edit
+        // base, so tweaking it offers "Save Changes to <name>"; a raw or window shot
+        // clears the selection so it reads as "Custom".
+        TemplateStore.setActive(name: openingPresetName)
+        TemplateStore.setEditingBase(name: openingPresetName)
 
         canvas.backgroundImage = image
         canvas.frame = NSRect(origin: .zero, size: canvasSize)

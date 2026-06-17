@@ -147,6 +147,26 @@ struct ScreenshotBackgroundOptions: Equatable, Codable {
         // Mono cream, near-white warm paper for light layouts.
         .init(name: "Mono Cream",    startHex: "#faf7f2", endHex: "#e6dfd2", accentHexes: ["#efe7d8", "#f5f0e8", "#ddd2c0"]),
 
+        // ── Expanded library: more curated vibes, same recipe (deep base, bright
+        // hero, three harmonious blooms). Vivid darks first.
+        .init(name: "Crimson Ember", startHex: "#1a0608", endHex: "#ff5a4f", accentHexes: ["#ff3b5f", "#ff8a5a", "#c0304a"]),
+        .init(name: "Teal Lagoon",   startHex: "#03201f", endHex: "#36d6c0", accentHexes: ["#2ec0c0", "#7fe6d0", "#2a9aa0"]),
+        .init(name: "Plum Wine",     startHex: "#1a0820", endHex: "#b85cc0", accentHexes: ["#9a3fb0", "#e07ad0", "#6a2f8a"]),
+        .init(name: "Forest",        startHex: "#04160e", endHex: "#4fb86a", accentHexes: ["#2fa05a", "#9ad97a", "#2a7a4a"]),
+        .init(name: "Neon Sunset",   startHex: "#1a0526", endHex: "#ff5fae", accentHexes: ["#ff4f8f", "#ff9a5a", "#8f4fff"]),
+        .init(name: "Tangerine",     startHex: "#1e0c03", endHex: "#ff8a2a", accentHexes: ["#ff6f2a", "#ffb05a", "#e0541f"]),
+        .init(name: "Indigo Night",  startHex: "#060a24", endHex: "#4a5cc0", accentHexes: ["#3a4ad9", "#6f7ae0", "#2a3580"]),
+        .init(name: "Steel Blue",    startHex: "#0a1018", endHex: "#5a7896", accentHexes: ["#43607e", "#8fa8c0", "#36506a"]),
+        .init(name: "Mocha",         startHex: "#160d08", endHex: "#c08a5a", accentHexes: ["#a8693f", "#e0b088", "#7a4f30"]),
+        .init(name: "Obsidian",      startHex: "#050608", endHex: "#2a3344", accentHexes: ["#3a4660", "#586a90", "#20283a"]),
+
+        // Light & airy palettes (the mesh's light branch keeps these clean).
+        .init(name: "Arctic",        startHex: "#eef5fb", endHex: "#c4dcf0", accentHexes: ["#d6e8f7", "#b0d0ec", "#cfe0f0"]),
+        .init(name: "Honey",         startHex: "#faf0d8", endHex: "#f0c070", accentHexes: ["#f5d28a", "#e8b25a", "#f7e0a8"]),
+        .init(name: "Blush",         startHex: "#fbeef0", endHex: "#f2c0cc", accentHexes: ["#f7d2da", "#ecb0c0", "#f5c8d4"]),
+        .init(name: "Sea Foam",      startHex: "#e8f7f0", endHex: "#aee0cc", accentHexes: ["#c8ecdc", "#9ad6c0", "#d2f0e4"]),
+        .init(name: "Glacier",       startHex: "#eaf2f8", endHex: "#bcd6e8", accentHexes: ["#d0e4f0", "#a8c8e0", "#c4dcec"]),
+
         // Flowing-wave palettes: organic layered waves over the mesh base.
         // Warm amber dune light rolling over deep umber.
         .init(name: "Amber Flow",    startHex: "#20100a", endHex: "#ff9a4f", accentHexes: ["#ff7a3f", "#ffc070", "#d9543f"], waves: true),
@@ -157,7 +177,12 @@ struct ScreenshotBackgroundOptions: Equatable, Codable {
         // Vivid magenta surf over a dark plum sea.
         .init(name: "Magenta Tide",  startHex: "#240a2e", endHex: "#ff6fd9", accentHexes: ["#d94fff", "#ff8fa8", "#8f3fd9"], waves: true),
         // Deep violet rollers with a soft lavender crest.
-        .init(name: "Violet Surge",  startHex: "#160a33", endHex: "#8f6fff", accentHexes: ["#6f4fe0", "#b08fff", "#4f2fa8"], waves: true)
+        .init(name: "Violet Surge",  startHex: "#160a33", endHex: "#8f6fff", accentHexes: ["#6f4fe0", "#b08fff", "#4f2fa8"], waves: true),
+        // Berry, cosmic, citrus and jade flows round out the wave set.
+        .init(name: "Berry Smoothie", startHex: "#200a26", endHex: "#e65fb0", accentHexes: ["#c04fd9", "#ff7a9a", "#8f3fb0"], waves: true),
+        .init(name: "Cosmic",         startHex: "#08061e", endHex: "#6f5cf0", accentHexes: ["#9a4fff", "#ff5fd0", "#3f4fd9"], waves: true),
+        .init(name: "Tangerine Tide", startHex: "#200d04", endHex: "#ff8a3f", accentHexes: ["#ff6f3a", "#ffbf6a", "#d9542f"], waves: true),
+        .init(name: "Jade Flow",      startHex: "#042018", endHex: "#3fd699", accentHexes: ["#2ec0a0", "#8fe6b0", "#2a9a78"], waves: true)
     ]
 
     static let editorDefault = ScreenshotBackgroundOptions(

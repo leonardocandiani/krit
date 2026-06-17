@@ -190,6 +190,24 @@ extension TemplateStore {
         Settings.activePresetName = name ?? ""
     }
 
+    /// The preset the user STARTED from in this editor, kept even after they
+    /// hand-edit the background (unlike `activePreset`, which drops to nil on any
+    /// divergence). It lets the sidebar offer "Save Changes to <name>" so an edited
+    /// preset can be updated in place instead of only saved as a brand-new copy.
+    /// In-memory for the app run; applying a built-in / previous / none clears it.
+    @MainActor private static var editingBaseName: String?
+
+    @MainActor
+    static var editingBase: EditTemplate? {
+        guard let editingBaseName, !editingBaseName.isEmpty else { return nil }
+        return all().first { $0.name.caseInsensitiveCompare(editingBaseName) == .orderedSame }
+    }
+
+    @MainActor
+    static func setEditingBase(name: String?) {
+        editingBaseName = name
+    }
+
     /// Snapshots the background that was active right before a preset is applied, so
     /// "Apply Previous Settings" can restore it.
     @MainActor
