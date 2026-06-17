@@ -67,6 +67,10 @@ final class UITestRunner: NSObject {
             case "overlay-trace": report = await Self.runOverlayCaptureTrace()
             case "window-capture": report = await Self.runWindowCaptureSuite()
             case "history-restore": report = await Self.runHistoryRestoreSuite()
+            case "preset-gallery": report = await Self.runPresetGallery()
+            case "preset-save": report = await Self.runPresetSaveSuite()
+            case "preset-default-open": report = await Self.runPresetDefaultOpenSuite()
+            case "highlighter-partial": report = await Self.runHighlighterPartialSuite()
             case "ocr":          report = await Self.runOCRSuite()
             case "shadow-sweep": report = Self.runShadowSweep()
             case "window-editor": report = await Self.runWindowEditorSuite()
@@ -100,6 +104,9 @@ final class UITestRunner: NSObject {
             case "arrow-scale": report = await Self.runArrowScale()
             case "editor-off-render": report = await Self.runEditorOffRender()
             case "export-formats": report = await Self.runExportFormats()
+            case "overlay-conveyor": report = await Self.runOverlayConveyor()
+            case "overlay-space-stress": report = await Self.runOverlaySpaceStress()
+            case "overlay-park-capture": report = await Self.runOverlayParkCapture()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -107,6 +114,273 @@ final class UITestRunner: NSObject {
                 try? data.write(to: URL(fileURLWithPath: outPath))
             }
         }
+    }
+
+    // MARK: - Cenário: overlay-conveyor (esteira: stack inteira segue o standby)
+
+    /// Prova a "esteira": com 3 cards empilhados, puxar o de baixo pra standby move
+    /// TODOS juntos como um cinto (não só o agarrado), e o cancel traz todos de
+    /// volta. Usa o hook direto (sem mouse sintético) porque o drag real é síncrono
+    /// e trava o main thread, e porque evento sintético brigaria com o cursor real.
+    private static func runOverlayConveyor() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        func makeCard(_ i: Int, _ color: NSColor) {
+            let img = NSImage(size: NSSize(width: 300, height: 200))
+            img.lockFocus(); color.setFill(); NSRect(x: 0, y: 0, width: 300, height: 200).fill(); img.unlockFocus()
+            let p = "/tmp/krit-conveyor-\(i).png"
+            if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: p))
+            }
+            let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: p, thumbnailPath: p, captureRect: nil)
+            QuickAccessOverlay.show(image: img, historyItem: item,
+                                    historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        }
+        let before = QuickAccessOverlay.uiTestWindows.count
+        makeCard(0, .systemRed);   try? await Task.sleep(nanoseconds: 500_000_000)
+        makeCard(1, .systemGreen); try? await Task.sleep(nanoseconds: 500_000_000)
+        makeCard(2, .systemBlue);  try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let count = QuickAccessOverlay.uiTestWindows.count - before
+        r["cardCount"] = count
+        guard count >= 3 else { r["error"] = "cards did not appear (\(count))"; r["allPass"] = false; return r }
+
+        let beforeOrigins = QuickAccessOverlay.uiTestStackOrigins(on: NSScreen.main)
+        r["beforeOrigins"] = beforeOrigins
+        let dy: CGFloat = -120
+        let moved = QuickAccessOverlay.uiTestConveyorStep(dy: dy)
+        r["movedOrigins"] = moved
+        // Every card must have dropped by ~|dy| (tolerance 2pt) = moved as one belt.
+        var allMoved = moved.count == beforeOrigins.count && !moved.isEmpty
+        for (b, m) in zip(beforeOrigins, moved) {
+            let delta = (m["y"] ?? 0) - (b["y"] ?? 0)
+            if abs(delta - Double(dy)) > 2 { allMoved = false }
+        }
+        r["allMovedTogether"] = allMoved
+
+        QuickAccessOverlay.uiTestConveyorReset()
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        let afterOrigins = QuickAccessOverlay.uiTestStackOrigins(on: NSScreen.main)
+        r["afterOrigins"] = afterOrigins
+        var allHome = afterOrigins.count == beforeOrigins.count
+        for (b, a) in zip(beforeOrigins, afterOrigins) {
+            if abs((a["y"] ?? 0) - (b["y"] ?? 0)) > 2 { allHome = false }
+        }
+        r["allHomeAfterReset"] = allHome
+
+        // Phase 2: a REAL synthetic mouse drag (not the hook) on the newest card,
+        // straight down past the standby threshold, must park the WHOLE stack, not
+        // just the grabbed card. Proves the live gesture path (handleThumbDrag →
+        // cardDragUpdate → applyConveyor → parkAll) end to end. Flaky if the
+        // physical cursor competes, so it re-arms hover until the card is key.
+        guard let newest = QuickAccessOverlay.uiTestWindows.last else {
+            r["error"] = "no newest card for live drag"; r["allPass"] = false; return r
+        }
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        func cg(_ pnt: NSPoint) -> CGPoint { CGPoint(x: pnt.x, y: primaryH - pnt.y) }
+        func post(_ type: CGEventType, _ pt: CGPoint) {
+            CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pt, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+        }
+        func center() -> CGPoint { cg(NSPoint(x: newest.frame.midX, y: newest.frame.midY)) }
+        func hover() async {
+            post(.mouseMoved, CGPoint(x: center().x - 25, y: center().y))
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            post(.mouseMoved, center())
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        for _ in 0..<6 {
+            await hover()
+            if (QuickAccessOverlay.uiTestHoverState()["isKey"] as? Bool) == true { break }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        let dragStart = center()
+        post(.leftMouseDown, dragStart); try? await Task.sleep(nanoseconds: 60_000_000)
+        var dp = dragStart
+        for _ in 0..<8 { dp.y += 90.0 / 8.0; post(.leftMouseDragged, dp); try? await Task.sleep(nanoseconds: 16_000_000) }
+        post(.leftMouseUp, dp); try? await Task.sleep(nanoseconds: 1_000_000_000)
+        // Trace from DURING the gesture (set by applyConveyor): the real drag must
+        // have translated BOTH siblings while pulling, not only parked them at the
+        // end. This is what distinguishes the conveyor from the old per-card park.
+        let trace = QuickAccessOverlay.uiTestConveyorTrace()
+        r["liveDragTrace"] = trace
+        let siblingsMovedDuringDrag = (trace["siblingsMoved"] ?? 0) >= 2   // 3 cards → 2 siblings
+        let beltDropSeen = (trace["maxDrop"] ?? 0) >= 40                   // belt traveled real distance
+        r["siblingsMovedDuringDrag"] = siblingsMovedDuringDrag
+        r["beltDropSeen"] = beltDropSeen
+        let states = QuickAccessOverlay.uiTestStandbyStates()
+        let liveDragParkedAll = !states.isEmpty && states.allSatisfy { $0 }
+        r["liveDragStates"] = states
+        r["liveDragParkedAll"] = liveDragParkedAll
+
+        // Restore must bring the WHOLE stack back up together (subir = mesma regra).
+        QuickAccessOverlay.uiTestRestoreAll(on: NSScreen.main)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        let restoredStates = QuickAccessOverlay.uiTestStandbyStates()
+        let restoredAll = !restoredStates.isEmpty && restoredStates.allSatisfy { !$0 }
+        r["restoredAll"] = restoredAll
+
+        for _ in 0..<count {
+            QuickAccessOverlay.uiTestCloseNewest()
+            try? await Task.sleep(nanoseconds: 120_000_000)
+        }
+        r["allPass"] = allMoved && allHome && liveDragParkedAll
+            && siblingsMovedDuringDrag && beltDropSeen && restoredAll
+        return r
+    }
+
+    // MARK: - Cenário: overlay-park-capture (print com hide continua a mesma sessão)
+
+    /// Prova o fix do "print com a stack em hide cria sessão nova": parka 2 cards,
+    /// depois 'captura' um 3º (QuickAccessOverlay.show, o mesmo caminho da captura
+    /// real). Esperado: a stack restaura e o novo card entra numa ÚNICA sessão
+    /// contínua (zero parked, 3 visíveis), não um card solto ao lado do handle.
+    /// Hook direto, sem mouse sintético (não briga com o cursor).
+    private static func runOverlayParkCapture() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        func makeCard(_ i: Int, _ color: NSColor) {
+            let img = NSImage(size: NSSize(width: 300, height: 200))
+            img.lockFocus(); color.setFill(); NSRect(x: 0, y: 0, width: 300, height: 200).fill(); img.unlockFocus()
+            let p = "/tmp/krit-parkcap-\(i).png"
+            if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: p))
+            }
+            let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: p, thumbnailPath: p, captureRect: nil)
+            QuickAccessOverlay.show(image: img, historyItem: item,
+                                    historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        }
+        let before = QuickAccessOverlay.uiTestWindows.count
+        makeCard(0, .systemRed); try? await Task.sleep(nanoseconds: 450_000_000)
+        makeCard(1, .systemGreen); try? await Task.sleep(nanoseconds: 800_000_000)
+        let count = QuickAccessOverlay.uiTestWindows.count - before
+        guard count >= 2 else { r["error"] = "cards did not appear (\(count))"; r["allPass"] = false; return r }
+
+        // Hide the whole stack (standby).
+        QuickAccessOverlay.uiTestParkAll(on: NSScreen.main)
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        let parkedBefore = QuickAccessOverlay.uiTestParkedCount()
+        r["parkedAfterHide"] = parkedBefore
+
+        // 'Capture' a new shot while hidden — the real capture path.
+        makeCard(2, .systemBlue)
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let parkedAfter = QuickAccessOverlay.uiTestParkedCount()
+        let visible = QuickAccessOverlay.uiTestStandbyStates()
+        r["parkedAfterCapture"] = parkedAfter
+        r["standbyStatesAfter"] = visible
+        // Pass: the stack was hidden (≥2 parked), then a capture restored everyone
+        // into ONE continuing session (0 parked, all visible) with the new card.
+        let continued = parkedBefore >= 2 && parkedAfter == 0
+            && !visible.isEmpty && visible.allSatisfy { !$0 }
+        r["continuedSameSession"] = continued
+
+        for _ in 0..<(count + 1) {
+            QuickAccessOverlay.uiTestCloseNewest()
+            try? await Task.sleep(nanoseconds: 120_000_000)
+        }
+        r["allPass"] = continued
+        return r
+    }
+
+    // MARK: - Cenário: overlay-space-stress (abrir Space N vezes não pode quebrar)
+
+    /// Martela o Space: abre/fecha o companion N vezes seguidas e exige que TODA
+    /// iteração abra E feche, e que o drag (standby) ainda funcione depois de toda
+    /// a repetição. Cobre o "abro o Space algumas vezes e ele falha". Usa CGEvent
+    /// (precisa de Accessibility/Input Monitoring no app de teste, como os outros
+    /// cenários de gesto); pode flakear se o cursor físico disputar, por isso
+    /// re-arma o hover até o card virar key antes de cada Space.
+    private static func runOverlaySpaceStress() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        let before = QuickAccessOverlay.uiTestWindows.count
+        let img = NSImage(size: NSSize(width: 300, height: 200))
+        img.lockFocus(); NSColor.systemPurple.setFill(); NSRect(x: 0, y: 0, width: 300, height: 200).fill(); img.unlockFocus()
+        let p = "/tmp/krit-space-stress.png"
+        if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: p))
+        }
+        let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: p, thumbnailPath: p, captureRect: nil)
+        QuickAccessOverlay.show(image: img, historyItem: item,
+                                historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        guard QuickAccessOverlay.uiTestWindows.count > before,
+              let card = QuickAccessOverlay.uiTestWindows.last else {
+            r["error"] = "card did not appear"; r["allPass"] = false; return r
+        }
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        func cg(_ pnt: NSPoint) -> CGPoint { CGPoint(x: pnt.x, y: primaryH - pnt.y) }
+        func post(_ type: CGEventType, _ pt: CGPoint) {
+            CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pt, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+        }
+        func center() -> CGPoint { cg(NSPoint(x: card.frame.midX, y: card.frame.midY)) }
+        func hover() async {
+            post(.mouseMoved, CGPoint(x: center().x - 25, y: center().y))
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            post(.mouseMoved, center())
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        func armCard() async -> Bool {
+            for _ in 0..<6 {
+                await hover()
+                if (QuickAccessOverlay.uiTestHoverState()["isKey"] as? Bool) == true { return true }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            return false
+        }
+        func postKey(_ code: CGKeyCode, down: Bool) {
+            CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)?.post(tap: .cghidEventTap)
+        }
+        let iterations = 10
+        var opens = 0, closes = 0, armedCount = 0
+        var perIter: [[String: Any]] = []
+        for i in 0..<iterations {
+            let armed = await armCard()
+            if armed { armedCount += 1 }
+            postKey(49, down: true); postKey(49, down: false)
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            let opened = QuickLookController.shared.isOpen
+            if opened { opens += 1 }
+            postKey(49, down: true); postKey(49, down: false)
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            let closed = !QuickLookController.shared.isOpen
+            if closed { closes += 1 }
+            perIter.append(["i": i, "armed": armed, "opened": opened, "closed": closed,
+                            "keyGateDrop": QuickAccessOverlay.uiTestHoverState()["keyGateDrop"] as? Int ?? -1])
+        }
+        r["iterations"] = iterations
+        r["opens"] = opens; r["closes"] = closes; r["armed"] = armedCount
+        r["perIter"] = perIter
+
+        // After the Space churn the DRAG must still work: standby past 50pt parks.
+        func dragFrom(_ start: CGPoint, by: CGVector, steps: Int, settleNs: UInt64) async {
+            post(.leftMouseDown, start); try? await Task.sleep(nanoseconds: 60_000_000)
+            var pt = start
+            for _ in 0..<steps {
+                pt.x += by.dx / CGFloat(steps); pt.y += by.dy / CGFloat(steps)
+                post(.leftMouseDragged, pt); try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+            post(.leftMouseUp, pt); try? await Task.sleep(nanoseconds: settleNs)
+        }
+        _ = await armCard()
+        await dragFrom(center(), by: CGVector(dx: 0, dy: 90), steps: 8, settleNs: 900_000_000)
+        let dragWorks = QuickAccessOverlay.uiTestStandbyStates().last == true
+        r["dragWorksAfterStress"] = dragWorks
+        if dragWorks { QuickAccessOverlay.uiTestRestoreAll(on: NSScreen.main); try? await Task.sleep(nanoseconds: 500_000_000) }
+        QuickAccessOverlay.uiTestCloseNewest()
+
+        r["allPass"] = (opens == iterations) && (closes == iterations) && dragWorks
+        return r
     }
 
     // MARK: - Cenário: export-formats (encode por formato via o caminho REAL)
@@ -1256,6 +1530,280 @@ final class UITestRunner: NSObject {
         }
 
         r["allPass"] = usesPresented && floated
+        return r
+    }
+
+    // MARK: - Cenário: preset-save (editar um preset e salvar as mudanças nele)
+    //
+    // Prova a queixa "to com o preset selecionado, edito, e preciso poder salvar":
+    // o edit base persiste pela edição (diferente do activePreset, que cai pra nil),
+    // "Save Changes" grava a config editada NO preset (update, não duplica) e o
+    // preset volta a ficar selecionado (sem o badge "(edited)"). Testa o caminho
+    // do store que o sidebar chama.
+
+    private static func runPresetSaveSuite() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let testName = "UITestPreset_SaveFlow"
+        if let existing = TemplateStore.all().first(where: { $0.name == testName }) {
+            TemplateStore.delete(id: existing.id)
+        }
+        TemplateStore.setActive(name: nil)
+        TemplateStore.setEditingBase(name: nil)
+
+        // Editor hosts the real background sidebar whose dropdown we inspect.
+        let img = NSImage(size: NSSize(width: 600, height: 400))
+        img.lockFocus(); NSColor.gray.setFill(); NSRect(x: 0, y: 0, width: 600, height: 400).fill(); img.unlockFocus()
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController,
+              let sidebar = ctrl.uiTestSidebar else {
+            r["error"] = "editor/sidebar did not open"; r["allPass"] = false; return r
+        }
+        defer { ctrl.window?.close() }
+
+        // 1. Base preset (padding 40), selected and marked as the edit base.
+        var base = ScreenshotBackgroundOptions.editorDefault
+        base.isEnabled = true
+        base.style = .gradient
+        base.padding = 40
+        guard let created = TemplateStore.add(name: testName, background: base) else {
+            r["error"] = "add failed"; r["allPass"] = false; return r
+        }
+        TemplateStore.setActive(name: testName)
+        TemplateStore.setEditingBase(name: testName)
+        ctrl.uiTestApplyBackground(base)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let titlesClean = sidebar.uiTestPresetMenuTitles()
+        r["menuClean"] = titlesClean
+        let cleanShowsName = titlesClean.first == testName
+        let cleanHasNoSave = !titlesClean.contains { $0.contains("Save Changes") }
+        r["cleanShowsName"] = cleanShowsName
+        r["cleanHasNoSave"] = cleanHasNoSave
+
+        // 2. Hand-edit (padding 120) through the REAL options path -> "(edited)".
+        var edited = base; edited.padding = 120
+        ctrl.uiTestApplyBackground(edited)
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let titlesEdited = sidebar.uiTestPresetMenuTitles()
+        r["menuEdited"] = titlesEdited
+        let editedBadge = titlesEdited.contains { $0 == "\(testName) (edited)" }
+        let hasSaveItem = titlesEdited.contains { $0.contains("Save Changes to") && $0.contains(testName) }
+        r["editedBadge"] = editedBadge
+        r["hasSaveItem"] = hasSaveItem
+
+        // 3. Save the edits back into the SAME preset (the store path the menu item
+        //    triggers): no duplicate, the saved config carries the edit.
+        _ = TemplateStore.update(id: created.id, background: edited)
+        TemplateStore.setActive(name: testName)
+        let copies = TemplateStore.all().filter { $0.name == testName }.count
+        let savedPadding = TemplateStore.template(named: testName)?.background.padding ?? -1
+        r["copies"] = copies
+        r["savedPadding"] = savedPadding
+
+        // cleanup
+        if let s = TemplateStore.template(named: testName) { TemplateStore.delete(id: s.id) }
+        TemplateStore.setEditingBase(name: nil)
+        TemplateStore.setActive(name: nil)
+
+        r["allPass"] = cleanShowsName && cleanHasNoSave && editedBadge && hasSaveItem
+            && copies == 1 && abs(savedPadding - 120) < 0.5
+        return r
+    }
+
+    // MARK: - Cenário: highlighter-partial (grifador segue o swipe, não a linha toda)
+    //
+    // Renderiza uma frase, roda o OCR real e faz um swipe sobre ~40% da linha. Prova
+    // que o grifo cobre só o trecho percorrido (como marca-texto de verdade), não a
+    // linha inteira (o bug), e que um swipe na linha toda ainda grifa tudo.
+
+    private static func runHighlighterPartialSuite() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        // Open raw (no default background) so OCR maps onto the full canvas slot.
+        let savedDefault = TemplateStore.defaultTemplate?.name
+        TemplateStore.setDefault(name: nil)
+        defer { TemplateStore.setDefault(name: savedDefault) }
+
+        let size = NSSize(width: 900, height: 300)
+        let img = NSImage(size: size)
+        img.lockFocus()
+        NSColor.white.setFill(); NSRect(origin: .zero, size: size).fill()
+        ("The quick brown fox jumps over the lazy dog" as NSString).draw(
+            at: NSPoint(x: 40, y: 130),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 40, weight: .semibold),
+                             .foregroundColor: NSColor.black])
+        img.unlockFocus()
+
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController else {
+            r["error"] = "editor did not open"; r["allPass"] = false; return r
+        }
+        defer { ctrl.window?.close() }
+        let canvas = ctrl.uiTestCanvas
+
+        await canvas.uiTestWarmTextDetection()
+        let lineRects = canvas.uiTestDetectedLineRects()
+        r["detectedLines"] = lineRects.count
+        guard let line = lineRects.max(by: { $0.width < $1.width }) else {
+            r["error"] = "no text detected"; r["allPass"] = false; return r
+        }
+        let fullWidth = line.width
+        r["fullLineWidth"] = Int(fullWidth)
+
+        // Swipe the LEFT ~40% of the line only.
+        let y = line.midY
+        let partial = canvas.uiTestSnappedHighlightRects(
+            from: CGPoint(x: line.minX + 2, y: y),
+            to: CGPoint(x: line.minX + fullWidth * 0.4, y: y))
+        r["snappedCount"] = partial.count
+        guard let hi = partial.first else {
+            r["error"] = "no snap (band missed the line)"; r["allPass"] = false; return r
+        }
+        let ratio = hi.width / fullWidth
+        r["partialWidth"] = Int(hi.width)
+        r["ratio"] = ratio
+        // The bug highlighted the whole line (ratio ~1.0). A real marker follows the
+        // swipe, so ~0.4 here; allow slack but it must be clearly under the full line.
+        let isPartial = ratio < 0.7
+        let coversSwept = hi.width > fullWidth * 0.2
+        r["isPartial"] = isPartial
+        r["coversSwept"] = coversSwept
+
+        // A full-line swipe still highlights essentially the whole line.
+        let full = canvas.uiTestSnappedHighlightRects(
+            from: CGPoint(x: line.minX - 5, y: y),
+            to: CGPoint(x: line.maxX + 5, y: y))
+        let fullW = full.first?.width ?? 0
+        let fullStillWorks = fullW > fullWidth * 0.9
+        r["fullSwipeWidth"] = Int(fullW)
+        r["fullStillWorks"] = fullStillWorks
+
+        r["allPass"] = isPartial && coversSwept && fullStillWorks
+        return r
+    }
+
+    // MARK: - Cenário: preset-default-open (print com preset padrão abre SELECIONADO)
+    //
+    // Reproduz a queixa: um print tirado com o preset definido como padrão abria no
+    // editor como "Custom", então editar criava um template novo em vez de oferecer
+    // "Save Changes". Prova que o editor agora abre com o preset padrão SELECIONADO
+    // e que editar acende o "Save Changes to <name>".
+
+    private static func runPresetDefaultOpenSuite() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let testName = "UITestPreset_DefaultOpen"
+        let savedDefault = TemplateStore.defaultTemplate?.name
+        if let existing = TemplateStore.all().first(where: { $0.name == testName }) {
+            TemplateStore.delete(id: existing.id)
+        }
+
+        // 1. A gradient preset, pinned as the default for new captures.
+        var bg = ScreenshotBackgroundOptions.editorDefault
+        bg.isEnabled = true
+        bg.style = .gradient
+        bg.padding = 64
+        guard TemplateStore.add(name: testName, background: bg) != nil else {
+            r["error"] = "add failed"; r["allPass"] = false; return r
+        }
+        TemplateStore.setDefault(name: testName)
+
+        // 2. A fresh capture (no historyItem) opens composed from the default preset.
+        let img = NSImage(size: NSSize(width: 600, height: 400))
+        img.lockFocus(); NSColor.gray.setFill(); NSRect(x: 0, y: 0, width: 600, height: 400).fill(); img.unlockFocus()
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController,
+              let sidebar = ctrl.uiTestSidebar else {
+            TemplateStore.setDefault(name: savedDefault)
+            if let s = TemplateStore.template(named: testName) { TemplateStore.delete(id: s.id) }
+            r["error"] = "editor/sidebar did not open"; r["allPass"] = false; return r
+        }
+        defer {
+            ctrl.window?.close()
+            TemplateStore.setDefault(name: savedDefault)
+            if let s = TemplateStore.template(named: testName) { TemplateStore.delete(id: s.id) }
+            TemplateStore.setEditingBase(name: nil)
+            TemplateStore.setActive(name: nil)
+        }
+
+        // 3. On open the dropdown shows the preset SELECTED, not "Custom".
+        let onOpen = sidebar.uiTestPresetMenuTitles()
+        r["menuOnOpen"] = onOpen
+        let selectedOnOpen = onOpen.first == testName
+        r["selectedOnOpen"] = selectedOnOpen
+
+        // 4. Editing it offers "Save Changes to <name>" (not only a new template).
+        var edited = bg; edited.padding = 130
+        ctrl.uiTestApplyBackground(edited)
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let onEdit = sidebar.uiTestPresetMenuTitles()
+        r["menuOnEdit"] = onEdit
+        let hasSave = onEdit.contains { $0.contains("Save Changes to") && $0.contains(testName) }
+        r["hasSaveAfterEdit"] = hasSave
+
+        r["allPass"] = selectedOnOpen && hasSave
+        return r
+    }
+
+    // MARK: - Cenário: preset-gallery (contact sheet de TODOS os wallpapers curados)
+    //
+    // Compõe cada preset de `imagePresets` (mesh + waves) com um card neutro no
+    // caminho real (composeIfNeeded) e tila num contact sheet pra revisão visual
+    // do set inteiro de uma vez. Diagnóstico sob demanda, não entra na bateria.
+
+    private static func runPresetGallery() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let presets = ScreenshotBackgroundOptions.imagePresets
+        r["count"] = presets.count
+        r["names"] = presets.map { $0.name }
+
+        // Small neutral card so the swatch reads like a real composed shot while
+        // the mesh fills most of the tile.
+        let card = NSImage(size: NSSize(width: 90, height: 58))
+        card.lockFocus()
+        NSColor(srgbRed: 0.13, green: 0.14, blue: 0.17, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: 90, height: 58).fill()
+        card.unlockFocus()
+
+        let cols = 6
+        let tileW: CGFloat = 200, tileH: CGFloat = 150, labelH: CGFloat = 22, pad: CGFloat = 10
+        let rows = (presets.count + cols - 1) / cols
+        let sheetW = CGFloat(cols) * (tileW + pad) + pad
+        let sheetH = CGFloat(rows) * (tileH + labelH + pad) + pad
+
+        let sheet = NSImage(size: NSSize(width: sheetW, height: sheetH))
+        sheet.lockFocus()
+        NSColor(srgbRed: 0.08, green: 0.08, blue: 0.09, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: sheetW, height: sheetH).fill()
+
+        for (i, preset) in presets.enumerated() {
+            var opts = ScreenshotBackgroundOptions.editorDefault
+            opts.isEnabled = true
+            opts.style = .image
+            opts.presetName = preset.name
+            opts.customImageData = nil
+            opts.padding = 60
+            let composed = ScreenshotBackgroundComposer.composeIfNeeded(card, options: opts)
+            let col = i % cols, row = i / cols
+            let x = pad + CGFloat(col) * (tileW + pad)
+            let y = sheetH - (CGFloat(row + 1) * (tileH + labelH + pad)) + pad
+            composed.draw(in: NSRect(x: x, y: y + labelH, width: tileW, height: tileH),
+                          from: .zero, operation: .copy, fraction: 1.0)
+            (preset.name as NSString).draw(at: NSPoint(x: x + 2, y: y + 2), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.white,
+            ])
+        }
+        sheet.unlockFocus()
+
+        try? FileManager.default.createDirectory(atPath: "/tmp/krit-presets", withIntermediateDirectories: true)
+        let path = "/tmp/krit-presets/gallery.png"
+        if let tiff = sheet.tiffRepresentation,
+           let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: path))
+            r["gallery"] = path
+        }
+        r["allPass"] = (r["gallery"] != nil)
         return r
     }
 

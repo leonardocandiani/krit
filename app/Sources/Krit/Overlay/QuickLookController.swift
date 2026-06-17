@@ -126,7 +126,12 @@ private final class SpacePreviewWindow: NSWindow {
             : 16.0 / 10.0
         let maxW = (vf.width - 2 * screenInset) * maxFraction
         let maxH = (vf.height - 2 * screenInset) * maxFraction
-        var w = maxW
+        // Never enlarge past the print's native size: the preview must SHOW the
+        // real print, not an interpolated blow-up. A small shot stays faithful and
+        // crisp (it was ballooned to 62% of the screen and went blurry, not
+        // matching the saved file); big shots still shrink to fit. Same rule the
+        // editor uses (fit never zooms past 100%).
+        var w = min(maxW, image.size.width)
         var h = w / aspect
         if h > maxH { h = maxH; w = h * aspect }
         return NSSize(width: round(w), height: round(h))

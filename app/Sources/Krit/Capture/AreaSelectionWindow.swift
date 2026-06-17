@@ -223,7 +223,13 @@ private final class SelectionOverlayWindow: NSPanel {
         )
         isOpaque = false
         backgroundColor = .clear
-        level = .screenSaver
+        // Shielding level (the capture-overlay level macOS uses for the login/screen
+        // shield) instead of .screenSaver: some apps float their own window ABOVE
+        // .screenSaver (Zentty and other always-on-top typing/teleprompter tools),
+        // and at .screenSaver the selection sat UNDER them, so you could only draw
+        // the rect on the bare sides, never over the app you wanted to shoot. Still
+        // a non-activating panel, so that app stays frontmost underneath.
+        level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         ignoresMouseEvents = false
         acceptsMouseMovedEvents = true
         hidesOnDeactivate = false

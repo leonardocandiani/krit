@@ -24,6 +24,12 @@ final class QuickAccessOverlay {
     @discardableResult
     static func show(image: NSImage, historyItem: HistoryItem, historyManager: HistoryManager,
                      screen: NSScreen? = nil, entrance: EntranceStyle = .slide) -> NSRect {
+        // Continue the SAME session: if this screen's stack is tucked in standby, a
+        // new capture restores it so the shot joins one continuing stack instead of
+        // spawning a parallel session beside the lonely handle (owner-reported bug).
+        if QuickAccessWindow.hasParked(on: screen) {
+            QuickAccessWindow.restoreAll(on: screen)
+        }
         let window = QuickAccessWindow(image: image, historyItem: historyItem, historyManager: historyManager,
                                        screen: screen, entrance: entrance)
         window.show()
@@ -45,6 +51,9 @@ final class QuickAccessOverlay {
     /// screenshot history, so this path takes no HistoryItem.
     static func showVideo(url: URL, duration: Double, thumbnail: NSImage, isTemporary: Bool,
                           actions: RecordingResultActions?, screen: NSScreen? = nil) {
+        if QuickAccessWindow.hasParked(on: screen) {
+            QuickAccessWindow.restoreAll(on: screen)
+        }
         let payload = VideoCardPayload(
             url: url, duration: max(duration, 0), thumbnail: thumbnail,
             isTemporary: isTemporary, actions: actions
@@ -325,11 +334,22 @@ private final class QuickAccessWindow: NSWindow {
     /// and how many the hover/ownership gate dropped.
     nonisolated(unsafe) static var uiTestKeySeen = 0
     nonisolated(unsafe) static var uiTestKeyGateDrop = 0
+    /// Conveyor trace: proves the REAL (synchronous) drag actually translated the
+    /// siblings DURING the gesture, which an end-state "all parked" check can't tell
+    /// apart from the old per-card park. Reset at drag begin, written by applyConveyor.
+    nonisolated(unsafe) static var uiTestConveyorMaxDrop: CGFloat = 0
+    nonisolated(unsafe) static var uiTestConveyorSiblingsMoved = 0
     /// The app that was frontmost before this card borrowed the keyboard.
     private var borrowedFromApp: NSRunningApplication?
     private var cardDragStartMouse: NSPoint?
     private var cardDragStartOrigin: NSPoint?
     private var isCardDragging = false
+    /// Conveyor (the owner's "esteira"): when the live gesture is a downward
+    /// standby pull, the WHOLE stack of this screen follows the drag as one unit,
+    /// not just the grabbed card. Captured at drag begin (sibling cards + their
+    /// start origins) so the standby pull can translate them together and a cancel
+    /// springs them all back. Empty when this card is the only one on its screen.
+    private var conveyorSiblings: [(card: QuickAccessWindow, startOrigin: NSPoint)] = []
     /// Live gesture mode for the harness probe (uiTestGestureState). Set by the
     /// continuous classifier while a card-owned drag runs; back to .none on release.
     /// The card is pinned to the anchor line, so there is no free-move mode here.
@@ -475,7 +495,11 @@ private final class QuickAccessWindow: NSWindow {
             // O5': while zoomed the card owns the keyboard regardless of where the
             // cursor sits, so Space/Esc always collapse it (the hover gate would
             // otherwise drop the key the moment the mouse left the preview).
-            guard self.isPreviewZoomed || (self.mouseInsideOverlay && self.cursorOwnsThisCard()) else {
+            // Gate on a FRESH cursor read (cursorOwnsThisCard reads NSEvent.mouseLocation
+            // + z-order live), never the cached `mouseInsideOverlay` flag: after a few
+            // Space toggles that flag could latch stale and silently swallow the key,
+            // the "open Space a few times and it stops working" the owner hit.
+            guard self.isPreviewZoomed || self.cursorOwnsThisCard() else {
                 QuickAccessWindow.uiTestKeyGateDrop += 1
                 return event
             }
@@ -903,6 +927,15 @@ private final class QuickAccessWindow: NSWindow {
         cardDragStartMouse = NSEvent.mouseLocation
         cardDragStartOrigin = frame.origin
         isCardDragging = false
+        // Conveyor: snapshot every OTHER visible card on this screen with its
+        // current origin, so a downward standby pull can carry the whole stack as
+        // one belt and a cancel springs them all home. The grabbed card moves via
+        // cardDragUpdate; these siblings move only while the pull reads as standby.
+        conveyorSiblings = QuickAccessWindow.orderedStack(on: overlayScreen)
+            .filter { $0 !== self }
+            .map { (card: $0, startOrigin: $0.frame.origin) }
+        QuickAccessWindow.uiTestConveyorMaxDrop = 0
+        QuickAccessWindow.uiTestConveyorSiblingsMoved = 0
         dismissTimer?.invalidate()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
     }
@@ -915,8 +948,46 @@ private final class QuickAccessWindow: NSWindow {
         // 4pt threshold so a tiny accidental press doesn't move/delete.
         if !isCardDragging && (abs(dx) + abs(dy) < 4) { return }
         isCardDragging = true
-        setFrameOrigin(NSPoint(x: o0.x + dx, y: o0.y + dy))
+        let intent = dragClassify(dx: dx, dy: dy)?.intent
+        // Delete pulls the card toward the edge, so it follows the cursor freely on
+        // X. Everything else rides the vertical RAIL: while descending the belt, X
+        // locks to the slot so a sideways hand-drift never shoves the card off the
+        // column (owner: "na hora que tô descendo, não pode ser arrastado pro lado").
+        if intent == .delete {
+            setFrameOrigin(NSPoint(x: o0.x + dx, y: o0.y + dy))
+        } else {
+            setFrameOrigin(NSPoint(x: o0.x, y: o0.y + dy))
+        }
         updateDragHint(dx: dx, dy: dy)
+        // Conveyor (esteira): a downward standby pull carries the whole stack as
+        // one belt; delete/file/dead-zone leave the siblings home (per-card).
+        applyConveyor(dy: dy, active: intent == .standby)
+    }
+
+    /// Translate the captured sibling cards by `dy` (vertical only, the belt stays
+    /// in its column) while a standby pull is live, or snap them back to their
+    /// start origins otherwise. The grabbed card moves on its own (cardDragUpdate);
+    /// this only drives the rest of the stack so the minimize reads as one motion.
+    private func applyConveyor(dy: CGFloat, active: Bool) {
+        var moved = 0
+        for entry in conveyorSiblings {
+            let card = entry.card
+            guard !card.isClosing, !card.isParked, !card.isPreviewZoomed else { continue }
+            let targetY = active ? entry.startOrigin.y + dy : entry.startOrigin.y
+            card.setFrameOrigin(NSPoint(x: entry.startOrigin.x, y: targetY))
+            if active { moved += 1 }
+        }
+        if active && moved > 0 {
+            QuickAccessWindow.uiTestConveyorSiblingsMoved = max(QuickAccessWindow.uiTestConveyorSiblingsMoved, moved)
+            QuickAccessWindow.uiTestConveyorMaxDrop = max(QuickAccessWindow.uiTestConveyorMaxDrop, abs(dy))
+        }
+    }
+
+    /// Spring every conveyor sibling back to its live stack slot (standby cancel).
+    private func springConveyorBack() {
+        for entry in conveyorSiblings {
+            entry.card.animateToStackSlot()
+        }
     }
 
     /// G1: classify the live drag and how close it is to confirming, so the card
@@ -1012,7 +1083,7 @@ private final class QuickAccessWindow: NSWindow {
     }
 
     func cardDragEnd() {
-        defer { cardDragStartMouse = nil; cardDragStartOrigin = nil }
+        defer { cardDragStartMouse = nil; cardDragStartOrigin = nil; conveyorSiblings = [] }
         // The card followed the cursor through the whole drag, so by release the
         // cursor has wandered off the card's resting slot while mouseInsideOverlay /
         // isHovered still read the grab-time "inside" state. Any path that LEAVES
@@ -1052,6 +1123,9 @@ private final class QuickAccessWindow: NSWindow {
         default:
             clearDragHint()
             snapBackToSlot()
+            // Belt cancel: the whole stack followed the standby pull, so spring the
+            // siblings home alongside this card, not just this one.
+            springConveyorBack()
             resumeDismissIfNeeded()
             // Cancel/snap-back keeps the card alive: re-sync hover/key from the
             // cursor's real position so a SECOND gesture right after (the owner's
@@ -1108,6 +1182,10 @@ private final class QuickAccessWindow: NSWindow {
                 isCardDragging = false
                 clearDragHint()
                 snapBackToSlot()
+                // A standby pull before the inward turn may have carried the belt
+                // down; spring the siblings home (this branch skips cardDragEnd).
+                springConveyorBack()
+                conveyorSiblings = []
                 cardDragStartMouse = nil
                 cardDragStartOrigin = nil
                 _ = beginFileDrag(lastEvent)
@@ -2145,6 +2223,11 @@ private final class QuickAccessWindow: NSWindow {
         // The big preview carries its own "Space" pill; the small hint is a
         // one-shot at landing, so opening the preview just retires it.
         setSpaceHintVisible(false)
+        // Repeated Space must stay alive: re-assert key ownership so the NEXT Space
+        // reaches the local keyDown monitor. grabKey() is a no-op while we are still
+        // key, and re-borrows if the toggle churn cost us focus, killing the "open
+        // Space a few times and it stops responding" decay at its source.
+        if cursorOwnsThisCard() { grabKey() }
     }
 
     /// Once-per-install affordance: the Space hint shows at the landing of the
@@ -3352,6 +3435,18 @@ extension QuickAccessOverlay {
         QuickAccessWindow.restoreAll(on: screen)
     }
 
+    /// Parks the whole stack on `screen` (harness hook: simulates the standby drag
+    /// outcome so a scenario can test capture-while-hidden without synthetic input).
+    @MainActor static func uiTestParkAll(on screen: NSScreen?) {
+        QuickAccessWindow.parkAll(on: screen)
+    }
+
+    /// Standby flag per open card, paired with whether each is on `screen`, so a
+    /// scenario can assert the whole stack's hide/restore state.
+    @MainActor static func uiTestParkedCount() -> Int {
+        QuickAccessWindow.uiTestOpenWindows.compactMap { ($0 as? QuickAccessWindow)?.uiTestIsParked }.filter { $0 }.count
+    }
+
     /// Gesture-machine state of the newest card, for the harness to assert which
     /// pinned gesture a synthesized drag took. One of: "none" (no card), "closing",
     /// "zoom", "parked", "entering", "deleting" (toward the edge, trash), "standby"
@@ -3378,10 +3473,59 @@ extension QuickAccessOverlay {
         }
         return card.uiTestDragPrepProbe(forceInline: forceInline)
     }
+
+    /// Origins (oldest→newest) of the visible stack on `screen`, for the conveyor
+    /// harness to compare against a belt step.
+    @MainActor static func uiTestStackOrigins(on screen: NSScreen?) -> [[String: Double]] {
+        QuickAccessWindow.uiTestStackOrigins(on: screen)
+    }
+
+    /// Conveyor probe: exercise the belt directly (no synthetic mouse, so it never
+    /// fights a live cursor). Grabs the newest card, translates the WHOLE stack by
+    /// `dy` exactly as a live downward standby pull does, and returns each card's
+    /// origin so the harness can assert the stack moved as ONE.
+    @MainActor static func uiTestConveyorStep(dy: CGFloat) -> [[String: Double]] {
+        (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestConveyorStep(dy: dy) ?? []
+    }
+
+    /// Cancel the conveyor probe: spring the whole stack home (the standby-cancel path).
+    @MainActor static func uiTestConveyorReset() {
+        (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestConveyorReset()
+    }
+
+    /// Trace of the LAST real drag's belt: how many siblings the gesture translated
+    /// and the max downward displacement seen. Proves the live (synchronous) drag
+    /// moved the whole stack DURING the gesture, not just parked them at the end.
+    @MainActor static func uiTestConveyorTrace() -> [String: Double] {
+        [
+            "siblingsMoved": Double(QuickAccessWindow.uiTestConveyorSiblingsMoved),
+            "maxDrop": Double(QuickAccessWindow.uiTestConveyorMaxDrop),
+        ]
+    }
 }
 
 private extension QuickAccessWindow {
     static var uiTestOpenWindows: [NSWindow] { openWindows }
+    static func uiTestStackOrigins(on screen: NSScreen?) -> [[String: Double]] {
+        orderedStack(on: screen).map { ["x": Double($0.frame.origin.x), "y": Double($0.frame.origin.y)] }
+    }
+    /// Snapshot the siblings, then translate the whole stack by `dy` exactly as a
+    /// live standby pull does. Returns every visible card's origin (oldest→newest).
+    func uiTestConveyorStep(dy: CGFloat) -> [[String: Double]] {
+        conveyorSiblings = QuickAccessWindow.orderedStack(on: overlayScreen)
+            .filter { $0 !== self }
+            .map { (card: $0, startOrigin: $0.frame.origin) }
+        cardDragStartOrigin = frame.origin
+        setFrameOrigin(NSPoint(x: frame.origin.x, y: frame.origin.y + dy))
+        applyConveyor(dy: dy, active: true)
+        return QuickAccessWindow.uiTestStackOrigins(on: overlayScreen)
+    }
+    func uiTestConveyorReset() {
+        setFrameOrigin(slotOrigin())
+        springConveyorBack()
+        conveyorSiblings = []
+        cardDragStartOrigin = nil
+    }
     func uiTestDragPrepProbe(forceInline: Bool) -> [String: Any] {
         thumbView?.uiTestDragPrep(forceInline: forceInline) ?? ["error": "no thumb"]
     }
