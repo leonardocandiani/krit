@@ -353,8 +353,15 @@ final class UITestRunner: NSObject {
         }
         r["outWidth"] = outWidth
         r["padded"] = outWidth > 320   // source is 320 wide; background padding must enlarge it
+        // Play, then close: closing must tear the player down (no background decode).
+        state.play()
+        try? await Task.sleep(nanoseconds: 200_000_000)
         ctl.close()
-        r["allPass"] = state.duration > 0.1 && state.zoomSegments.count == 1 && outExists && outWidth > 320
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let tornDown = state.player.currentItem == nil && state.player.timeControlStatus != .playing
+        r["tornDown"] = tornDown
+        r["sharedCleared"] = VideoEditorWindowController.uiTestShared == nil
+        r["allPass"] = state.duration > 0.1 && state.zoomSegments.count == 1 && outExists && outWidth > 320 && tornDown
         return r
     }
 

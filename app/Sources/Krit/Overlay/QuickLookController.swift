@@ -347,7 +347,12 @@ private final class SpacePreviewWindow: NSWindow {
 
     /// Fade out and tear down both windows.
     func dismiss() {
+        // Kill the loop observer BEFORE pausing so a late end-of-play notification
+        // can't call play() again and leave a dismissed clip decoding forever.
+        if let loopObserver { NotificationCenter.default.removeObserver(loopObserver); self.loopObserver = nil }
         player?.pause()
+        playerLayer?.player = nil
+        player = nil
         let pill = pillWindow
         pillWindow = nil
         NSAnimationContext.runAnimationGroup({ ctx in

@@ -114,6 +114,16 @@ final class VideoEditorState: ObservableObject {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
     }
 
+    /// Stop the player and release its decoding pipeline. Called when the editor
+    /// window closes so a closed editor never keeps decoding video/audio in the
+    /// background (that pegged coreaudiod/WindowServer and made the app laggy).
+    func tearDown() {
+        player.pause()
+        isPlaying = false
+        if let timeObserver { player.removeTimeObserver(timeObserver); self.timeObserver = nil }
+        player.replaceCurrentItem(with: nil)
+    }
+
     private func addTimeObserver() {
         let interval = CMTime(seconds: 1.0 / 30.0, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
@@ -616,7 +626,7 @@ struct VideoEditorView: View {
 // MARK: - Window controller
 
 @MainActor
-final class VideoEditorWindowController: NSWindowController {
+final class VideoEditorWindowController: NSWindowController, NSWindowDelegate {
     private static var shared: VideoEditorWindowController?
     private let state: VideoEditorState
 
@@ -641,9 +651,17 @@ final class VideoEditorWindowController: NSWindowController {
         window.center()
         window.isReleasedWhenClosed = false
         super.init(window: window)
+        window.delegate = self
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    // Closing the editor must stop the player and drop the shared reference, or the
+    // AVPlayer keeps decoding in the background forever (lag + audio pipeline churn).
+    func windowWillClose(_ notification: Notification) {
+        state.tearDown()
+        if Self.shared === self { Self.shared = nil }
+    }
 
     /// GUI test hook: drive the editor headlessly.
     var uiTestState: VideoEditorState { state }
