@@ -112,6 +112,7 @@ final class UITestRunner: NSObject {
             case "autozoom-core": report = Self.runAutoZoomCore()
             case "autozoom-export": report = await Self.runAutoZoomExport()
             case "video-preview": report = await Self.runVideoPreview()
+            case "video-editor": report = await Self.runVideoEditor()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -285,6 +286,55 @@ final class UITestRunner: NSObject {
         r["outsideIsIdentity"] = (outside == CameraState.identity)
 
         r["allPass"] = path.count > 10 && inBounds && followsRight && mid.zoomLevel > 1.5 && outside == .identity
+        return r
+    }
+
+    // MARK: - Cenário: video-editor (abre o editor, add zoom, exporta)
+
+    /// Abre o editor de vídeo real, confirma que carrega métricas + metadata,
+    /// snapshota a janela, adiciona um zoom e exporta, conferindo o arquivo.
+    private static func runVideoEditor() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "video-editor"]
+        let srcURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("krit-ve-src.mp4")
+        let made = await makeSyntheticZoomSource(to: srcURL, size: CGSize(width: 320, height: 240), frames: 60, fps: 30)
+        r["sourceMade"] = made
+        guard made else { r["allPass"] = false; return r }
+
+        // Synthetic cursor sweep so the auto path is non-empty.
+        var samples: [RecordedMouseSample] = []
+        for i in 0..<60 {
+            let x = 0.2 + 0.6 * CGFloat(i) / 59.0
+            samples.append(RecordedMouseSample(time: Double(i) / 30.0, normalizedX: x, normalizedY: 0.5, isInsideCapture: true))
+        }
+        RecordingMetadataStore.save(
+            RecordingMetadata(captureSize: CGSize(width: 320, height: 240), samplesPerSecond: 30, mouseSamples: samples),
+            for: srcURL
+        )
+
+        var exported: URL?
+        VideoEditorWindowController.show(url: srcURL) { out, _ in exported = out }
+        guard let ctl = VideoEditorWindowController.uiTestShared else { r["allPass"] = false; return r }
+        let state = ctl.uiTestState
+        for _ in 0..<40 { if state.duration > 0.1 { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
+        r["duration"] = state.duration
+        r["metadataLoaded"] = (state.metadata != nil)
+        if let win = ctl.window {
+            r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-video-editor.png") ? "/tmp/krit-video-editor.png" : "FAILED"
+        }
+
+        state.seek(to: 0.2)
+        state.addZoomAtPlayhead()
+        r["segments"] = state.zoomSegments.count
+        r["autoPaths"] = state.autoFocusPaths.count
+        state.export()
+        var outExists = false
+        for _ in 0..<150 {
+            if let e = exported { outExists = FileManager.default.fileExists(atPath: e.path); break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        r["exportExists"] = outExists
+        ctl.close()
+        r["allPass"] = state.duration > 0.1 && state.zoomSegments.count == 1 && outExists
         return r
     }
 

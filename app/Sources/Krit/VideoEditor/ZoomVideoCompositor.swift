@@ -47,7 +47,8 @@ enum ZoomComposer {
         to outURL: URL,
         segments: [ZoomSegment],
         autoFocusPaths: [UUID: [AutoFocusCameraSample]],
-        transitionDuration: TimeInterval = ZoomCalculator.defaultTransitionDuration
+        transitionDuration: TimeInterval = ZoomCalculator.defaultTransitionDuration,
+        timeRange: CMTimeRange? = nil
     ) async throws {
         let asset = AVURLAsset(url: url)
         let videoComposition = try await makeVideoComposition(
@@ -63,6 +64,9 @@ enum ZoomComposer {
         export.outputURL = outURL
         export.outputFileType = .mp4
         export.videoComposition = videoComposition
+        // Trim, when requested. Zoom segment times are asset-relative, so they keep
+        // aligning even with the output trimmed to a sub-range.
+        if let timeRange { export.timeRange = timeRange }
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             export.exportAsynchronously { continuation.resume() }

@@ -265,7 +265,14 @@ final class RecordingEngine: NSObject, RecordingResultActions {
     }
 
     func reopenResultWindow(url: URL, duration: Double) {
-        RecordingResultWindow.show(url: url, duration: duration, actions: self)
+        // "Edit recording" opens the Snapzy-style video editor (player + timeline +
+        // zoom lane + trim), the real editing surface. The exported clip comes back
+        // as a fresh card.
+        VideoEditorWindowController.show(url: url) { [weak self] outURL, outDuration in
+            guard let self else { return }
+            self.lastFinishedRecording = (outURL, outDuration)
+            self.presentResult(url: outURL, duration: outDuration)
+        }
     }
 
     /// First-frame poster for the overlay card. AVAssetImageGenerator on a fresh
