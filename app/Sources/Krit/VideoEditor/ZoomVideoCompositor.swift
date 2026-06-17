@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreImage
 import Foundation
+import ImageIO
 
 /// Bakes the auto-zoom camera path into an exported video. An
 /// `AVMutableVideoComposition` driven by a custom compositor that, per frame,
@@ -150,7 +151,7 @@ final class ZoomVideoCompositor: NSObject, AVVideoCompositing {
     func cancelAllPendingVideoCompositionRequests() {}
 
     // Cached per export instance (render size + background params are constant).
-    private var cachedGradient: CIImage?
+    private var cachedBackdrop: CIImage?
     private var cachedMask: CIImage?
 
     private func process(_ request: AVAsynchronousVideoCompositionRequest) {
@@ -208,30 +209,60 @@ final class ZoomVideoCompositor: NSObject, AVVideoCompositing {
         let padX = (renderSize.width - extent.width) / 2
         let padY = (renderSize.height - extent.height) / 2
 
-        let gradient = gradientImage(start: bg.startHex, end: bg.endHex, size: renderSize)
+        let backdrop = backdropImage(bg, size: renderSize)
         let radius = bg.cornerFraction * min(extent.width, extent.height)
         let rounded = roundCorners(video, radius: radius) ?? video
         let placed = rounded.transformed(by: CGAffineTransform(translationX: padX, y: padY))
-        let composite = placed.composited(over: gradient).cropped(to: CGRect(origin: .zero, size: renderSize))
+        let composite = placed.composited(over: backdrop).cropped(to: CGRect(origin: .zero, size: renderSize))
         ciContext.render(composite, to: output)
         return output
     }
 
-    private func gradientImage(start: String, end: String, size: CGSize) -> CIImage {
-        if let cachedGradient { return cachedGradient }
-        let c0 = ciColor(start), c1 = ciColor(end)
+    /// Gradient or wallpaper backdrop at render size (cached per export).
+    private func backdropImage(_ bg: VideoBackgroundOptions, size: CGSize) -> CIImage {
+        if let cachedBackdrop { return cachedBackdrop }
         let image: CIImage
-        if let f = CIFilter(name: "CILinearGradient") {
-            f.setValue(CIVector(x: 0, y: 0), forKey: "inputPoint0")
-            f.setValue(CIVector(x: 0, y: size.height), forKey: "inputPoint1")
-            f.setValue(c0, forKey: "inputColor0")
-            f.setValue(c1, forKey: "inputColor1")
-            image = (f.outputImage ?? CIImage(color: c0)).cropped(to: CGRect(origin: .zero, size: size))
-        } else {
-            image = CIImage(color: c0).cropped(to: CGRect(origin: .zero, size: size))
+        switch bg.kind {
+        case .wallpaper: image = wallpaperImage(bg, size: size)
+        case .gradient:  image = gradientImage(start: bg.startHex, end: bg.endHex, size: size)
         }
-        cachedGradient = image
+        cachedBackdrop = image
         return image
+    }
+
+    private func gradientImage(start: String, end: String, size: CGSize) -> CIImage {
+        let c0 = ciColor(start), c1 = ciColor(end)
+        guard let f = CIFilter(name: "CILinearGradient") else {
+            return CIImage(color: c0).cropped(to: CGRect(origin: .zero, size: size))
+        }
+        f.setValue(CIVector(x: 0, y: 0), forKey: "inputPoint0")
+        f.setValue(CIVector(x: 0, y: size.height), forKey: "inputPoint1")
+        f.setValue(c0, forKey: "inputColor0")
+        f.setValue(c1, forKey: "inputColor1")
+        return (f.outputImage ?? CIImage(color: c0)).cropped(to: CGRect(origin: .zero, size: size))
+    }
+
+    /// Wallpaper scaled aspect-fill to the render size, centered.
+    private func wallpaperImage(_ bg: VideoBackgroundOptions, size: CGSize) -> CIImage {
+        guard let data = bg.wallpaperData,
+              let src = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return gradientImage(start: bg.startHex, end: bg.endHex, size: size)
+        }
+        let idx = min(max(bg.wallpaperIndex, 0), max(CGImageSourceGetCount(src) - 1, 0))
+        guard let cg = CGImageSourceCreateImageAtIndex(src, idx, nil) else {
+            return gradientImage(start: bg.startHex, end: bg.endHex, size: size)
+        }
+        let base = CIImage(cgImage: cg)
+        let ext = base.extent
+        guard ext.width > 0, ext.height > 0 else {
+            return gradientImage(start: bg.startHex, end: bg.endHex, size: size)
+        }
+        let scale = max(size.width / ext.width, size.height / ext.height)
+        let scaled = base.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let tx = (size.width - ext.width * scale) / 2
+        let ty = (size.height - ext.height * scale) / 2
+        return scaled.transformed(by: CGAffineTransform(translationX: tx, y: ty))
+            .cropped(to: CGRect(origin: .zero, size: size))
     }
 
     /// Clip the video to a rounded rect via an alpha mask (CoreGraphics, cached).

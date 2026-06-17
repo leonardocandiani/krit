@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import ImageIO
 import SwiftUI
 
 // A real video editor (Snapzy-style) for recordings: an AVPlayer preview that
@@ -8,12 +9,17 @@ import SwiftUI
 // directly, and an export that bakes the zoom into the file via ZoomComposer.
 // Replaces the menu-action "Auto-Zoom & Export" with an interactive editor.
 
-/// The gradient backdrop the video sits on (padding + rounded corners), Snapzy's
-/// signature look. Fractions keep the preview and the baked export consistent.
+/// The backdrop the video sits on (padding + rounded corners), Snapzy's signature
+/// look: a gradient or a real wallpaper image. Fractions keep the preview and the
+/// baked export consistent.
 struct VideoBackgroundOptions: Equatable {
+    enum Kind: Equatable { case gradient, wallpaper }
     var isEnabled: Bool = false
+    var kind: Kind = .gradient
     var startHex: String = "#1f0a22"
     var endHex: String = "#ff8f6b"
+    var wallpaperData: Data?          // full-res image bytes for the export composite
+    var wallpaperIndex: Int = 0       // image inside a dynamic (light/dark) HEIC
     var paddingFraction: CGFloat = 0.06   // of video width, per side
     var cornerFraction: CGFloat = 0.025   // of the smaller video dimension
     static let disabled = VideoBackgroundOptions()
@@ -34,23 +40,58 @@ final class VideoEditorState: ObservableObject {
 
     @Published var zoomSegments: [ZoomSegment] = []
     @Published var selectedZoomId: UUID?
+    @Published var transitionDuration: TimeInterval = ZoomCalculator.defaultTransitionDuration
 
     @Published var frameThumbnails: [NSImage] = []
     @Published var isExtractingFrames = false
 
     @Published var backgroundEnabled = false
+    @Published var backgroundKind: VideoBackgroundOptions.Kind = .gradient
     @Published var backgroundPresetIndex = 0
+    @Published var selectedWallpaperIndex = 0
     @Published var backgroundPadding: CGFloat = 0.06
     @Published var backgroundCorner: CGFloat = 0.025
 
     static let backgroundPresets = Array(ScreenshotBackgroundOptions.imagePresets.prefix(8))
+    let wallpapers: [SystemWallpaperSource.Wallpaper] = SystemWallpaperSource.all
+    private var wallpaperThumbs: [Int: NSImage] = [:]
 
     var backgroundOptions: VideoBackgroundOptions {
-        let p = Self.backgroundPresets[min(backgroundPresetIndex, Self.backgroundPresets.count - 1)]
-        return VideoBackgroundOptions(
-            isEnabled: backgroundEnabled, startHex: p.startHex, endHex: p.endHex,
-            paddingFraction: backgroundPadding, cornerFraction: backgroundCorner
+        var opts = VideoBackgroundOptions(
+            isEnabled: backgroundEnabled, paddingFraction: backgroundPadding, cornerFraction: backgroundCorner
         )
+        if backgroundKind == .wallpaper, selectedWallpaperIndex < wallpapers.count {
+            opts.kind = .wallpaper
+            opts.wallpaperData = try? Data(contentsOf: wallpapers[selectedWallpaperIndex].url)
+            opts.wallpaperIndex = wallpapers[selectedWallpaperIndex].imageIndex
+        } else {
+            let p = Self.backgroundPresets[min(backgroundPresetIndex, Self.backgroundPresets.count - 1)]
+            opts.kind = .gradient
+            opts.startHex = p.startHex
+            opts.endHex = p.endHex
+        }
+        return opts
+    }
+
+    /// Downsampled wallpaper for the swatch grid and the live preview (cached).
+    func wallpaperThumbnail(_ i: Int) -> NSImage? {
+        guard i >= 0, i < wallpapers.count else { return nil }
+        if let c = wallpaperThumbs[i] { return c }
+        let img = Self.downsampledImage(url: wallpapers[i].url, index: wallpapers[i].imageIndex, maxPixel: 320)
+        if let img { wallpaperThumbs[i] = img }
+        return img
+    }
+
+    static func downsampledImage(url: URL, index: Int, maxPixel: CGFloat) -> NSImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let idx = min(max(index, 0), max(CGImageSourceGetCount(src) - 1, 0))
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, idx, opts as CFDictionary) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
     private(set) var metadata: RecordingMetadata?
@@ -148,7 +189,7 @@ final class VideoEditorState: ObservableObject {
     func camera(at time: Double) -> CameraState {
         AutoFocusEngine.resolvedCameraState(
             at: time, segments: zoomSegments.filter(\.isEnabled), autoFocusPaths: autoFocusPaths,
-            transitionDuration: ZoomCalculator.defaultTransitionDuration
+            transitionDuration: transitionDuration
         )
     }
 
@@ -238,6 +279,7 @@ final class VideoEditorState: ObservableObject {
         let segments = zoomSegments.filter(\.isEnabled)
         let paths = autoFocusPaths
         let bg = backgroundOptions
+        let trans = transitionDuration
         let trimmed = trimStart > 0.01 || trimEnd < duration - 0.01
         let range: CMTimeRange? = trimmed
             ? CMTimeRange(start: CMTime(seconds: trimStart, preferredTimescale: 600),
@@ -247,7 +289,7 @@ final class VideoEditorState: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await ZoomComposer.export(url: self.url, to: outURL, segments: segments, autoFocusPaths: paths, timeRange: range, background: bg)
+                try await ZoomComposer.export(url: self.url, to: outURL, segments: segments, autoFocusPaths: paths, transitionDuration: trans, timeRange: range, background: bg)
                 await MainActor.run {
                     self.isExporting = false
                     ToastWindow.show(message: "Saved: \(outURL.lastPathComponent)", duration: 3.0)
@@ -341,25 +383,25 @@ struct VideoEditorView: View {
     var body: some View {
         VStack(spacing: 0) {
             toolbar
-            playerArea
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            timeline
-                .frame(height: 226)
-                .background(Color(white: 0.10))
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    playerArea.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    timeline.frame(height: 192).background(Color(white: 0.10))
+                }
+                if state.selectedSegment != nil {
+                    Divider()
+                    zoomSidebar
+                }
+            }
         }
-        .frame(minWidth: 720, minHeight: 560)
+        .frame(minWidth: 860, minHeight: 560)
         .background(Color(white: 0.13))
     }
 
     private var playerArea: some View {
         GeometryReader { geo in
             ZStack {
-                if state.backgroundEnabled {
-                    LinearGradient(colors: [color(state.backgroundOptions.startHex), color(state.backgroundOptions.endHex)],
-                                   startPoint: .bottom, endPoint: .top)
-                } else {
-                    Color.black
-                }
+                backdrop
                 PlayerView(state: state)
                     .aspectRatio(state.naturalSize.width / max(state.naturalSize.height, 1), contentMode: .fit)
                     .clipShape(RoundedRectangle(cornerRadius: state.backgroundEnabled ? state.backgroundCorner * min(geo.size.width, geo.size.height) : 0))
@@ -367,6 +409,19 @@ struct VideoEditorView: View {
                     .padding(state.backgroundEnabled ? state.backgroundPadding * geo.size.width : 0)
             }
             .frame(width: geo.size.width, height: geo.size.height)
+        }
+    }
+
+    @ViewBuilder private var backdrop: some View {
+        if state.backgroundEnabled {
+            if state.backgroundKind == .wallpaper, let img = state.wallpaperThumbnail(state.selectedWallpaperIndex) {
+                Image(nsImage: img).resizable().aspectRatio(contentMode: .fill).clipped()
+            } else {
+                LinearGradient(colors: [color(state.backgroundOptions.startHex), color(state.backgroundOptions.endHex)],
+                               startPoint: .bottom, endPoint: .top)
+            }
+        } else {
+            Color.black
         }
     }
 
@@ -409,7 +464,6 @@ struct VideoEditorView: View {
     private var timeline: some View {
         VStack(spacing: 10) {
             EditorTimeline(state: state)
-            inspector
             Divider()
             backgroundBar
         }
@@ -422,63 +476,134 @@ struct VideoEditorView: View {
             Toggle(isOn: $state.backgroundEnabled) { Text("Background") }
                 .toggleStyle(.switch)
             if state.backgroundEnabled {
-                ForEach(0..<VideoEditorState.backgroundPresets.count, id: \.self) { i in
-                    swatch(i)
+                Picker("", selection: $state.backgroundKind) {
+                    Text("Gradient").tag(VideoBackgroundOptions.Kind.gradient)
+                    Text("Wallpaper").tag(VideoBackgroundOptions.Kind.wallpaper)
                 }
-                Divider().frame(height: 18)
+                .pickerStyle(.segmented).frame(width: 168).labelsHidden()
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        if state.backgroundKind == .gradient {
+                            ForEach(0..<VideoEditorState.backgroundPresets.count, id: \.self) { gradientSwatch($0) }
+                        } else {
+                            ForEach(0..<state.wallpapers.count, id: \.self) { wallpaperSwatch($0) }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .frame(maxWidth: 260)
+
                 Image(systemName: "square.dashed").foregroundColor(.secondary)
-                Slider(value: $state.backgroundPadding, in: 0...0.14).frame(width: 80)
+                Slider(value: $state.backgroundPadding, in: 0...0.14).frame(width: 66)
                 Image(systemName: "rectangle.roundedtop").foregroundColor(.secondary)
-                Slider(value: $state.backgroundCorner, in: 0...0.06).frame(width: 80)
+                Slider(value: $state.backgroundCorner, in: 0...0.06).frame(width: 66)
             }
             Spacer()
         }
-        .frame(height: 28)
+        .frame(height: 30)
     }
 
-    private func swatch(_ i: Int) -> some View {
+    private func gradientSwatch(_ i: Int) -> some View {
         let p = VideoEditorState.backgroundPresets[i]
+        let selected = state.backgroundKind == .gradient && state.backgroundPresetIndex == i
         return RoundedRectangle(cornerRadius: 5)
             .fill(LinearGradient(colors: [color(p.startHex), color(p.endHex)], startPoint: .bottom, endPoint: .top))
-            .frame(width: 26, height: 20)
-            .overlay(RoundedRectangle(cornerRadius: 5)
-                .strokeBorder(state.backgroundPresetIndex == i ? Color.white : .clear, lineWidth: 2))
+            .frame(width: 30, height: 22)
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(selected ? Color.white : .clear, lineWidth: 2))
             .onTapGesture { state.backgroundPresetIndex = i }
     }
 
-    @ViewBuilder private var inspector: some View {
+    private func wallpaperSwatch(_ i: Int) -> some View {
+        let selected = state.backgroundKind == .wallpaper && state.selectedWallpaperIndex == i
+        return Group {
+            if let img = state.wallpaperThumbnail(i) {
+                Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
+            } else {
+                Color.gray.opacity(0.3)
+            }
+        }
+        .frame(width: 30, height: 22)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(selected ? Color.white : .clear, lineWidth: 2))
+        .onTapGesture { state.selectedWallpaperIndex = i }
+    }
+
+    @ViewBuilder private var zoomSidebar: some View {
         if let seg = state.selectedSegment {
-            HStack(spacing: 12) {
-                Picker("", selection: Binding(
-                    get: { seg.zoomType },
-                    set: { newType in state.updateSelected { $0.zoomType = newType } }
-                )) {
-                    Text("Auto").tag(ZoomType.auto)
-                    Text("Manual").tag(ZoomType.manual)
-                }
-                .pickerStyle(.segmented).frame(width: 140)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Label("Zoom", systemImage: "plus.magnifyingglass").font(.system(size: 13, weight: .semibold))
+                        Spacer()
+                        Text(seg.isAutoMode ? "Follows cursor" : "Manual")
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 6).padding(.vertical, 3)
+                            .background((seg.isAutoMode ? Color.green : Color.accentColor).opacity(0.18))
+                            .foregroundColor(seg.isAutoMode ? .green : .accentColor)
+                            .cornerRadius(4)
+                    }
 
-                Text("Zoom")
-                Slider(value: Binding(
-                    get: { Double(seg.zoomLevel) },
-                    set: { v in state.updateSelected { $0.zoomLevel = CGFloat(v) } }
-                ), in: 1.0...4.0)
-                .frame(width: 160)
-                Text(seg.formattedZoomLevel).font(.system(size: 11).monospacedDigit())
+                    Picker("", selection: Binding(
+                        get: { seg.zoomType },
+                        set: { t in state.updateSelected { $0.zoomType = t } }
+                    )) {
+                        Text("Auto").tag(ZoomType.auto)
+                        Text("Manual").tag(ZoomType.manual)
+                    }
+                    .pickerStyle(.segmented).labelsHidden()
 
-                Spacer()
-                Button(role: .destructive, action: { state.removeSelectedZoom() }) {
-                    Image(systemName: "trash")
+                    Divider()
+
+                    labeledSlider("Zoom level", value: Double(seg.zoomLevel), range: 1...4, suffix: "x") { v in
+                        state.updateSelected { $0.zoomLevel = CGFloat(v) }
+                    }
+                    labeledSlider("Smoothness", value: state.transitionDuration, range: 0.1...1.2, suffix: "s") { v in
+                        state.transitionDuration = v
+                    }
+
+                    if seg.isAutoMode {
+                        labeledSlider("Follow speed", value: seg.followSpeed, range: 0.2...1.0) { v in
+                            state.updateSelected { $0.followSpeed = v }
+                        }
+                        labeledSlider("Focus margin", value: Double(seg.focusMargin), range: 0.2...0.9) { v in
+                            state.updateSelected { $0.focusMargin = CGFloat(v) }
+                        }
+                    } else {
+                        Text("Center").font(.system(size: 11, weight: .medium)).foregroundColor(.secondary)
+                        labeledSlider("Horizontal", value: Double(seg.zoomCenter.x), range: 0...1) { v in
+                            state.updateSelected { $0.zoomCenter.x = CGFloat(v) }
+                        }
+                        labeledSlider("Vertical", value: Double(seg.zoomCenter.y), range: 0...1) { v in
+                            state.updateSelected { $0.zoomCenter.y = CGFloat(v) }
+                        }
+                    }
+
+                    Divider()
+
+                    Button(role: .destructive, action: { state.removeSelectedZoom() }) {
+                        Label("Delete Zoom", systemImage: "trash").frame(maxWidth: .infinity)
+                    }
+                    Spacer(minLength: 8)
                 }
+                .padding(14)
             }
-            .frame(height: 30)
-        } else {
+            .frame(width: 248)
+            .background(Color(white: 0.12))
+        }
+    }
+
+    private func labeledSlider(_ title: String, value: Double, range: ClosedRange<Double>,
+                               suffix: String = "", onChange: @escaping (Double) -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("Tap a zoom block to edit, or Add Zoom at the playhead.")
-                    .font(.system(size: 11)).foregroundColor(.secondary)
+                Text(title).font(.system(size: 11)).foregroundColor(.secondary)
                 Spacer()
+                Text(suffix == "x" ? String(format: "%.1f%@", value, suffix)
+                                   : String(format: "%.2f%@", value, suffix))
+                    .font(.system(size: 11).monospacedDigit()).foregroundColor(.secondary)
             }
-            .frame(height: 30)
+            Slider(value: Binding(get: { value }, set: { onChange($0) }), in: range)
         }
     }
 

@@ -325,10 +325,16 @@ final class UITestRunner: NSObject {
         state.addZoom(at: 1.0)
         r["segments"] = state.zoomSegments.count
         r["autoPaths"] = state.autoFocusPaths.count
-        // Turn on the Snapzy-style gradient background so the snapshot + export
-        // exercise the padded/rounded composite path.
+        // Turn on the Snapzy-style background; switch to a real wallpaper so the
+        // snapshot + export exercise the wallpaper composite path too.
         state.backgroundEnabled = true
-        try? await Task.sleep(nanoseconds: 500_000_000)
+        r["wallpapers"] = state.wallpapers.count
+        if !state.wallpapers.isEmpty {
+            state.backgroundKind = .wallpaper
+            state.selectedWallpaperIndex = 0
+            r["wallpaperThumb"] = state.wallpaperThumbnail(0) != nil
+        }
+        try? await Task.sleep(nanoseconds: 600_000_000)
         if let win = ctl.window {
             r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-video-editor.png") ? "/tmp/krit-video-editor.png" : "FAILED"
         }
