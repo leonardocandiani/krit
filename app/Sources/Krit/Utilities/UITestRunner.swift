@@ -108,6 +108,7 @@ final class UITestRunner: NSObject {
             case "overlay-space-stress": report = await Self.runOverlaySpaceStress()
             case "overlay-park-capture": report = await Self.runOverlayParkCapture()
             case "prefs-shortcuts": report = await Self.runPrefsShortcuts()
+            case "autozoom-core": report = Self.runAutoZoomCore()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -229,6 +230,58 @@ final class UITestRunner: NSObject {
         }
         r["allPass"] = allMoved && allHome && liveDragParkedAll
             && siblingsMovedDuringDrag && beltDropSeen && restoredAll
+        return r
+    }
+
+    // MARK: - Cenário: autozoom-core (a matemática de auto-zoom portada do Snapzy)
+
+    /// Roda o motor de auto-zoom com um rastro de cursor sintético (varre da
+    /// esquerda pra direita no meio do frame) e checa os invariantes: o caminho da
+    /// câmera é gerado, os centros ficam dentro do crop (pra 2x, [0.25, 0.75]), a
+    /// câmera segue o cursor pra direita, e o estado resolvido no meio está zoomado.
+    private static func runAutoZoomCore() -> [String: Any] {
+        var r: [String: Any] = ["scenario": "autozoom-core"]
+        let fps = 30
+        let total = 60
+        var samples: [RecordedMouseSample] = []
+        for i in 0..<total {
+            let t = Double(i) / Double(fps)
+            let x = 0.15 + 0.7 * Double(i) / Double(total - 1)   // 0.15 -> 0.85
+            samples.append(RecordedMouseSample(time: t, normalizedX: CGFloat(x), normalizedY: 0.5, isInsideCapture: true))
+        }
+        let metadata = RecordingMetadata(captureSize: CGSize(width: 1920, height: 1080), samplesPerSecond: fps, mouseSamples: samples)
+        let segment = ZoomSegment(startTime: 0, duration: 2.0, zoomLevel: 2.0, zoomType: .auto)
+
+        let path = AutoFocusEngine.buildPath(from: metadata, segment: segment)
+        r["pathCount"] = path.count
+
+        let cropHalf: CGFloat = 0.5 / 2.0
+        let inBounds = path.allSatisfy {
+            $0.center.x >= cropHalf - 0.001 && $0.center.x <= 1 - cropHalf + 0.001 &&
+            $0.center.y >= cropHalf - 0.001 && $0.center.y <= 1 - cropHalf + 0.001
+        }
+        r["centersInBounds"] = inBounds
+
+        let startX = path.first?.center.x ?? 0
+        let endX = path.last?.center.x ?? 0
+        r["startCenterX"] = Double(startX)
+        r["endCenterX"] = Double(endX)
+        let followsRight = endX > startX + 0.05
+        r["followsCursorRight"] = followsRight
+
+        let mid = AutoFocusEngine.resolvedCameraState(
+            at: 1.0, segments: [segment], autoFocusPaths: [segment.id: path], transitionDuration: 0.4
+        )
+        r["midZoom"] = Double(mid.zoomLevel)
+        r["midCenterX"] = Double(mid.center.x)
+
+        // Outside any segment must be identity (no zoom).
+        let outside = AutoFocusEngine.resolvedCameraState(
+            at: 5.0, segments: [segment], autoFocusPaths: [segment.id: path], transitionDuration: 0.4
+        )
+        r["outsideIsIdentity"] = (outside == CameraState.identity)
+
+        r["allPass"] = path.count > 10 && inBounds && followsRight && mid.zoomLevel > 1.5 && outside == .identity
         return r
     }
 
