@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import KeyboardShortcuts
 import AudioToolbox
 import os
@@ -109,6 +110,7 @@ final class UITestRunner: NSObject {
             case "overlay-park-capture": report = await Self.runOverlayParkCapture()
             case "prefs-shortcuts": report = await Self.runPrefsShortcuts()
             case "autozoom-core": report = Self.runAutoZoomCore()
+            case "autozoom-export": report = await Self.runAutoZoomExport()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -283,6 +285,129 @@ final class UITestRunner: NSObject {
 
         r["allPass"] = path.count > 10 && inBounds && followsRight && mid.zoomLevel > 1.5 && outside == .identity
         return r
+    }
+
+    // MARK: - Cenário: autozoom-export (o zoom é gravado no vídeo exportado)
+
+    /// Prova o compositor de ponta a ponta: cria um vídeo sintético (quadrante
+    /// branco sobre preto), exporta com um zoom 2x num canto e confirma que o frame
+    /// de saída mudou de forma material vs o source (o crop+scale do zoom alterou a
+    /// composição do frame). Não depende de orientação: checa a magnitude da mudança.
+    private static func runAutoZoomExport() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "autozoom-export"]
+        let dir = NSTemporaryDirectory()
+        let srcURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-az-src.mp4")
+        let outURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-az-out.mp4")
+        let size = CGSize(width: 320, height: 240)
+        let fps = 30, frames = 30
+
+        let made = await makeSyntheticZoomSource(to: srcURL, size: size, frames: frames, fps: fps)
+        r["sourceMade"] = made
+        guard made else { r["allPass"] = false; return r }
+
+        let clip = Double(frames) / Double(fps)
+        let segment = ZoomSegment(
+            startTime: 0, duration: clip, zoomLevel: 2.0,
+            zoomCenter: CGPoint(x: 0.25, y: 0.25), zoomType: .manual
+        )
+        do {
+            try await ZoomComposer.export(url: srcURL, to: outURL, segments: [segment], autoFocusPaths: [:])
+        } catch {
+            r["exportError"] = "\(error)"; r["allPass"] = false; return r
+        }
+        r["outExists"] = FileManager.default.fileExists(atPath: outURL.path)
+
+        let mid = clip / 2.0
+        guard let srcImg = await cgImage(from: srcURL, at: mid),
+              let outImg = await cgImage(from: outURL, at: mid) else {
+            r["frameGrab"] = "failed"; r["allPass"] = false; return r
+        }
+        let srcBright = brightFraction(srcImg)
+        let outBright = brightFraction(outImg)
+        r["srcBright"] = srcBright
+        r["outBright"] = outBright
+        let changed = srcBright >= 0 && outBright >= 0 && abs(outBright - srcBright) > 0.15
+        r["zoomChangedFrame"] = changed
+        r["allPass"] = (r["outExists"] as? Bool == true) && changed
+        return r
+    }
+
+    private static func makeSyntheticZoomSource(to url: URL, size: CGSize, frames: Int, fps: Int) async -> Bool {
+        try? FileManager.default.removeItem(at: url)
+        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mp4) else { return false }
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(size.width),
+            AVVideoHeightKey: Int(size.height),
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                kCVPixelBufferWidthKey as String: Int(size.width),
+                kCVPixelBufferHeightKey as String: Int(size.height),
+            ]
+        )
+        guard writer.canAdd(input) else { return false }
+        writer.add(input)
+        guard writer.startWriting() else { return false }
+        writer.startSession(atSourceTime: .zero)
+
+        let w = Int(size.width), h = Int(size.height)
+        for i in 0..<frames {
+            while !input.isReadyForMoreMediaData { usleep(2000) }
+            guard let pool = adaptor.pixelBufferPool else { return false }
+            var pb: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
+            guard let buffer = pb else { return false }
+            CVPixelBufferLockBaseAddress(buffer, [])
+            if let base = CVPixelBufferGetBaseAddress(buffer) {
+                let bpr = CVPixelBufferGetBytesPerRow(buffer)
+                let cs = CGColorSpaceCreateDeviceRGB()
+                if let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8,
+                                       bytesPerRow: bpr, space: cs,
+                                       bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) {
+                    ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+                    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+                    ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+                    ctx.fill(CGRect(x: 0, y: h / 2, width: w / 2, height: h / 2))
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))
+        }
+        input.markAsFinished()
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            writer.finishWriting { c.resume() }
+        }
+        return writer.status == .completed
+    }
+
+    private static func cgImage(from url: URL, at seconds: Double) async -> CGImage? {
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
+        return try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image
+    }
+
+    private static func brightFraction(_ image: CGImage) -> Double {
+        let n = 16
+        var pixels = [UInt8](repeating: 0, count: n * n * 4)
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: &pixels, width: n, height: n, bitsPerComponent: 8,
+                                  bytesPerRow: n * 4, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return -1 }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: n, height: n))
+        var bright = 0
+        for p in 0..<(n * n) {
+            let luma = (0.2126 * Double(pixels[p * 4]) + 0.7152 * Double(pixels[p * 4 + 1]) + 0.0722 * Double(pixels[p * 4 + 2])) / 255.0
+            if luma > 0.6 { bright += 1 }
+        }
+        return Double(bright) / Double(n * n)
     }
 
     // MARK: - Cenário: prefs-shortcuts (abrir a aba Shortcuts sem crashar)
