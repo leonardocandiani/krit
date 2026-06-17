@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 
 /// Space-preview companion for the Quick Access overlay (CleanShot "Space" look).
 ///
@@ -29,6 +30,9 @@ final class QuickLookController {
 
     /// A preview is open right now.
     var isOpen: Bool { owner != nil }
+
+    /// GUI test hook: the open preview is a video and it is actively playing.
+    var uiTestIsPlayingVideo: Bool { previewWindow?.uiTestIsPlaying ?? false }
 
     /// True only when the preview belongs to `card`.
     func isOpen(forOwner card: AnyObject) -> Bool {
@@ -63,6 +67,26 @@ final class QuickLookController {
         }
     }
 
+    /// Open a VIDEO preview for `card`: plays `videoURL` (looped) at the size of
+    /// `poster` (its first frame), anchored to the card. Space shows the clip
+    /// playing, not the static thumbnail.
+    func open(owner card: AnyObject, videoURL: URL, poster: NSImage, cardFrame: NSRect, screen: NSScreen?) {
+        if owner === card, previewWindow != nil { return }
+        close()
+        owner = card
+        let window = SpacePreviewWindow(image: poster, cardFrame: cardFrame, screen: screen, videoURL: videoURL)
+        window.present()
+        previewWindow = window
+    }
+
+    func toggle(owner card: AnyObject, videoURL: URL, poster: NSImage, cardFrame: NSRect, screen: NSScreen?) {
+        if isOpen(forOwner: card) {
+            close()
+        } else {
+            open(owner: card, videoURL: videoURL, poster: poster, cardFrame: cardFrame, screen: screen)
+        }
+    }
+
     /// Tear the preview down unconditionally.
     func close() {
         previewWindow?.dismiss()
@@ -89,7 +113,13 @@ private final class SpacePreviewWindow: NSWindow {
     private static let pillHeight: CGFloat = 30
     private static let pillGap: CGFloat = 12
 
-    init(image: NSImage, cardFrame: NSRect, screen: NSScreen?) {
+    private let videoURL: URL?
+    private var player: AVPlayer?
+    private var playerLayer: AVPlayerLayer?
+    private var loopObserver: Any?
+
+    init(image: NSImage, cardFrame: NSRect, screen: NSScreen?, videoURL: URL? = nil) {
+        self.videoURL = videoURL
         let vf = (screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? cardFrame
         let imageSize = SpacePreviewWindow.previewSize(for: image, in: vf)
         let origin = SpacePreviewWindow.anchoredOrigin(
@@ -115,8 +145,15 @@ private final class SpacePreviewWindow: NSWindow {
         buildContent(image: image, screenVisibleFrame: vf)
     }
 
+    deinit {
+        if let loopObserver { NotificationCenter.default.removeObserver(loopObserver) }
+    }
+
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+
+    /// GUI test hook: a video preview that is actively playing.
+    var uiTestIsPlaying: Bool { player?.timeControlStatus == .playing }
 
     /// Preview image box: image aspect preserved, capped at `maxFraction` of the
     /// visible frame (minus the inset) so a big shot never overflows the screen.
@@ -192,6 +229,13 @@ private final class SpacePreviewWindow: NSWindow {
         imageView.layer?.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
         container.addSubview(imageView)
 
+        // Video card: play the clip (looped) over the poster, so Space previews the
+        // moving video, not a frozen thumbnail. The poster stays as the backdrop
+        // until the first frame is ready.
+        if let videoURL, let hostLayer = imageView.layer {
+            setUpVideoLayer(on: hostLayer, url: videoURL)
+        }
+
         // Hairline so the preview reads against bright wallpapers (the card uses
         // the same border treatment).
         let border = NSView(frame: container.bounds)
@@ -208,6 +252,32 @@ private final class SpacePreviewWindow: NSWindow {
         spawnPill(belowPreviewFrame: frame, screenVisibleFrame: vf)
 
         alphaValue = 0
+    }
+
+    /// Play the clip on a looping AVPlayerLayer over the poster backdrop, muted
+    /// (a glance preview, not playback with sound).
+    private func setUpVideoLayer(on host: CALayer, url: URL) {
+        let player = AVPlayer(url: url)
+        player.isMuted = true
+        let layer = AVPlayerLayer(player: player)
+        layer.frame = host.bounds
+        layer.videoGravity = .resizeAspect
+        layer.cornerRadius = host.cornerRadius
+        layer.cornerCurve = .continuous
+        layer.masksToBounds = true
+        host.addSublayer(layer)
+        self.player = player
+        self.playerLayer = layer
+
+        loopObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: player.currentItem,
+            queue: .main
+        ) { [weak player] _ in
+            player?.seek(to: .zero)
+            player?.play()
+        }
+        player.play()
     }
 
     /// The "Space" hint pill. A separate borderless window placed just below the
@@ -277,6 +347,7 @@ private final class SpacePreviewWindow: NSWindow {
 
     /// Fade out and tear down both windows.
     func dismiss() {
+        player?.pause()
         let pill = pillWindow
         pillWindow = nil
         NSAnimationContext.runAnimationGroup({ ctx in

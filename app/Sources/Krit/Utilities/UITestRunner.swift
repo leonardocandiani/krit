@@ -111,6 +111,7 @@ final class UITestRunner: NSObject {
             case "prefs-shortcuts": report = await Self.runPrefsShortcuts()
             case "autozoom-core": report = Self.runAutoZoomCore()
             case "autozoom-export": report = await Self.runAutoZoomExport()
+            case "video-preview": report = await Self.runVideoPreview()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -284,6 +285,31 @@ final class UITestRunner: NSObject {
         r["outsideIsIdentity"] = (outside == CameraState.identity)
 
         r["allPass"] = path.count > 10 && inBounds && followsRight && mid.zoomLevel > 1.5 && outside == .identity
+        return r
+    }
+
+    // MARK: - Cenário: video-preview (Space toca o vídeo, não a thumb)
+
+    /// Abre o preview do Space para um vídeo e confirma que ele ABRE e está
+    /// TOCANDO (AVPlayer rodando), não mostrando um poster estático.
+    private static func runVideoPreview() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "video-preview"]
+        let srcURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("krit-vp-src.mp4")
+        let made = await makeSyntheticZoomSource(to: srcURL, size: CGSize(width: 320, height: 240), frames: 30, fps: 30)
+        r["sourceMade"] = made
+        guard made else { r["allPass"] = false; return r }
+
+        let owner = NSObject()
+        let poster = NSImage(size: NSSize(width: 320, height: 240))
+        let vf = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let cardFrame = NSRect(x: vf.midX, y: vf.midY, width: 240, height: 150)
+        QuickLookController.shared.open(owner: owner, videoURL: srcURL, poster: poster, cardFrame: cardFrame, screen: NSScreen.main)
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        r["previewOpen"] = QuickLookController.shared.isOpen
+        r["playingVideo"] = QuickLookController.shared.uiTestIsPlayingVideo
+        QuickLookController.shared.close()
+        _ = owner   // keep the weak owner alive through the check
+        r["allPass"] = (r["previewOpen"] as? Bool == true) && (r["playingVideo"] as? Bool == true)
         return r
     }
 

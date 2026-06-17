@@ -2221,9 +2221,16 @@ private final class QuickAccessWindow: NSWindow {
     /// current on-screen frame and screen so the preview lands right beside it.
     private func togglePreview() {
         guard !isClosing, !isParked, !isPreviewZoomed else { return }
-        QuickLookController.shared.toggle(
-            owner: self, image: image, cardFrame: frame, screen: overlayScreen
-        )
+        if let payload = videoPayload {
+            // Video card: Space previews the clip PLAYING, not the poster frame.
+            QuickLookController.shared.toggle(
+                owner: self, videoURL: payload.url, poster: image, cardFrame: frame, screen: overlayScreen
+            )
+        } else {
+            QuickLookController.shared.toggle(
+                owner: self, image: image, cardFrame: frame, screen: overlayScreen
+            )
+        }
         // The big preview carries its own "Space" pill; the small hint is a
         // one-shot at landing, so opening the preview just retires it.
         setSpaceHintVisible(false)
