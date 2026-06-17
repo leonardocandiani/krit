@@ -107,6 +107,7 @@ final class UITestRunner: NSObject {
             case "overlay-conveyor": report = await Self.runOverlayConveyor()
             case "overlay-space-stress": report = await Self.runOverlaySpaceStress()
             case "overlay-park-capture": report = await Self.runOverlayParkCapture()
+            case "prefs-shortcuts": report = await Self.runPrefsShortcuts()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -228,6 +229,33 @@ final class UITestRunner: NSObject {
         }
         r["allPass"] = allMoved && allHome && liveDragParkedAll
             && siblingsMovedDuringDrag && beltDropSeen && restoredAll
+        return r
+    }
+
+    // MARK: - Cenário: prefs-shortcuts (abrir a aba Shortcuts sem crashar)
+
+    /// Prova o fix do crash da aba Shortcuts: monta a seção pelo caminho REAL
+    /// (show(tab: .shortcuts) -> ShortcutsForm -> KeyboardShortcuts.Recorder ->
+    /// RecorderCocoa -> String.localized -> Bundle.module). Se o resource bundle do
+    /// KeyboardShortcuts faltasse no app, o Bundle.module dava fatalError e o
+    /// processo morria ANTES de escrever este report (timeout = ainda crasha). Report
+    /// escrito com windowUp=true = sobreviveu = bundle presente, fix de runtime ok.
+    private static func runPrefsShortcuts() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let ctrl = PreferencesWindowController.shared
+        ctrl.show(tab: .shortcuts)
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let win = ctrl.uiTestWindow
+        r["windowUp"] = win?.isVisible ?? false
+        // Re-render a couple of other tabs and come back, to exercise the section
+        // cache + Recorder teardown/rebuild that a real user does by clicking around.
+        ctrl.show(tab: .general)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        ctrl.show(tab: .shortcuts)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        r["survivedTabSwitch"] = (ctrl.uiTestWindow?.isVisible ?? false)
+        ctrl.uiTestClose()
+        r["allPass"] = (r["windowUp"] as? Bool == true) && (r["survivedTabSwitch"] as? Bool == true)
         return r
     }
 

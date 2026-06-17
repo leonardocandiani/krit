@@ -139,20 +139,33 @@ if [ -f "$SCRIPT_DIR/THIRD_PARTY_NOTICES.md" ]; then
     cp "$SCRIPT_DIR/THIRD_PARTY_NOTICES.md" "$APP_BUNDLE/Contents/Resources/THIRD_PARTY_NOTICES.md"
 fi
 
-# Copy SPM-generated resource bundle (capture sound, etc.) if present. Same
-# layout rule as the binaries: prefer the CURRENT run's layout, or a stale
-# bundle from a previous build in the other layout ships instead.
+# Copy EVERY SPM-generated resource bundle into the app, not just our own
+# (Krit_KritKit, the capture sound). A package built with resources loads them
+# through Bundle.module, which fatalErrors the instant its .bundle is missing
+# from the app: that was the Shortcuts-tab crash (KeyboardShortcuts'
+# RecorderCocoa -> String.localized -> Bundle.module on the absent
+# KeyboardShortcuts_KeyboardShortcuts.bundle). Prefer the CURRENT run's products
+# dir (same layout rule as the binaries), fall back to a tree scan.
 if [ ${#ARCH_FLAGS[@]} -gt 0 ]; then
-    SPM_RESOURCE_BUNDLE="$BUILD_PATH/apple/Products/Release/Krit_KritKit.bundle"
+    PRODUCTS_DIR="$BUILD_PATH/apple/Products/Release"
 else
-    SPM_RESOURCE_BUNDLE="$BUILD_PATH/release/Krit_KritKit.bundle"
+    PRODUCTS_DIR="$BUILD_PATH/release"
 fi
-if [ ! -d "$SPM_RESOURCE_BUNDLE" ]; then
-    SPM_RESOURCE_BUNDLE="$(find "$BUILD_PATH" -name "Krit_KritKit.bundle" -type d 2>/dev/null | head -1)"
+RESOURCE_BUNDLES=()
+if [ -d "$PRODUCTS_DIR" ]; then
+    for b in "$PRODUCTS_DIR"/*.bundle; do
+        [ -d "$b" ] && RESOURCE_BUNDLES+=("$b")
+    done
 fi
-if [ -d "$SPM_RESOURCE_BUNDLE" ]; then
-    cp -R "$SPM_RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"
+if [ ${#RESOURCE_BUNDLES[@]} -eq 0 ]; then
+    while IFS= read -r b; do RESOURCE_BUNDLES+=("$b"); done \
+        < <(find "$BUILD_PATH" -name "*.bundle" -type d 2>/dev/null)
 fi
+for b in "${RESOURCE_BUNDLES[@]}"; do
+    rm -rf "$APP_BUNDLE/Contents/Resources/$(basename "$b")"
+    cp -R "$b" "$APP_BUNDLE/Contents/Resources/"
+    echo "▶ Bundled resource: $(basename "$b")"
+done
 
 # Embed Sparkle.framework (auto-update). SPM links the app against the binary
 # xcframework artifact whose install name is @rpath/Sparkle.framework/…, so the
