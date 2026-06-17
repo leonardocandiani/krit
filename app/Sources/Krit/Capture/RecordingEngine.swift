@@ -83,6 +83,16 @@ final class RecordingEngine: NSObject, RecordingResultActions {
     private var hud: RecordingHUDWindow?
     private var configuration = RecordingConfiguration.current
 
+    // Cursor-path capture (feeds auto-zoom). A timer samples the mouse against the
+    // capture region; the clock advances only while not paused so sample times line
+    // up with the gated video timeline. Written as a metadata sidecar on finish.
+    private var mouseSamples: [RecordedMouseSample] = []
+    private var mouseSampleTimer: Timer?
+    private var mouseSampleClock: TimeInterval = 0
+    private var captureRegionRect: CGRect = .zero
+    private var captureRegionSize: CGSize = .zero
+    private let mouseSamplesPerSecond = 30
+
     var active: Bool { isRecording || isFinishing }
 
     /// GUI test hook: how many dim panels are live (0 when no dim is showing).
@@ -180,6 +190,10 @@ final class RecordingEngine: NSObject, RecordingResultActions {
                 try startMicrophoneCapture(deviceID: configuration.microphoneDeviceID)
             }
             try await prepared.stream.startCapture()
+
+            captureRegionRect = prepared.regionRect
+            captureRegionSize = prepared.regionRect.size
+            startMouseSampling()
 
             // The click/keystroke overlay lives INSIDE the captured region so the
             // stream picks it up directly, it is deliberately NOT excluded.
@@ -304,6 +318,42 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         }
         clickKeyOverlay?.setPaused(isPaused)
         hud?.setPaused(isPaused)
+    }
+
+    // MARK: - Cursor sampling (auto-zoom source)
+
+    private func startMouseSampling() {
+        mouseSamples.removeAll()
+        mouseSampleClock = 0
+        mouseSampleTimer?.invalidate()
+        let interval = 1.0 / Double(mouseSamplesPerSecond)
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { self?.sampleMouseTick(interval: interval) }
+        }
+        // .common so the timer keeps firing while the cursor is tracking/dragging.
+        RunLoop.main.add(timer, forMode: .common)
+        mouseSampleTimer = timer
+    }
+
+    private func sampleMouseTick(interval: TimeInterval) {
+        guard isRecording, !isFinishing, !isPaused else { return }
+        guard captureRegionRect.width > 0, captureRegionRect.height > 0 else { return }
+        // NSEvent.mouseLocation is global screen space, bottom-left origin, same as
+        // the capture region rect. Normalize, then flip Y to a top-left origin so a
+        // sample maps straight onto a video frame.
+        let p = NSEvent.mouseLocation
+        let rawX = (p.x - captureRegionRect.minX) / captureRegionRect.width
+        let rawYBottom = (p.y - captureRegionRect.minY) / captureRegionRect.height
+        let inside = rawX >= 0 && rawX <= 1 && rawYBottom >= 0 && rawYBottom <= 1
+        let nx = min(max(rawX, 0), 1)
+        let nyTop = min(max(1 - rawYBottom, 0), 1)
+        mouseSamples.append(RecordedMouseSample(time: mouseSampleClock, normalizedX: nx, normalizedY: nyTop, isInsideCapture: inside))
+        mouseSampleClock += interval
+    }
+
+    private func stopMouseSampling() {
+        mouseSampleTimer?.invalidate()
+        mouseSampleTimer = nil
     }
 
     fileprivate nonisolated func streamDidStopWithError(_ error: Error) {
@@ -702,6 +752,7 @@ final class RecordingEngine: NSObject, RecordingResultActions {
     private func finishRecording(error: Error?) {
         guard isFinishing else { return }
         stopMicrophoneCapture()
+        stopMouseSampling()
         cameraBubble?.stop()
         cameraBubble = nil
         clickKeyOverlay?.stop()
@@ -739,6 +790,11 @@ final class RecordingEngine: NSObject, RecordingResultActions {
             // Recorded media duration for the trim range, captured before cleanup
             // resets the timing state.
             let recordedDuration = CMTimeGetSeconds(self.lastPresentationTime ?? .zero)
+            // Snapshot the cursor path before cleanup clears it, so the success
+            // branch can write the metadata sidecar for this clip.
+            let capturedSamples = self.mouseSamples
+            let capturedRegionSize = self.captureRegionSize
+            let capturedSamplesPerSecond = self.mouseSamplesPerSecond
             writer.finishWriting { [weak self] in
                 let writerStatus = writerBox.writer.status
                 let writerError = writerBox.writer.error
@@ -754,6 +810,16 @@ final class RecordingEngine: NSObject, RecordingResultActions {
                         // Surface GIF export + trim (C1/C3) now that the MP4 exists.
                         self.uiTestLastFinishOutcome = "saved:\(url.path)"
                         self.lastFinishedRecording = (url, recordedDuration)
+                        if !capturedSamples.isEmpty {
+                            RecordingMetadataStore.save(
+                                RecordingMetadata(
+                                    captureSize: capturedRegionSize,
+                                    samplesPerSecond: capturedSamplesPerSecond,
+                                    mouseSamples: capturedSamples
+                                ),
+                                for: url
+                            )
+                        }
                         self.presentResult(url: url, duration: recordedDuration)
                     } else {
                         // Do not clobber a more specific probe (failed append)
@@ -952,6 +1018,10 @@ final class RecordingEngine: NSObject, RecordingResultActions {
     private func cleanup() {
         cancelFinishTimeout()
         stopMicrophoneCapture()
+        stopMouseSampling()
+        mouseSamples.removeAll()
+        captureRegionRect = .zero
+        captureRegionSize = .zero
         cameraBubble?.stop()
         cameraBubble = nil
         clickKeyOverlay?.stop()
