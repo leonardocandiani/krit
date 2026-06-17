@@ -10,6 +10,9 @@ import ScreenCaptureKit
 protocol RecordingResultActions: AnyObject {
     func exportGIF(from url: URL)
     func trim(url: URL, range: CMTimeRange)
+    /// Bakes screen-studio-style auto-zoom into a copy of the clip, following the
+    /// recorded cursor path. No-ops with a toast when the clip has no cursor data.
+    func exportAutoZoom(from url: URL)
     /// Re-presents the RecordingResultWindow (GIF / trim editor) for a finished
     /// recording. The overlay card's "Edit recording" routes here so the result
     /// window's exclusive features stay reachable after it stops being the default.
@@ -1011,6 +1014,38 @@ final class RecordingEngine: NSObject, RecordingResultActions {
             } else {
                 ToastWindow.show(message: "Could not trim recording.")
                 if let error = export.error { print("[KRIT] Trim failed: \(error)") }
+            }
+        }
+    }
+
+    func exportAutoZoom(from url: URL) {
+        guard let metadata = RecordingMetadataStore.load(for: url), metadata.mouseSamples.count >= 2 else {
+            ToastWindow.show(message: "No cursor data to auto-zoom this clip.")
+            return
+        }
+        let base = url.deletingPathExtension().lastPathComponent
+        let outURL = url.deletingLastPathComponent().appendingPathComponent("\(base) Auto-Zoom.mp4")
+        ToastWindow.show(message: "Rendering auto-zoom…")
+        Task { [weak self] in
+            let asset = AVURLAsset(url: url)
+            let seconds = (try? await asset.load(.duration)).map(CMTimeGetSeconds) ?? 0
+            guard seconds > 0.05 else {
+                ToastWindow.show(message: "Could not auto-zoom recording.")
+                return
+            }
+            // One auto segment over the whole clip: a constant 2x camera that
+            // follows the recorded cursor. Smart per-activity segments come later.
+            let segment = ZoomSegment(startTime: 0, duration: seconds, zoomLevel: 2.0, zoomType: .auto)
+            let path = AutoFocusEngine.buildPath(from: metadata, segment: segment)
+            do {
+                try await ZoomComposer.export(url: url, to: outURL, segments: [segment], autoFocusPaths: [segment.id: path])
+                guard let self else { return }
+                ToastWindow.show(message: "Saved auto-zoom: \(outURL.lastPathComponent)", duration: 3.0)
+                self.lastFinishedRecording = (outURL, seconds)
+                self.presentResult(url: outURL, duration: seconds)
+            } catch {
+                ToastWindow.show(message: "Could not auto-zoom recording.")
+                print("[KRIT] Auto-zoom export failed: \(error)")
             }
         }
     }

@@ -773,6 +773,9 @@ private final class QuickAccessWindow: NSWindow {
     private func buildVideoMenuTop(_ menu: NSMenu, payload: VideoCardPayload) {
         menu.addItem(contextItem("Open", #selector(openVideoAction)))
         menu.addItem(contextItem("Edit recording…", #selector(editAction), key: "e"))
+        let autoZoom = contextItem("Auto-Zoom & Export", #selector(autoZoomAction))
+        autoZoom.isEnabled = (payload.actions != nil)
+        menu.addItem(autoZoom)
 
         menu.addItem(.separator())
         // In-place zoom (O5) of the poster frame, same as pressing Space.
@@ -2688,6 +2691,11 @@ private final class QuickAccessWindow: NSWindow {
                 completion()
             }
         })
+    }
+
+    @objc private func autoZoomAction() {
+        guard let payload = videoPayload else { return }
+        payload.actions?.exportAutoZoom(from: payload.url)
     }
 
     @objc private func editAction() {
