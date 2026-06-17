@@ -316,16 +316,19 @@ final class UITestRunner: NSObject {
         guard let ctl = VideoEditorWindowController.uiTestShared else { r["allPass"] = false; return r }
         let state = ctl.uiTestState
         for _ in 0..<40 { if state.duration > 0.1 { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
+        for _ in 0..<60 { if !state.frameThumbnails.isEmpty { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
         r["duration"] = state.duration
         r["metadataLoaded"] = (state.metadata != nil)
+        r["frames"] = state.frameThumbnails.count
+
+        state.seek(to: 1.0)
+        state.addZoom(at: 1.0)
+        r["segments"] = state.zoomSegments.count
+        r["autoPaths"] = state.autoFocusPaths.count
+        try? await Task.sleep(nanoseconds: 400_000_000)
         if let win = ctl.window {
             r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-video-editor.png") ? "/tmp/krit-video-editor.png" : "FAILED"
         }
-
-        state.seek(to: 0.2)
-        state.addZoomAtPlayhead()
-        r["segments"] = state.zoomSegments.count
-        r["autoPaths"] = state.autoFocusPaths.count
         state.export()
         var outExists = false
         for _ in 0..<150 {

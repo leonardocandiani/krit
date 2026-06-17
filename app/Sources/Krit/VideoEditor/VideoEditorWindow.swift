@@ -24,6 +24,9 @@ final class VideoEditorState: ObservableObject {
     @Published var zoomSegments: [ZoomSegment] = []
     @Published var selectedZoomId: UUID?
 
+    @Published var frameThumbnails: [NSImage] = []
+    @Published var isExtractingFrames = false
+
     private(set) var metadata: RecordingMetadata?
     private(set) var autoFocusPaths: [UUID: [AutoFocusCameraSample]] = [:]
 
@@ -65,6 +68,30 @@ final class VideoEditorState: ObservableObject {
             self.trimEnd = self.duration
             if let size { self.naturalSize = CGSize(width: abs(size.width), height: abs(size.height)) }
         }
+        await extractFrames(count: 24, duration: max(dur, 0.01))
+    }
+
+    /// Filmstrip thumbnails across the clip, for the timeline.
+    private func extractFrames(count: Int, duration: Double) async {
+        await MainActor.run { self.isExtractingFrames = true }
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 160, height: 160)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 0.3, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.3, preferredTimescale: 600)
+        var images: [NSImage] = []
+        for i in 0..<count {
+            let t = duration * Double(i) / Double(max(count - 1, 1))
+            let time = CMTime(seconds: t, preferredTimescale: 600)
+            if let cg = try? await generator.image(at: time).image {
+                images.append(NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
+            }
+        }
+        await MainActor.run {
+            self.frameThumbnails = images
+            self.isExtractingFrames = false
+        }
     }
 
     // MARK: - Transport
@@ -94,7 +121,7 @@ final class VideoEditorState: ObservableObject {
     /// Resolved camera at the current time, for the live preview transform.
     func camera(at time: Double) -> CameraState {
         AutoFocusEngine.resolvedCameraState(
-            at: time, segments: zoomSegments, autoFocusPaths: autoFocusPaths,
+            at: time, segments: zoomSegments.filter(\.isEnabled), autoFocusPaths: autoFocusPaths,
             transitionDuration: ZoomCalculator.defaultTransitionDuration
         )
     }
@@ -124,13 +151,41 @@ final class VideoEditorState: ObservableObject {
         rebuildAutoPaths()
     }
 
-    /// Move a segment so it starts at `start`, clamped within the clip.
-    func moveSegment(_ id: UUID, to start: Double) {
-        guard let idx = zoomSegments.firstIndex(where: { $0.id == id }) else { return }
-        let maxStart = max(0, duration - zoomSegments[idx].duration)
-        zoomSegments[idx].startTime = min(max(start, 0), maxStart)
+    /// Add a zoom centered on `time` (Snapzy's click-to-add on the track).
+    func addZoom(at time: Double) {
+        let dur = min(ZoomSegment.defaultDuration, max(duration, ZoomSegment.minDuration))
+        let start = min(max(time - dur / 2, 0), max(duration - dur, 0))
+        let type: ZoomType = (metadata?.mouseSamples.count ?? 0) >= 2 ? .auto : .manual
+        let segment = ZoomSegment(startTime: start, duration: dur, zoomLevel: 2.0, zoomType: type)
+        zoomSegments.append(segment)
+        zoomSegments.sort { $0.startTime < $1.startTime }
+        selectedZoomId = segment.id
         rebuildAutoPaths()
     }
+
+    /// Resize/move during a track-level drag (start + duration set together).
+    func updateZoom(id: UUID, startTime: Double, duration newDuration: Double) {
+        guard let idx = zoomSegments.firstIndex(where: { $0.id == id }) else { return }
+        zoomSegments[idx].startTime = max(0, min(startTime, max(duration - ZoomSegment.minDuration, 0)))
+        zoomSegments[idx].duration = max(ZoomSegment.minDuration, min(newDuration, duration - zoomSegments[idx].startTime))
+        rebuildAutoPaths()
+    }
+
+    func selectZoom(id: UUID?) { selectedZoomId = id }
+
+    func removeZoom(id: UUID) {
+        zoomSegments.removeAll { $0.id == id }
+        autoFocusPaths[id] = nil
+        if selectedZoomId == id { selectedZoomId = nil }
+    }
+
+    func toggleZoomEnabled(id: UUID) {
+        guard let idx = zoomSegments.firstIndex(where: { $0.id == id }) else { return }
+        zoomSegments[idx].isEnabled.toggle()
+    }
+
+    func setTrimStart(_ t: Double) { trimStart = min(max(t, 0), trimEnd - 0.1) }
+    func setTrimEnd(_ t: Double) { trimEnd = max(min(t, duration), trimStart + 0.1) }
 
     func rebuildAutoPaths() {
         guard let metadata else { autoFocusPaths = [:]; return }
@@ -154,7 +209,7 @@ final class VideoEditorState: ObservableObject {
         pause()
         let base = url.deletingPathExtension().lastPathComponent
         let outURL = url.deletingLastPathComponent().appendingPathComponent("\(base) Edited.mp4")
-        let segments = zoomSegments
+        let segments = zoomSegments.filter(\.isEnabled)
         let paths = autoFocusPaths
         let trimmed = trimStart > 0.01 || trimEnd < duration - 0.01
         let range: CMTimeRange? = trimmed
@@ -255,8 +310,6 @@ final class PlayerLayerView: NSView {
 
 struct VideoEditorView: View {
     @ObservedObject var state: VideoEditorState
-    @State private var dragId: UUID?
-    @State private var dragOrigin: Double = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -265,7 +318,7 @@ struct VideoEditorView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black)
             timeline
-                .frame(height: 150)
+                .frame(height: 184)
                 .background(Color(white: 0.10))
         }
         .frame(minWidth: 720, minHeight: 540)
@@ -305,58 +358,8 @@ struct VideoEditorView: View {
     }
 
     private var timeline: some View {
-        VStack(spacing: 8) {
-            // Scrubber + trim.
-            GeometryReader { geo in
-                let w = geo.size.width
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color(white: 0.25)).frame(height: 6)
-                    // trimmed span highlight
-                    Rectangle().fill(Color.accentColor.opacity(0.25))
-                        .frame(width: max(0, frac(state.trimEnd - state.trimStart) * w), height: 30)
-                        .offset(x: frac(state.trimStart) * w)
-                    // playhead
-                    Rectangle().fill(Color.white).frame(width: 2, height: 38)
-                        .offset(x: frac(state.currentTime) * w - 1)
-                }
-                .frame(height: 38)
-                .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0).onChanged { v in
-                    state.seek(to: Double(max(0, min(v.location.x / w, 1))) * state.duration)
-                })
-            }
-            .frame(height: 38)
-
-            // Zoom lane.
-            GeometryReader { geo in
-                let w = geo.size.width
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 4).fill(Color(white: 0.18))
-                        .frame(height: 40)
-                    ForEach(state.zoomSegments) { seg in
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(seg.id == state.selectedZoomId ? Color.accentColor.opacity(0.85) : Color.accentColor.opacity(0.45))
-                            .frame(width: max(10, frac(seg.duration) * w), height: 34)
-                            .overlay(
-                                Text("\(seg.isAutoMode ? "Auto " : "")\(seg.formattedZoomLevel)")
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .foregroundColor(.white)
-                                    .padding(.leading, 6),
-                                alignment: .leading
-                            )
-                            .offset(x: frac(seg.startTime) * w)
-                            // Tap selects; drag moves the segment along the timeline.
-                            .gesture(DragGesture(minimumDistance: 0).onChanged { v in
-                                if dragId != seg.id { dragId = seg.id; dragOrigin = seg.startTime; state.selectedZoomId = seg.id }
-                                let dt = Double(v.translation.width / w) * state.duration
-                                state.moveSegment(seg.id, to: dragOrigin + dt)
-                            }.onEnded { _ in dragId = nil })
-                    }
-                }
-                .frame(height: 40)
-            }
-            .frame(height: 40)
-
+        VStack(spacing: 10) {
+            EditorTimeline(state: state)
             inspector
         }
         .padding(.horizontal, 16)
@@ -397,10 +400,6 @@ struct VideoEditorView: View {
             }
             .frame(height: 30)
         }
-    }
-
-    private func frac(_ t: Double) -> CGFloat {
-        state.duration > 0 ? CGFloat(t / state.duration) : 0
     }
 
     private func timeString(_ s: Double) -> String {
