@@ -15,7 +15,8 @@ enum ZoomComposer {
         for asset: AVAsset,
         segments: [ZoomSegment],
         autoFocusPaths: [UUID: [AutoFocusCameraSample]],
-        transitionDuration: TimeInterval = ZoomCalculator.defaultTransitionDuration
+        transitionDuration: TimeInterval = ZoomCalculator.defaultTransitionDuration,
+        background: VideoBackgroundOptions = .disabled
     ) async throws -> AVMutableVideoComposition {
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw ComposerError.noVideoTrack
@@ -25,8 +26,11 @@ enum ZoomComposer {
         let fps = nominalFPS > 0 ? nominalFPS : 30
         let duration = try await asset.load(.duration)
 
+        let natW = abs(naturalSize.width), natH = abs(naturalSize.height)
+        let pad = background.isEnabled ? (background.paddingFraction * natW).rounded() : 0
+
         let comp = AVMutableVideoComposition()
-        comp.renderSize = CGSize(width: abs(naturalSize.width), height: abs(naturalSize.height))
+        comp.renderSize = CGSize(width: natW + 2 * pad, height: natH + 2 * pad)
         comp.frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, fps.rounded())))
 
         let instruction = ZoomCompositionInstruction(
@@ -34,7 +38,8 @@ enum ZoomComposer {
             zooms: segments,
             autoFocusPaths: autoFocusPaths,
             trackID: track.trackID,
-            transitionDuration: transitionDuration
+            transitionDuration: transitionDuration,
+            background: background
         )
         comp.instructions = [instruction]
         comp.customVideoCompositorClass = ZoomVideoCompositor.self
@@ -48,14 +53,16 @@ enum ZoomComposer {
         segments: [ZoomSegment],
         autoFocusPaths: [UUID: [AutoFocusCameraSample]],
         transitionDuration: TimeInterval = ZoomCalculator.defaultTransitionDuration,
-        timeRange: CMTimeRange? = nil
+        timeRange: CMTimeRange? = nil,
+        background: VideoBackgroundOptions = .disabled
     ) async throws {
         let asset = AVURLAsset(url: url)
         let videoComposition = try await makeVideoComposition(
             for: asset,
             segments: segments,
             autoFocusPaths: autoFocusPaths,
-            transitionDuration: transitionDuration
+            transitionDuration: transitionDuration,
+            background: background
         )
         guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
             throw ComposerError.exportFailed
@@ -84,6 +91,7 @@ final class ZoomCompositionInstruction: NSObject, AVVideoCompositionInstructionP
     let autoFocusPaths: [UUID: [AutoFocusCameraSample]]
     let trackID: CMPersistentTrackID
     let transitionDuration: TimeInterval
+    let background: VideoBackgroundOptions
 
     var enablePostProcessing: Bool { true }
     var containsTweening: Bool { true }
@@ -95,13 +103,15 @@ final class ZoomCompositionInstruction: NSObject, AVVideoCompositionInstructionP
         zooms: [ZoomSegment],
         autoFocusPaths: [UUID: [AutoFocusCameraSample]],
         trackID: CMPersistentTrackID,
-        transitionDuration: TimeInterval
+        transitionDuration: TimeInterval,
+        background: VideoBackgroundOptions = .disabled
     ) {
         self.timeRange = timeRange
         self.zooms = zooms
         self.autoFocusPaths = autoFocusPaths
         self.trackID = trackID
         self.transitionDuration = transitionDuration
+        self.background = background
         super.init()
     }
 }
@@ -139,6 +149,10 @@ final class ZoomVideoCompositor: NSObject, AVVideoCompositing {
 
     func cancelAllPendingVideoCompositionRequests() {}
 
+    // Cached per export instance (render size + background params are constant).
+    private var cachedGradient: CIImage?
+    private var cachedMask: CIImage?
+
     private func process(_ request: AVAsynchronousVideoCompositionRequest) {
         guard let instruction = request.videoCompositionInstruction as? ZoomCompositionInstruction,
               let sourceBuffer = request.sourceFrame(byTrackID: instruction.trackID) else {
@@ -154,32 +168,97 @@ final class ZoomVideoCompositor: NSObject, AVVideoCompositing {
             transitionDuration: instruction.transitionDuration
         )
 
+        let source = CIImage(cvPixelBuffer: sourceBuffer)
+        let zoomed = camera.zoomLevel > minRenderableZoom ? applyZoom(to: source, camera: camera) : source
+
+        if instruction.background.isEnabled, let output = composeBackground(zoomed, background: instruction.background) {
+            request.finish(withComposedVideoFrame: output)
+            return
+        }
+
+        // Zoom-only (or passthrough) path.
         guard camera.zoomLevel > minRenderableZoom,
-              let output = applyZoom(to: sourceBuffer, camera: camera) else {
+              let renderContext, let output = renderContext.newPixelBuffer() else {
             request.finish(withComposedVideoFrame: sourceBuffer)
             return
         }
+        ciContext.render(zoomed, to: output)
         request.finish(withComposedVideoFrame: output)
     }
 
-    private func applyZoom(to sourceBuffer: CVPixelBuffer, camera: CameraState) -> CVPixelBuffer? {
-        let image = CIImage(cvPixelBuffer: sourceBuffer)
+    private func applyZoom(to image: CIImage, camera: CameraState) -> CIImage {
         let extent = image.extent
-        let crop = ZoomCalculator.calculateCropRect(
-            center: camera.center,
-            zoomLevel: camera.zoomLevel,
-            frameSize: extent.size
-        )
-        guard crop.width > 0, crop.height > 0 else { return nil }
+        let crop = ZoomCalculator.calculateCropRect(center: camera.center, zoomLevel: camera.zoomLevel, frameSize: extent.size)
+        guard crop.width > 0, crop.height > 0 else { return image }
         let scaleX = extent.width / crop.width
         let scaleY = extent.height / crop.height
-        let zoomed = image
+        return image
             .cropped(to: crop)
             .transformed(by: CGAffineTransform(translationX: -crop.origin.x, y: -crop.origin.y))
             .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+    }
 
+    /// Place the (rounded) video on the gradient backdrop with padding, baked into
+    /// a render-size buffer. Snapzy's signature look.
+    private func composeBackground(_ video: CIImage, background bg: VideoBackgroundOptions) -> CVPixelBuffer? {
         guard let renderContext, let output = renderContext.newPixelBuffer() else { return nil }
-        ciContext.render(zoomed, to: output)
+        let renderSize = renderContext.size
+        let extent = video.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+        let padX = (renderSize.width - extent.width) / 2
+        let padY = (renderSize.height - extent.height) / 2
+
+        let gradient = gradientImage(start: bg.startHex, end: bg.endHex, size: renderSize)
+        let radius = bg.cornerFraction * min(extent.width, extent.height)
+        let rounded = roundCorners(video, radius: radius) ?? video
+        let placed = rounded.transformed(by: CGAffineTransform(translationX: padX, y: padY))
+        let composite = placed.composited(over: gradient).cropped(to: CGRect(origin: .zero, size: renderSize))
+        ciContext.render(composite, to: output)
         return output
+    }
+
+    private func gradientImage(start: String, end: String, size: CGSize) -> CIImage {
+        if let cachedGradient { return cachedGradient }
+        let c0 = ciColor(start), c1 = ciColor(end)
+        let image: CIImage
+        if let f = CIFilter(name: "CILinearGradient") {
+            f.setValue(CIVector(x: 0, y: 0), forKey: "inputPoint0")
+            f.setValue(CIVector(x: 0, y: size.height), forKey: "inputPoint1")
+            f.setValue(c0, forKey: "inputColor0")
+            f.setValue(c1, forKey: "inputColor1")
+            image = (f.outputImage ?? CIImage(color: c0)).cropped(to: CGRect(origin: .zero, size: size))
+        } else {
+            image = CIImage(color: c0).cropped(to: CGRect(origin: .zero, size: size))
+        }
+        cachedGradient = image
+        return image
+    }
+
+    /// Clip the video to a rounded rect via an alpha mask (CoreGraphics, cached).
+    private func roundCorners(_ image: CIImage, radius: CGFloat) -> CIImage? {
+        guard radius > 0.5 else { return image }
+        let extent = image.extent
+        if cachedMask == nil {
+            let w = Int(extent.width.rounded()), h = Int(extent.height.rounded())
+            guard w > 0, h > 0,
+                  let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return image }
+            ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.addPath(CGPath(roundedRect: CGRect(x: 0, y: 0, width: w, height: h), cornerWidth: radius, cornerHeight: radius, transform: nil))
+            ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fillPath()
+            if let cg = ctx.makeImage() { cachedMask = CIImage(cgImage: cg).transformed(by: CGAffineTransform(translationX: extent.origin.x, y: extent.origin.y)) }
+        }
+        guard let mask = cachedMask, let blend = CIFilter(name: "CIBlendWithAlphaMask") else { return image }
+        blend.setValue(image, forKey: kCIInputImageKey)
+        blend.setValue(CIImage(color: .clear).cropped(to: extent), forKey: kCIInputBackgroundImageKey)
+        blend.setValue(mask, forKey: kCIInputMaskImageKey)
+        return blend.outputImage
+    }
+
+    private func ciColor(_ hex: String) -> CIColor {
+        let ns = ScreenshotBackgroundComposer.color(from: hex).usingColorSpace(.sRGB) ?? .black
+        return CIColor(red: ns.redComponent, green: ns.greenComponent, blue: ns.blueComponent, alpha: 1)
     }
 }

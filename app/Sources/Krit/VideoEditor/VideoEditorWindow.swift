@@ -8,6 +8,17 @@ import SwiftUI
 // directly, and an export that bakes the zoom into the file via ZoomComposer.
 // Replaces the menu-action "Auto-Zoom & Export" with an interactive editor.
 
+/// The gradient backdrop the video sits on (padding + rounded corners), Snapzy's
+/// signature look. Fractions keep the preview and the baked export consistent.
+struct VideoBackgroundOptions: Equatable {
+    var isEnabled: Bool = false
+    var startHex: String = "#1f0a22"
+    var endHex: String = "#ff8f6b"
+    var paddingFraction: CGFloat = 0.06   // of video width, per side
+    var cornerFraction: CGFloat = 0.025   // of the smaller video dimension
+    static let disabled = VideoBackgroundOptions()
+}
+
 @MainActor
 final class VideoEditorState: ObservableObject {
     let url: URL
@@ -26,6 +37,21 @@ final class VideoEditorState: ObservableObject {
 
     @Published var frameThumbnails: [NSImage] = []
     @Published var isExtractingFrames = false
+
+    @Published var backgroundEnabled = false
+    @Published var backgroundPresetIndex = 0
+    @Published var backgroundPadding: CGFloat = 0.06
+    @Published var backgroundCorner: CGFloat = 0.025
+
+    static let backgroundPresets = Array(ScreenshotBackgroundOptions.imagePresets.prefix(8))
+
+    var backgroundOptions: VideoBackgroundOptions {
+        let p = Self.backgroundPresets[min(backgroundPresetIndex, Self.backgroundPresets.count - 1)]
+        return VideoBackgroundOptions(
+            isEnabled: backgroundEnabled, startHex: p.startHex, endHex: p.endHex,
+            paddingFraction: backgroundPadding, cornerFraction: backgroundCorner
+        )
+    }
 
     private(set) var metadata: RecordingMetadata?
     private(set) var autoFocusPaths: [UUID: [AutoFocusCameraSample]] = [:]
@@ -211,6 +237,7 @@ final class VideoEditorState: ObservableObject {
         let outURL = url.deletingLastPathComponent().appendingPathComponent("\(base) Edited.mp4")
         let segments = zoomSegments.filter(\.isEnabled)
         let paths = autoFocusPaths
+        let bg = backgroundOptions
         let trimmed = trimStart > 0.01 || trimEnd < duration - 0.01
         let range: CMTimeRange? = trimmed
             ? CMTimeRange(start: CMTime(seconds: trimStart, preferredTimescale: 600),
@@ -220,7 +247,7 @@ final class VideoEditorState: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await ZoomComposer.export(url: self.url, to: outURL, segments: segments, autoFocusPaths: paths, timeRange: range)
+                try await ZoomComposer.export(url: self.url, to: outURL, segments: segments, autoFocusPaths: paths, timeRange: range, background: bg)
                 await MainActor.run {
                     self.isExporting = false
                     ToastWindow.show(message: "Saved: \(outURL.lastPathComponent)", duration: 3.0)
@@ -314,15 +341,37 @@ struct VideoEditorView: View {
     var body: some View {
         VStack(spacing: 0) {
             toolbar
-            PlayerView(state: state)
+            playerArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black)
             timeline
-                .frame(height: 184)
+                .frame(height: 226)
                 .background(Color(white: 0.10))
         }
-        .frame(minWidth: 720, minHeight: 540)
+        .frame(minWidth: 720, minHeight: 560)
         .background(Color(white: 0.13))
+    }
+
+    private var playerArea: some View {
+        GeometryReader { geo in
+            ZStack {
+                if state.backgroundEnabled {
+                    LinearGradient(colors: [color(state.backgroundOptions.startHex), color(state.backgroundOptions.endHex)],
+                                   startPoint: .bottom, endPoint: .top)
+                } else {
+                    Color.black
+                }
+                PlayerView(state: state)
+                    .aspectRatio(state.naturalSize.width / max(state.naturalSize.height, 1), contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: state.backgroundEnabled ? state.backgroundCorner * min(geo.size.width, geo.size.height) : 0))
+                    .shadow(color: .black.opacity(state.backgroundEnabled ? 0.45 : 0), radius: 18, y: 8)
+                    .padding(state.backgroundEnabled ? state.backgroundPadding * geo.size.width : 0)
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+        }
+    }
+
+    private func color(_ hex: String) -> Color {
+        Color(nsColor: ScreenshotBackgroundComposer.color(from: hex))
     }
 
     private var toolbar: some View {
@@ -361,9 +410,40 @@ struct VideoEditorView: View {
         VStack(spacing: 10) {
             EditorTimeline(state: state)
             inspector
+            Divider()
+            backgroundBar
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    private var backgroundBar: some View {
+        HStack(spacing: 10) {
+            Toggle(isOn: $state.backgroundEnabled) { Text("Background") }
+                .toggleStyle(.switch)
+            if state.backgroundEnabled {
+                ForEach(0..<VideoEditorState.backgroundPresets.count, id: \.self) { i in
+                    swatch(i)
+                }
+                Divider().frame(height: 18)
+                Image(systemName: "square.dashed").foregroundColor(.secondary)
+                Slider(value: $state.backgroundPadding, in: 0...0.14).frame(width: 80)
+                Image(systemName: "rectangle.roundedtop").foregroundColor(.secondary)
+                Slider(value: $state.backgroundCorner, in: 0...0.06).frame(width: 80)
+            }
+            Spacer()
+        }
+        .frame(height: 28)
+    }
+
+    private func swatch(_ i: Int) -> some View {
+        let p = VideoEditorState.backgroundPresets[i]
+        return RoundedRectangle(cornerRadius: 5)
+            .fill(LinearGradient(colors: [color(p.startHex), color(p.endHex)], startPoint: .bottom, endPoint: .top))
+            .frame(width: 26, height: 20)
+            .overlay(RoundedRectangle(cornerRadius: 5)
+                .strokeBorder(state.backgroundPresetIndex == i ? Color.white : .clear, lineWidth: 2))
+            .onTapGesture { state.backgroundPresetIndex = i }
     }
 
     @ViewBuilder private var inspector: some View {

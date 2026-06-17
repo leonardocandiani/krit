@@ -325,19 +325,30 @@ final class UITestRunner: NSObject {
         state.addZoom(at: 1.0)
         r["segments"] = state.zoomSegments.count
         r["autoPaths"] = state.autoFocusPaths.count
-        try? await Task.sleep(nanoseconds: 400_000_000)
+        // Turn on the Snapzy-style gradient background so the snapshot + export
+        // exercise the padded/rounded composite path.
+        state.backgroundEnabled = true
+        try? await Task.sleep(nanoseconds: 500_000_000)
         if let win = ctl.window {
             r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-video-editor.png") ? "/tmp/krit-video-editor.png" : "FAILED"
         }
         state.export()
-        var outExists = false
+        var outURL: URL?
         for _ in 0..<150 {
-            if let e = exported { outExists = FileManager.default.fileExists(atPath: e.path); break }
+            if let e = exported { outURL = e; break }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
+        let outExists = outURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
         r["exportExists"] = outExists
+        var outWidth: CGFloat = 0
+        if let e = outURL, let track = try? await AVURLAsset(url: e).loadTracks(withMediaType: .video).first,
+           let size = try? await track.load(.naturalSize) {
+            outWidth = abs(size.width)
+        }
+        r["outWidth"] = outWidth
+        r["padded"] = outWidth > 320   // source is 320 wide; background padding must enlarge it
         ctl.close()
-        r["allPass"] = state.duration > 0.1 && state.zoomSegments.count == 1 && outExists
+        r["allPass"] = state.duration > 0.1 && state.zoomSegments.count == 1 && outExists && outWidth > 320
         return r
     }
 
