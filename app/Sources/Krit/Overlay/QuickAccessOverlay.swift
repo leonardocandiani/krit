@@ -1490,14 +1490,21 @@ private final class QuickAccessWindow: NSWindow {
         let durationText = Self.durationLabel(duration)
         let font = NSFont.systemFont(ofSize: metrics.pillFontSize, weight: .semibold)
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
-        // NSTextField lays text slightly wider than NSString.size reports (cell
-        // insets, glyph bearing), and a label defaults to truncating-tail. Sizing
-        // the field to the bare measured width clipped the last digit, so "0:08"
-        // rendered "0:0". Round up + a small slack and disable truncation so the
-        // whole stamp always fits.
-        let textW = ceil((durationText as NSString).size(withAttributes: attrs).width) + 2
+        // Let the field measure ITSELF (sizeToFit) instead of guessing the width
+        // from NSString.size. The measured-width path under-reported the cell
+        // insets and clipped the last digit ("0:02" rendered "0:0") even with a
+        // slack pad; the intrinsic content size never clips, at any digit count.
+        let label = NSTextField(labelWithAttributedString: NSAttributedString(string: durationText, attributes: attrs))
+        label.lineBreakMode = .byClipping
+        label.cell?.truncatesLastVisibleLine = false
+        label.isBezeled = false
+        label.drawsBackground = false
+        label.isEditable = false
+        label.sizeToFit()
+        let textW = ceil(label.frame.width)
+        let textH = ceil(label.frame.height)
         let pad: CGFloat = 8
-        let pillH = metrics.pillHeight * 0.74
+        let pillH = max(metrics.pillHeight * 0.74, textH + 4)
         let pill = NSView(frame: NSRect(
             x: metrics.buttonMargin,
             y: metrics.buttonMargin,
@@ -1508,13 +1515,7 @@ private final class QuickAccessWindow: NSWindow {
         pill.layer?.cornerRadius = pillH / 2
         pill.layer?.cornerCurve = .continuous
 
-        let label = NSTextField(labelWithAttributedString: NSAttributedString(string: durationText, attributes: attrs))
-        label.lineBreakMode = .byClipping
-        label.cell?.truncatesLastVisibleLine = false
-        label.frame = NSRect(x: pad, y: (pillH - font.pointSize - 4) / 2, width: textW, height: font.pointSize + 4)
-        label.isBezeled = false
-        label.drawsBackground = false
-        label.isEditable = false
+        label.frame = NSRect(x: pad, y: (pillH - textH) / 2, width: textW, height: textH)
         pill.addSubview(label)
         badge.addSubview(pill)
 

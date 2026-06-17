@@ -254,6 +254,10 @@ final class UITestRunner: NSObject {
         ctrl.show(tab: .shortcuts)
         try? await Task.sleep(nanoseconds: 500_000_000)
         r["survivedTabSwitch"] = (ctrl.uiTestWindow?.isVisible ?? false)
+        if let win = ctrl.uiTestWindow {
+            let shot = "/tmp/krit-prefs-glass.png"
+            r["snapshot"] = Self.snapshotWindow(win, to: shot) ? shot : "FAILED"
+        }
         ctrl.uiTestClose()
         r["allPass"] = (r["windowUp"] as? Bool == true) && (r["survivedTabSwitch"] as? Bool == true)
         return r
@@ -1279,7 +1283,13 @@ final class UITestRunner: NSObject {
             && (cardsAfter > cardsBefore)
             && (engine.uiTestDimPanelCount == 0)
 
-        if cardsAfter > cardsBefore { QuickAccessOverlay.uiTestCloseNewest() }
+        if cardsAfter > cardsBefore {
+            if let card = QuickAccessOverlay.uiTestWindows.last {
+                _ = Self.snapshotWindow(card, to: "/tmp/krit-video-card.png")
+                r["cardShot"] = "/tmp/krit-video-card.png"
+            }
+            QuickAccessOverlay.uiTestCloseNewest()
+        }
         return r
     }
 
