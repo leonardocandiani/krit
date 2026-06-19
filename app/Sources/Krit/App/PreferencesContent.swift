@@ -87,7 +87,7 @@ private struct GeneralForm: View {
                     Text(mode.label).tag(mode)
                 }
             } label: {
-                Text("Theme")
+                rowLabel("Theme", "circle.lefthalf.filled", .indigo)
                 Text("Match the system, or always use Light or Dark.")
             }
             .pickerStyle(.segmented)
@@ -99,7 +99,7 @@ private struct GeneralForm: View {
 
         Section("Startup") {
             Toggle(isOn: $launchAtLogin) {
-                Text("Launch KRIT at login")
+                rowLabel("Launch KRIT at login", "power", .green)
                 Text("Start the menu bar app automatically.")
             }
             .onChange(of: launchAtLogin) { newValue in
@@ -115,15 +115,17 @@ private struct GeneralForm: View {
 
         Section("Sounds") {
             Toggle(isOn: $playSounds) {
-                Text("Play sounds")
+                rowLabel("Play sounds", "speaker.wave.2.fill", .pink)
                 Text("Capture, copy, save, and recording cues.")
             }
             .onChange(of: playSounds) { Settings.playSounds = $0 }
 
-            Picker("Capture sound", selection: $captureSound) {
+            Picker(selection: $captureSound) {
                 ForEach(CaptureSoundStyle.allCases, id: \.self) { style in
                     Text(style.displayName).tag(style)
                 }
+            } label: {
+                rowLabel("Capture sound", "waveform", .purple)
             }
             .onChange(of: captureSound) { newValue in
                 Settings.captureSoundStyle = newValue
@@ -133,21 +135,25 @@ private struct GeneralForm: View {
         }
 
         Section("Menu bar") {
-            Toggle("Show menu bar icon", isOn: $showMenuBarIcon)
-                .onChange(of: showMenuBarIcon) { Settings.showMenuBarIcon = $0 }
-            Toggle("Hide desktop icons while capturing", isOn: $hideDesktopIcons)
-                .onChange(of: hideDesktopIcons) { Settings.hideDesktopIconsWhileCapturing = $0 }
+            Toggle(isOn: $showMenuBarIcon) {
+                rowLabel("Show menu bar icon", "menubar.rectangle", .blue)
+            }
+            .onChange(of: showMenuBarIcon) { Settings.showMenuBarIcon = $0 }
+            Toggle(isOn: $hideDesktopIcons) {
+                rowLabel("Hide desktop icons while capturing", "menubar.dock.rectangle", .gray)
+            }
+            .onChange(of: hideDesktopIcons) { Settings.hideDesktopIconsWhileCapturing = $0 }
         }
 
         Section("After capture") {
             Toggle(isOn: $copyToClipboard) {
-                Text("Copy screenshots to clipboard")
+                rowLabel("Copy screenshots to clipboard", "doc.on.clipboard.fill", .blue)
                 Text("New screenshots are copied automatically.")
             }
             .onChange(of: copyToClipboard) { Settings.afterCaptureCopyToClipboard = $0 }
 
             Toggle(isOn: $saveAutomatically) {
-                Text("Save automatically")
+                rowLabel("Save automatically", "square.and.arrow.down.fill", .green)
                 Text("Write each capture to the save location without asking.")
             }
             .onChange(of: saveAutomatically) { Settings.afterCaptureSaveAutomatically = $0 }
@@ -155,7 +161,7 @@ private struct GeneralForm: View {
 
         Section("Selection") {
             Toggle(isOn: $magnifierOnControl) {
-                Text("Show magnifier only while holding Control")
+                rowLabel("Show magnifier only while holding Control", "plus.magnifyingglass", .orange)
                 Text("Keeps the crosshair light; hold ⌃ for the zoom loupe and guide lines.")
             }
             .onChange(of: magnifierOnControl) { Settings.magnifierRequiresControl = $0 }
@@ -174,16 +180,19 @@ private struct CaptureForm: View {
 
     var body: some View {
         Section("Export format") {
-            Picker("File format", selection: $format) {
+            Picker(selection: $format) {
                 Text("PNG").tag("png")
                 Text("JPEG").tag("jpeg")
                 Text("WebP").tag("webp")
                 Text("PDF").tag("pdf")
+            } label: {
+                rowLabel("File format", "doc.fill", .blue)
             }
             .onChange(of: format) { Settings.screenshotFormat = $0 }
 
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
+                HStack(spacing: 10) {
+                    SettingIcon(symbol: "slider.horizontal.3", color: .indigo)
                     Text("JPEG quality")
                     Spacer()
                     Text("\(Int(jpegQuality * 100))%")
@@ -202,7 +211,7 @@ private struct CaptureForm: View {
                 Text("5 seconds").tag(5)
                 Text("10 seconds").tag(10)
             } label: {
-                Text("Self-timer")
+                rowLabel("Self-timer", "timer", .orange)
                 Text("Counts 3, 2, 1 before the capture fires. Esc cancels.")
             }
             .onChange(of: countdown) { Settings.captureCountdownSeconds = $0 }
@@ -214,14 +223,15 @@ private struct CaptureForm: View {
                     Text(value.displayName).tag(value)
                 }
             } label: {
-                Text("Background")
+                rowLabel("Background", "macwindow.on.rectangle", .teal)
                 Text("Window shots open composed on the current desktop wallpaper, centered with a shadow.")
             }
             .onChange(of: windowBackground) { Settings.windowCaptureBackground = $0 }
         }
 
         Section("Save location") {
-            HStack {
+            HStack(spacing: 10) {
+                SettingIcon(symbol: "folder.fill", color: .blue)
                 Text("Screenshots folder")
                 Spacer()
                 Text(saveLocation)
@@ -272,33 +282,41 @@ private struct RecordingForm: View {
                 Text("High").tag("high")
                 Text("Max").tag("max")
             } label: {
-                Text("Quality")
+                rowLabel("Quality", "video.fill", .red)
                 Text("Max keeps more detail for demos but makes larger files.")
             }
             .onChange(of: quality) { Settings.recordingQuality = $0 }
 
-            Picker("Frame rate", selection: $fps) {
+            Picker(selection: $fps) {
                 Text("30 fps").tag(30)
                 Text("60 fps").tag(60)
+            } label: {
+                rowLabel("Frame rate", "speedometer", .orange)
             }
             .onChange(of: fps) { Settings.recordingFPS = $0 }
 
-            Toggle("Show cursor", isOn: $showsCursor)
-                .onChange(of: showsCursor) { Settings.recordingShowsCursor = $0 }
+            Toggle(isOn: $showsCursor) {
+                rowLabel("Show cursor", "cursorarrow", .gray)
+            }
+            .onChange(of: showsCursor) { Settings.recordingShowsCursor = $0 }
         }
 
         Section("Audio") {
             Toggle(isOn: $systemAudio) {
-                Text("Record system audio")
+                rowLabel("Record system audio", "speaker.wave.2.fill", .purple)
                 Text("Excludes KRIT's own sounds to avoid feedback.")
             }
             .onChange(of: systemAudio) { Settings.recordingSystemAudio = $0 }
 
-            Toggle("Record microphone", isOn: $microphone)
-                .onChange(of: microphone) { Settings.recordingMicrophone = $0 }
+            Toggle(isOn: $microphone) {
+                rowLabel("Record microphone", "mic.fill", .pink)
+            }
+            .onChange(of: microphone) { Settings.recordingMicrophone = $0 }
 
             DevicePicker(
                 title: "Microphone",
+                symbol: "mic.circle.fill",
+                color: .pink,
                 options: PreferencesDeviceProvider.microphones,
                 selection: $micDevice
             )
@@ -307,13 +325,15 @@ private struct RecordingForm: View {
 
         Section("Webcam") {
             Toggle(isOn: $webcam) {
-                Text("Webcam overlay")
+                rowLabel("Webcam overlay", "camera.fill", .teal)
                 Text("Circular picture in picture in the corner. Needs camera permission.")
             }
             .onChange(of: webcam) { Settings.recordingWebcam = $0 }
 
             DevicePicker(
                 title: "Camera",
+                symbol: "camera.circle.fill",
+                color: .teal,
                 options: PreferencesDeviceProvider.cameras,
                 selection: $webcamDevice
             )
@@ -321,22 +341,26 @@ private struct RecordingForm: View {
         }
 
         Section("Clicks and keystrokes") {
-            Toggle("Highlight mouse clicks", isOn: $showsClicks)
-                .onChange(of: showsClicks) { Settings.recordingShowsClicks = $0 }
+            Toggle(isOn: $showsClicks) {
+                rowLabel("Highlight mouse clicks", "cursorarrow.click", .blue)
+            }
+            .onChange(of: showsClicks) { Settings.recordingShowsClicks = $0 }
 
             Toggle(isOn: $showsKeystrokes) {
-                Text("Show pressed keys")
+                rowLabel("Show pressed keys", "keyboard.fill", .indigo)
                 Text("Keystroke HUD inside the recording. Needs Accessibility permission.")
             }
             .onChange(of: showsKeystrokes) { Settings.recordingShowsKeystrokes = $0 }
         }
 
         Section("GIF export") {
-            Picker("Frame rate", selection: $gifFPS) {
+            Picker(selection: $gifFPS) {
                 Text("10 fps").tag(10)
                 Text("15 fps").tag(15)
                 Text("24 fps").tag(24)
                 Text("30 fps").tag(30)
+            } label: {
+                rowLabel("Frame rate", "speedometer", .orange)
             }
             .onChange(of: gifFPS) { Settings.recordingGIFFPS = $0 }
 
@@ -346,7 +370,7 @@ private struct RecordingForm: View {
                 Text("800 px").tag(800)
                 Text("1024 px").tag(1024)
             } label: {
-                Text("Max size")
+                rowLabel("Max size", "arrow.up.left.and.arrow.down.right", .green)
                 Text("Largest dimension in pixels; frames downscale to fit.")
             }
             .onChange(of: gifMaxDimension) { Settings.recordingGIFMaxDimension = $0 }
@@ -358,14 +382,18 @@ private struct RecordingForm: View {
 /// AppKit popup it replaces, so the persisted ID stays compatible.
 private struct DevicePicker: View {
     let title: String
+    var symbol: String = "circle"
+    var color: Color = .gray
     let options: [(String, String)]
     @Binding var selection: String
 
     var body: some View {
-        Picker(title, selection: $selection) {
+        Picker(selection: $selection) {
             ForEach(options, id: \.1) { option in
                 Text(option.0).tag(option.1)
             }
+        } label: {
+            rowLabel(title, symbol, color)
         }
     }
 }
@@ -379,27 +407,33 @@ private struct PreviewForm: View {
 
     var body: some View {
         Section("Size") {
-            Picker("Preview size", selection: $size) {
+            Picker(selection: $size) {
                 ForEach(OverlaySize.allCases, id: \.self) { value in
                     Text(value.displayName).tag(value)
                 }
+            } label: {
+                rowLabel("Preview size", "arrow.up.left.and.arrow.down.right", .indigo)
             }
             .onChange(of: size) { Settings.overlaySize = $0 }
         }
 
         Section("Behavior") {
-            Picker("Auto dismiss", selection: $timeout) {
+            Picker(selection: $timeout) {
                 Text("3 seconds").tag(3.0)
                 Text("6 seconds").tag(6.0)
                 Text("10 seconds").tag(10.0)
                 Text("30 seconds").tag(30.0)
                 Text("Never").tag(-1.0)
+            } label: {
+                rowLabel("Auto dismiss", "clock.fill", .orange)
             }
             .onChange(of: timeout) { Settings.overlayTimeout = $0 }
 
-            Picker("Screen side", selection: $onLeft) {
+            Picker(selection: $onLeft) {
                 Text("Left").tag(true)
                 Text("Right").tag(false)
+            } label: {
+                rowLabel("Screen side", "arrow.left.and.right.square.fill", .teal)
             }
             .onChange(of: onLeft) { Settings.overlayOnLeft = $0 }
         }
@@ -421,7 +455,8 @@ private struct EditorForm: View {
     var body: some View {
         Section("Annotations") {
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
+                HStack(spacing: 10) {
+                    SettingIcon(symbol: "pencil.tip", color: .red)
                     Text("Default thickness")
                     Spacer()
                     Text("\(Int(lineWidth)) pt")
@@ -442,7 +477,7 @@ private struct EditorForm: View {
                     Text(option.0).tag(option.1)
                 }
             } label: {
-                Text("Default template")
+                rowLabel("Default template", "doc.on.doc.fill", .purple)
                 Text("Applied automatically to new captures.")
             }
             .onChange(of: defaultTemplate) {
@@ -457,27 +492,28 @@ private struct EditorForm: View {
 private struct ShortcutsForm: View {
     var body: some View {
         Section("Screenshots") {
-            KeyboardShortcuts.Recorder("All-in-one", name: .allInOne)
-            KeyboardShortcuts.Recorder("Capture area", name: .captureArea)
-            KeyboardShortcuts.Recorder("Capture window", name: .captureWindow)
-            KeyboardShortcuts.Recorder("Capture full screen", name: .captureFullscreen)
-            KeyboardShortcuts.Recorder("Repeat last area", name: .capturePreviousArea)
-            KeyboardShortcuts.Recorder("Snap and paste", name: .snapAndPaste)
-            KeyboardShortcuts.Recorder("Toggle capture history", name: .captureHistory)
+            shortcutRow("All-in-one", "square.dashed.inset.filled", .blue, .allInOne)
+            shortcutRow("Capture area", "rectangle.dashed", .blue, .captureArea)
+            shortcutRow("Capture window", "macwindow", .teal, .captureWindow)
+            shortcutRow("Capture full screen", "rectangle.on.rectangle", .indigo, .captureFullscreen)
+            shortcutRow("Repeat last area", "arrow.counterclockwise", .orange, .capturePreviousArea)
+            shortcutRow("Snap and paste", "doc.on.clipboard", .green, .snapAndPaste)
+            shortcutRow("Toggle capture history", "clock.arrow.circlepath", .purple, .captureHistory)
         }
 
         Section("Recording") {
-            KeyboardShortcuts.Recorder("Record screen", name: .recordScreen)
+            shortcutRow("Record screen", "record.circle", .red, .recordScreen)
         }
 
         Section("Tools") {
-            KeyboardShortcuts.Recorder("Capture text (OCR)", name: .ocrCapture)
-            KeyboardShortcuts.Recorder("Scrolling capture", name: .scrollingCapture)
-            KeyboardShortcuts.Recorder("Pick color", name: .pickColor)
+            shortcutRow("Capture text (OCR)", "text.viewfinder", .pink, .ocrCapture)
+            shortcutRow("Scrolling capture", "scroll", .brown, .scrollingCapture)
+            shortcutRow("Pick color", "eyedropper", .mint, .pickColor)
         }
 
         Section {
-            HStack {
+            HStack(spacing: 10) {
+                SettingIcon(symbol: "arrow.uturn.backward", color: .gray)
                 Text("Restore defaults")
                 Spacer()
                 Button("Restore") {
@@ -486,6 +522,17 @@ private struct ShortcutsForm: View {
             }
         } footer: {
             Text("Click a shortcut to change it. Shortcuts are global while KRIT runs.")
+        }
+    }
+
+    /// One shortcut row: icon chip + title on the left, the recorder field on the
+    /// right.
+    @ViewBuilder
+    private func shortcutRow(_ title: String, _ symbol: String, _ color: Color, _ name: KeyboardShortcuts.Name) -> some View {
+        HStack(spacing: 10) {
+            rowLabel(title, symbol, color)
+            Spacer()
+            KeyboardShortcuts.Recorder("", name: name)
         }
     }
 }
@@ -525,8 +572,9 @@ private struct PresetsForm: View {
             Button {
                 newFromSelection()
             } label: {
-                Label("New preset from selection", systemImage: "plus.viewfinder")
+                rowLabel("New preset from selection", "plus.viewfinder", .green)
             }
+            .buttonStyle(.plain)
         } footer: {
             Text("Drag a region on screen; KRIT saves it as a preset you can name and bind.")
         }
@@ -667,38 +715,109 @@ private struct PresetRow: View {
 
 // MARK: - About
 
+/// A colored rounded-square glyph, the Settings-style icon chip that gives each
+/// About row a bit of life.
+private struct SettingIcon: View {
+    let symbol: String
+    let color: Color
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(color.gradient)
+            .frame(width: 26, height: 26)
+            .overlay(
+                Image(systemName: symbol)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+            )
+    }
+}
+
+/// A settings row label with a leading colored icon chip, the look every
+/// Preferences row shares.
+@ViewBuilder
+private func rowLabel(_ title: String, _ symbol: String, _ color: Color) -> some View {
+    Label { Text(title) } icon: { SettingIcon(symbol: symbol, color: color) }
+}
+
 private struct AboutForm: View {
     private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.15.4"
     private let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+    private let repo = "https://github.com/leonardocandiani/krit"
+
+    @State private var autoCheck = UpdaterManager.shared.automaticChecks
 
     var body: some View {
         Section {
-            HStack(spacing: 18) {
+            HStack(spacing: 16) {
                 Image(nsImage: NSImage(named: "NSApplicationIcon")
                     ?? NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: nil)
                     ?? NSImage())
                     .resizable()
-                    .frame(width: 72, height: 72)
-                VStack(alignment: .leading, spacing: 4) {
+                    .frame(width: 64, height: 64)
+                VStack(alignment: .leading, spacing: 3) {
                     Text("KRIT")
-                        .font(.system(size: 24, weight: .bold))
+                        .font(.system(size: 22, weight: .bold))
                     Text("Version \(version) (\(build))")
+                        .foregroundStyle(.secondary)
+                    Text("Screenshots and screen recording for macOS.")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
             }
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
+        }
+
+        Section("Updates") {
+            LabeledContent {
+                Button("Check Now") { UpdaterManager.shared.checkForUpdates() }
+            } label: {
+                Label { Text("Check for Updates") } icon: { SettingIcon(symbol: "arrow.triangle.2.circlepath", color: .blue) }
+            }
+
+            Toggle(isOn: $autoCheck) {
+                Label { Text("Automatically check for updates") } icon: { SettingIcon(symbol: "clock.arrow.circlepath", color: .green) }
+            }
+            .onChange(of: autoCheck) { UpdaterManager.shared.automaticChecks = $0 }
+
+            Button {
+                WhatsNewWindowController.showNow()
+            } label: {
+                Label { Text("What's New") } icon: { SettingIcon(symbol: "sparkles", color: .pink) }
+            }
+            .buttonStyle(.plain)
+        }
+
+        Section {
+            LabeledContent {
+                Button("Report") { open("\(repo)/issues/new?labels=bug") }
+            } label: {
+                Label { Text("Report a Bug") } icon: { SettingIcon(symbol: "ladybug.fill", color: .red) }
+            }
+
+            LabeledContent {
+                Button("Request") { open("\(repo)/issues/new?labels=enhancement") }
+            } label: {
+                Label { Text("Request a Feature") } icon: { SettingIcon(symbol: "lightbulb.fill", color: .orange) }
+            }
+
+            LabeledContent {
+                Button("Star") { open(repo) }
+            } label: {
+                Label { Text("Star on GitHub") } icon: { SettingIcon(symbol: "star.fill", color: .yellow) }
+            }
+        } header: {
+            Text("Feedback")
+        } footer: {
+            Text("Found a bug or have an idea? KRIT is open source, everything goes straight to GitHub.")
         }
 
         Section("Links") {
-            HStack {
-                Text("Source on GitHub")
-                Spacer()
-                Button("Open") {
-                    if let link = URL(string: "https://github.com/leonardocandiani/krit") {
-                        NSWorkspace.shared.open(link)
-                    }
-                }
+            LabeledContent {
+                Button("Open") { open(repo) }
+            } label: {
+                Label { Text("Source on GitHub") } icon: { SettingIcon(symbol: "chevron.left.forwardslash.chevron.right", color: .gray) }
             }
         }
 
@@ -707,6 +826,10 @@ private struct AboutForm: View {
         } footer: {
             Text("© 2026 Leonardo Candiani. MIT License, free and open source.")
         }
+    }
+
+    private func open(_ string: String) {
+        if let url = URL(string: string) { NSWorkspace.shared.open(url) }
     }
 }
 

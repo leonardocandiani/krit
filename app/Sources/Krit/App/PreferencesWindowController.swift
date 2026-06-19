@@ -100,20 +100,18 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         root.autoresizingMask = [.width, .height]
         window.contentView = root
 
-        // Sidebar: behindWindow vibrancy so it reads as part of the window edge,
-        // traffic lights floating over it (titlebar is transparent).
-        let sidebarBlur = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: windowSize.height))
-        sidebarBlur.material = .sidebar
-        sidebarBlur.blendingMode = .behindWindow
-        sidebarBlur.state = .active
-        sidebarBlur.autoresizingMask = [.height]
-        root.addSubview(sidebarBlur)
-
+        // Sidebar: real Liquid Glass (NSGlassEffectView via ChromeFactory, the same
+        // backing the overlay and Welcome use), replacing the old .sidebar vibrancy
+        // so Settings finally speaks the app's glass language. Square corners; the
+        // window's own rounding clips the left edge. Traffic lights float over it
+        // (titlebar transparent). Pre-26 systems fall back to the HUD blur.
         sidebar = PreferencesSidebar(width: sidebarWidth, height: windowSize.height) { [weak self] tab in
             self?.select(tab: tab, animated: true)
         }
-        sidebar.view.autoresizingMask = [.height]
-        sidebarBlur.addSubview(sidebar.view)
+        let sidebarGlass = ChromeFactory.make(content: sidebar.view, cornerRadius: 0)
+        sidebarGlass.frame = NSRect(x: 0, y: 0, width: sidebarWidth, height: windowSize.height)
+        sidebarGlass.autoresizingMask = [.height]
+        root.addSubview(sidebarGlass)
 
         // Hairline between sidebar and content. A separator color so it reads in
         // both light and dark instead of a fixed white alpha that vanished on light.
@@ -357,6 +355,12 @@ extension PreferencesWindowController {
     func uiTestForceShow() {
         select(tab: .general, animated: false)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Switch tabs with no cross-fade, so a snapshot catches the settled state
+    /// instead of two layers mid-transition.
+    func uiTestSelect(_ tab: PreferencesTab) {
+        select(tab: tab, animated: false)
     }
 
     var uiTestWindow: NSWindow? { window }

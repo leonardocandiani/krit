@@ -113,6 +113,10 @@ final class UITestRunner: NSObject {
             case "autozoom-export": report = await Self.runAutoZoomExport()
             case "video-preview": report = await Self.runVideoPreview()
             case "video-editor": report = await Self.runVideoEditor()
+            case "whats-new": report = await Self.runWhatsNew()
+            case "about": report = await Self.runAbout()
+            case "prefs-icons": report = await Self.runPrefsIcons()
+            case "toast": report = await Self.runToast()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
@@ -286,6 +290,114 @@ final class UITestRunner: NSObject {
         r["outsideIsIdentity"] = (outside == CameraState.identity)
 
         r["allPass"] = path.count > 10 && inBounds && followsRight && mid.zoomLevel > 1.5 && outside == .identity
+        return r
+    }
+
+    // MARK: - Cenário: whats-new (painel de novidades pós-update)
+
+    /// Confirma que as notas bundled carregam, que a lógica de gate decide certo
+    /// (instalação nova não mostra, update mostra, versão repetida/stale não), e
+    /// que o painel abre de fato (snapshot).
+    private static func runWhatsNew() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "whats-new"]
+        guard let notes = WhatsNewStore.load() else { r["error"] = "WhatsNew.md not bundled"; r["allPass"] = false; return r }
+        r["notesVersion"] = notes.version
+        r["notesHasBody"] = !notes.body.isEmpty
+
+        // Pure gate decision across the branches.
+        let v = "1.0.0"
+        let freshInstall = WhatsNewWindowController.shouldShow(current: v, lastSeen: "", hasLaunched: false, notesVersion: v)
+        let sameVersion  = WhatsNewWindowController.shouldShow(current: v, lastSeen: v, hasLaunched: true, notesVersion: v)
+        let realUpdate   = WhatsNewWindowController.shouldShow(current: v, lastSeen: "0.9.0", hasLaunched: true, notesVersion: v)
+        let staleNotes   = WhatsNewWindowController.shouldShow(current: v, lastSeen: "0.9.0", hasLaunched: true, notesVersion: "0.9.0")
+        r["gateFreshInstall"] = freshInstall   // expect false
+        r["gateSameVersion"] = sameVersion     // expect false
+        r["gateRealUpdate"] = realUpdate       // expect true
+        r["gateStaleNotes"] = staleNotes       // expect false
+
+        // The panel actually opens (manual path, no gating).
+        WhatsNewWindowController.showNow()
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        let opened = WhatsNewWindowController.uiTestIsOpen
+        r["panelOpened"] = opened
+        if opened, let win = WhatsNewWindowController.uiTestWindow {
+            r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-whats-new.png") ? "/tmp/krit-whats-new.png" : "FAILED"
+        }
+        WhatsNewWindowController.uiTestClose()
+
+        r["allPass"] = !notes.body.isEmpty && !freshInstall && !sameVersion && realUpdate && !staleNotes && opened
+        return r
+    }
+
+    // MARK: - Cenário: prefs-icons (chips de ícone em todas as abas)
+
+    /// Percorre cada aba do Preferences e fotografa, pra conferir os chips de
+    /// ícone colorido em todas as telas. Snapshots em /tmp/krit-prefs-<aba>.png.
+    private static func runPrefsIcons() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "prefs-icons"]
+        let ctrl = PreferencesWindowController.shared
+        ctrl.uiTestForceShow()
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        guard let win = ctrl.uiTestWindow else { r["error"] = "prefs not open"; r["allPass"] = false; return r }
+        let originalFrame = win.frame
+        defer { win.setFrame(originalFrame, display: false); ctrl.uiTestClose() }
+        var f = win.frame; f.size.height = 760; win.setFrame(f, display: true)
+
+        let tabs: [(PreferencesTab, String)] = [
+            (.general, "general"), (.capture, "capture"), (.recording, "recording"),
+            (.preview, "preview"), (.editor, "editor"), (.shortcuts, "shortcuts"),
+            (.presets, "presets")
+        ]
+        var shots: [String] = []
+        var allOK = true
+        for (tab, name) in tabs {
+            ctrl.uiTestSelect(tab)
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            let path = "/tmp/krit-prefs-\(name).png"
+            let ok = Self.snapshotWindow(win, to: path)
+            allOK = allOK && ok
+            shots.append(ok ? path : "FAILED:\(name)")
+        }
+        r["snapshots"] = shots
+        r["allPass"] = allOK
+        return r
+    }
+
+    // MARK: - Cenário: about (tela About repaginada com cards)
+
+    /// Abre o Preferences na aba About e fotografa: header, cards de Updates e
+    /// Feedback com chips de ícone. Gate visual em /tmp/krit-about.png.
+    private static func runAbout() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "about"]
+        let ctrl = PreferencesWindowController.shared
+        ctrl.uiTestForceShow()
+        ctrl.show(tab: .about)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        guard let win = ctrl.uiTestWindow else { r["error"] = "prefs not open"; r["allPass"] = false; return r }
+        let originalFrame = win.frame
+        defer { win.setFrame(originalFrame, display: false); ctrl.uiTestClose() }
+        let shot = "/tmp/krit-about.png"
+        let ok = Self.snapshotWindow(win, to: shot)
+        r["snapshot"] = ok ? shot : "FAILED"
+        r["allPass"] = ok
+        return r
+    }
+
+    // MARK: - Cenário: toast (notificação com ícone)
+
+    /// Mostra um toast e fotografa o glifo + texto na cápsula de glass. Gate
+    /// visual em /tmp/krit-toast.png.
+    private static func runToast() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "toast"]
+        ToastWindow.show(message: "Saved screenshot to Desktop", duration: 8.0)
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        guard let win = NSApp.windows.first(where: { $0 is ToastWindow }) else {
+            r["error"] = "toast not shown"; r["allPass"] = false; return r
+        }
+        let shot = "/tmp/krit-toast.png"
+        let ok = Self.snapshotWindow(win, to: shot)
+        r["snapshot"] = ok ? shot : "FAILED"
+        r["allPass"] = ok
         return r
     }
 

@@ -7,10 +7,10 @@ final class ToastWindow: NSWindow {
     private static var current: ToastWindow?
     private var finalOrigin: NSPoint = .zero
 
-    static func show(message: String, duration: TimeInterval = 2.0, anchorView: NSView? = nil) {
+    static func show(message: String, duration: TimeInterval = 2.0, anchorView: NSView? = nil, icon: String? = nil) {
         current?.orderOut(nil)
 
-        let toast = ToastWindow(message: message, anchorView: anchorView)
+        let toast = ToastWindow(message: message, anchorView: anchorView, icon: icon)
         current = toast
 
         // Start 12px below final position, scaled down
@@ -60,7 +60,7 @@ final class ToastWindow: NSWindow {
         }
     }
 
-    private init(message: String, anchorView: NSView?) {
+    private init(message: String, anchorView: NSView?, icon: String?) {
         let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
@@ -72,8 +72,14 @@ final class ToastWindow: NSWindow {
         let paddingX: CGFloat = 28
         let paddingY: CGFloat = 12
         let textSafety: CGFloat = 34
+        // Every toast carries a leading glyph (the Klack-style polish): an
+        // explicit symbol when passed, otherwise one inferred from the message.
+        let glyph = Self.resolveIcon(name: icon, message: message)
+        let iconSize: CGFloat = 17
+        let iconGap: CGFloat = 9
+        let iconSpace = iconSize + iconGap
         let maxWidth = min(760, max(320, screenFrame.width - horizontalInset * 2))
-        let maxTextWidth = maxWidth - paddingX * 2
+        let maxTextWidth = maxWidth - paddingX * 2 - iconSpace
         let singleLineWidth = ceil((message as NSString).size(withAttributes: attrs).width)
         let targetTextWidth = min(singleLineWidth + textSafety, maxTextWidth)
         let textRect = (message as NSString).boundingRect(
@@ -81,8 +87,8 @@ final class ToastWindow: NSWindow {
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: attrs
         )
-        let width = Self.pixelAligned(min(maxWidth, max(280, ceil(targetTextWidth) + paddingX * 2)), scale: screenScale)
-        let labelWidth = Self.pixelAligned(width - paddingX * 2, scale: screenScale)
+        let width = Self.pixelAligned(min(maxWidth, max(280, ceil(targetTextWidth) + paddingX * 2 + iconSpace)), scale: screenScale)
+        let labelWidth = Self.pixelAligned(width - paddingX * 2 - iconSpace, scale: screenScale)
         let labelHeight = ceil(textRect.height)
         let bubbleHeight = Self.pixelAligned(max(42, labelHeight + paddingY * 2), scale: screenScale)
         let pointerHeight: CGFloat = anchorView == nil ? 0 : 9
@@ -134,12 +140,19 @@ final class ToastWindow: NSWindow {
 
         contentView = container
 
+        let iconView = NSImageView(frame: NSRect(x: paddingX, y: (bubbleHeight - iconSize) / 2, width: iconSize, height: iconSize))
+        iconView.image = NSImage(systemSymbolName: glyph.symbol, accessibilityDescription: nil)
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        iconView.contentTintColor = glyph.color
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        clipView.addSubview(iconView)
+
         let label = NSTextField(wrappingLabelWithString: message)
         label.attributedStringValue = NSAttributedString(string: message, attributes: attrs)
         label.textColor = .white
         label.alignment = .center
         label.lineBreakMode = .byCharWrapping
-        label.frame = NSRect(x: paddingX, y: (bubbleHeight - labelHeight) / 2, width: labelWidth, height: labelHeight)
+        label.frame = NSRect(x: paddingX + iconSpace, y: (bubbleHeight - labelHeight) / 2, width: labelWidth, height: labelHeight)
         clipView.addSubview(label)
 
         if let anchorFrame = Self.screenFrame(for: anchorView), let screen = Self.screen(containing: anchorFrame) {
@@ -156,6 +169,26 @@ final class ToastWindow: NSWindow {
             finalOrigin = Self.pixelAligned(NSPoint(x: x, y: y), scale: screenScale)
             setFrameOrigin(finalOrigin)
         }
+    }
+
+    /// Picks the leading glyph + tint for a toast. An explicit symbol wins;
+    /// otherwise the message text is matched to a fitting icon so success, error,
+    /// progress and copy cues each read at a glance.
+    private static func resolveIcon(name: String?, message: String) -> (symbol: String, color: NSColor) {
+        if let name { return (name, .white) }
+        let m = message.lowercased()
+        if m.contains("could not") || m.contains("not saved") || m.contains("unavailable")
+            || m.contains("check permissions") || m.contains("already in progress") {
+            return ("exclamationmark.triangle.fill", .systemOrange)
+        }
+        if m.hasPrefix("saved") || m.contains("copied") {
+            return ("checkmark.circle.fill", .systemGreen)
+        }
+        if m.contains("recording started") { return ("record.circle.fill", .systemRed) }
+        if m.contains("exporting") || m.contains("rendering") || m.contains("trimming") {
+            return ("hourglass", .white)
+        }
+        return ("info.circle.fill", .white)
     }
 
     private static func screenFrame(for view: NSView?) -> NSRect? {

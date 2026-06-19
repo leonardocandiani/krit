@@ -26,6 +26,13 @@ final class UpdaterManager: NSObject {
 
     var updater: SPUUpdater { controller.updater }
 
+    /// Auto-update preference, surfaced in About so callers never touch Sparkle
+    /// types directly.
+    var automaticChecks: Bool {
+        get { updater.automaticallyChecksForUpdates }
+        set { updater.automaticallyChecksForUpdates = newValue }
+    }
+
     /// User-initiated check (menu item). Shows Sparkle's standard UI.
     func checkForUpdates() {
         controller.checkForUpdates(nil)
