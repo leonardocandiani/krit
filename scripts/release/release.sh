@@ -168,6 +168,13 @@ NEW_VERSION="$(defaults read "$INFO_PLIST" CFBundleShortVersionString)"
 [ "$NEW_VERSION" = "$VERSION" ] || fail "Version bump did not take effect (read back: $NEW_VERSION)."
 ok "Version set to $VERSION in app/Info.plist"
 
+# Bundle the release notes so the in-app "What's New" panel shows them after the
+# update. Written BEFORE the build so it ships inside the app; the leading
+# "version:" line gates the panel to this exact build.
+WHATSNEW_FILE="$APP_DIR/Sources/Krit/Resources/WhatsNew.md"
+{ printf 'version: %s\n' "$VERSION"; cat "$NOTES_TMP"; } > "$WHATSNEW_FILE"
+ok "What's New notes bundled for $VERSION"
+
 # ---------------------------------------------------------------------------
 # Build the app
 # ---------------------------------------------------------------------------
@@ -242,7 +249,7 @@ fi
 # appcast entry and the cask digest; shipped apps read appcast.xml from main,
 # so main gets pushed before the release is published.
 info "Committing release metadata"
-git add "$INFO_PLIST" "$REPO_ROOT/appcast.xml" "$CASK_FILE"
+git add "$INFO_PLIST" "$REPO_ROOT/appcast.xml" "$CASK_FILE" "$WHATSNEW_FILE"
 git commit -m "chore: release $TAG
 
 - bump CFBundleShortVersionString to $VERSION

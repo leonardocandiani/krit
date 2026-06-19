@@ -43,6 +43,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if !welcomeController.showIfNeeded(onClose: promptForNativeShortcuts) {
             promptForNativeShortcuts()
         }
+        // After an update, surface the release notes once (gated on a version
+        // change; skipped on a fresh install, where the welcome runs instead).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            WhatsNewWindowController.showIfNeeded()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -257,6 +262,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let updates = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
         updates.target = self
         menu.addItem(updates)
+
+        let whatsNew = NSMenuItem(title: "What's New", action: #selector(showWhatsNew), keyEquivalent: "")
+        whatsNew.target = self
+        menu.addItem(whatsNew)
         menu.addItem(.separator())
 
         menu.addItem(header: "Capture")
@@ -341,6 +350,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func openPreferences()     { PreferencesWindowController.shared.show(tab: .general) }
     @objc func openAbout()           { PreferencesWindowController.shared.show(tab: .about) }
     @objc func checkForUpdates()     { UpdaterManager.shared.checkForUpdates() }
+    @objc func showWhatsNew()        { WhatsNewWindowController.showNow() }
 
     // MARK: - Recent captures (status item menu section)
 

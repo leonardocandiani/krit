@@ -35,6 +35,13 @@ enum Settings {
         set { defaults.set(newValue, forKey: "didShowReadyToast") }
     }
 
+    /// Last app version whose "What's New" panel was shown, so it appears once per
+    /// update and never nags.
+    static var lastWhatsNewVersion: String {
+        get { defaults.string(forKey: "lastWhatsNewVersion") ?? "" }
+        set { defaults.set(newValue, forKey: "lastWhatsNewVersion") }
+    }
+
     // MARK: - Overlay
 
     /// Auto-dismiss timeout in seconds. -1 = never dismiss automatically.
