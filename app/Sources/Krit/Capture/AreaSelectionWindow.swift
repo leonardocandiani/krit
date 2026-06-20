@@ -43,7 +43,13 @@ final class AreaSelectionWindow: NSObject {
         // robust both-ways fix is a frozen-frame pipeline (capture on hotkey,
         // crop from the freeze), which would fix that at the cost of the
         // configurable capture scale — a separate product call.
-        NSApp.setActivationPolicy(.regular)
+        // Activating KRIT (next line) is what makes the overlay appear over the
+        // frontmost app — see the note above. The activation POLICY only decides
+        // whether that activation also flashes a Dock icon for the selection's
+        // duration: `.regular` shows one, `.accessory` does not. Default to
+        // `.accessory` (no Dock flash, like every other KRIT window); the
+        // showDockIconDuringCapture setting opts back into `.regular`.
+        NSApp.setActivationPolicy(Settings.showDockIconDuringCapture ? .regular : .accessory)
         NSApp.activate(ignoringOtherApps: true)
 
         // Overlays go up IMMEDIATELY so the selection is usable the instant the

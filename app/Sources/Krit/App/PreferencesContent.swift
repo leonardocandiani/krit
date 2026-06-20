@@ -75,6 +75,7 @@ private struct GeneralForm: View {
     @State private var captureSound = Settings.captureSoundStyle
     @State private var showMenuBarIcon = Settings.showMenuBarIcon
     @State private var hideDesktopIcons = Settings.hideDesktopIconsWhileCapturing
+    @State private var showDockDuringCapture = Settings.showDockIconDuringCapture
     @State private var copyToClipboard = Settings.afterCaptureCopyToClipboard
     @State private var saveAutomatically = Settings.afterCaptureSaveAutomatically
     @State private var magnifierOnControl = Settings.magnifierRequiresControl
@@ -144,6 +145,11 @@ private struct GeneralForm: View {
                 rowLabel("Hide desktop icons while capturing", "menubar.dock.rectangle", .gray)
             }
             .onChange(of: hideDesktopIcons) { Settings.hideDesktopIconsWhileCapturing = $0 }
+            Toggle(isOn: $showDockDuringCapture) {
+                rowLabel("Show Dock icon during capture", "dock.rectangle", .teal)
+                Text("KRIT briefly appears in the Dock while you pick a capture area. Off keeps it hidden.")
+            }
+            .onChange(of: showDockDuringCapture) { Settings.showDockIconDuringCapture = $0 }
         }
 
         Section("After capture") {

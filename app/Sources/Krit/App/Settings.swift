@@ -125,6 +125,16 @@ enum Settings {
         set { defaults.set(newValue, forKey: "hideDesktopIconsWhileCapturing") }
     }
 
+    /// Whether KRIT shows a Dock icon while the area-selection overlay is up.
+    /// The overlay needs KRIT activated to reliably appear over the frontmost app
+    /// (see AreaSelectionWindow); activating under `.regular` flashes a Dock icon
+    /// for the selection's duration, while `.accessory` does not. Default OFF — no
+    /// Dock flash; users who prefer the Dock presence can turn it on.
+    static var showDockIconDuringCapture: Bool {
+        get { defaults.bool(forKey: "showDockIconDuringCapture") }
+        set { defaults.set(newValue, forKey: "showDockIconDuringCapture") }
+    }
+
     // MARK: - After Capture
 
     static var afterCaptureShowOverlay: Bool {
