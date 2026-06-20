@@ -137,6 +137,7 @@ private struct GeneralForm: View {
         Section("Menu bar") {
             Toggle(isOn: $showMenuBarIcon) {
                 rowLabel("Show menu bar icon", "menubar.rectangle", .blue)
+                Text("Hidden? Reopen KRIT from Spotlight or Finder to get back to Preferences.")
             }
             .onChange(of: showMenuBarIcon) { Settings.showMenuBarIcon = $0 }
             Toggle(isOn: $hideDesktopIcons) {

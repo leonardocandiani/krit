@@ -56,6 +56,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         QuickAccessOverlay.tearDownAll()
     }
 
+    /// KRIT is a menu-bar (LSUIElement) app with no Dock icon and no main window,
+    /// so relaunching it — Spotlight, `open -a KRIT`, double-click in Finder while
+    /// it already runs — has no natural target; macOS routes that intent here.
+    /// Open Preferences when nothing of KRIT's is on screen, OR whenever the menu
+    /// bar icon is hidden: with the icon off, this reopen is the ONLY way back to
+    /// Preferences (where the toggle to restore the icon lives), so without this
+    /// hook, hiding the icon would strand the user with no way into settings.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag || !Settings.showMenuBarIcon {
+            openPreferences()
+        }
+        return true
+    }
+
     /// Two entry points share this callback:
     ///   - `krit://` automation URLs (URL scheme) route to the command router.
     ///   - "Open With KRIT" file URLs (Finder, Dock drop) open in the editor.
