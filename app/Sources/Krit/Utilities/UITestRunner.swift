@@ -116,6 +116,7 @@ final class UITestRunner: NSObject {
             case "whats-new": report = await Self.runWhatsNew()
             case "about": report = await Self.runAbout()
             case "prefs-icons": report = await Self.runPrefsIcons()
+            case "reopen": report = await Self.runReopenRecovery()
             case "toast": report = await Self.runToast()
             default:             report["error"] = "unknown scenario"
             }
@@ -326,6 +327,57 @@ final class UITestRunner: NSObject {
         WhatsNewWindowController.uiTestClose()
 
         r["allPass"] = !notes.body.isEmpty && !freshInstall && !sameVersion && realUpdate && !staleNotes && opened
+        return r
+    }
+
+    // MARK: - Cenário: reopen (PR #4, recuperar Preferences com o ícone escondido)
+
+    /// Exercita o handler real `applicationShouldHandleReopen` nos três ramos da
+    /// lógica `if !flag || !Settings.showMenuBarIcon`: abre Preferences quando não
+    /// há janela; abre quando o ícone da barra está escondido mesmo com janela; e
+    /// NÃO força Preferences quando o ícone está visível e já há janela. Salva e
+    /// restaura `showMenuBarIcon` pra não deixar o default sujo.
+    private static func runReopenRecovery() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "reopen"]
+        guard let delegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no AppDelegate"; r["allPass"] = false; return r
+        }
+        let prefs = PreferencesWindowController.shared
+        let savedIcon = Settings.showMenuBarIcon
+
+        // Ramo 1: sem janela visível -> reopen abre Preferences.
+        prefs.uiTestClose()
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        _ = delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        let opensWhenNoWindows = prefs.uiTestWindow?.isVisible == true
+        r["opensWhenNoWindows"] = opensWhenNoWindows
+
+        // Ramo 2 (o bug reportado): ícone escondido -> reopen abre Preferences mesmo
+        // alegando janela visível.
+        Settings.showMenuBarIcon = false
+        prefs.uiTestClose()
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        _ = delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        let opensWhenIconHidden = prefs.uiTestWindow?.isVisible == true
+        r["opensWhenIconHidden"] = opensWhenIconHidden
+        if opensWhenIconHidden, let win = prefs.uiTestWindow {
+            r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-reopen.png") ? "/tmp/krit-reopen.png" : "FAILED"
+        }
+
+        // Controle: ícone visível + janela já aberta -> reopen NÃO força Preferences.
+        Settings.showMenuBarIcon = true
+        prefs.uiTestClose()
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        _ = delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true)
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        let staysClosedWhenSafe = prefs.uiTestWindow?.isVisible != true
+        r["staysClosedWhenIconVisibleAndWindowOpen"] = staysClosedWhenSafe
+
+        Settings.showMenuBarIcon = savedIcon
+        prefs.uiTestClose()
+        r["allPass"] = opensWhenNoWindows && opensWhenIconHidden && staysClosedWhenSafe
         return r
     }
 
