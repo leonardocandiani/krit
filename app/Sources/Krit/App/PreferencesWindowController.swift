@@ -108,10 +108,32 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         sidebar = PreferencesSidebar(width: sidebarWidth, height: windowSize.height) { [weak self] tab in
             self?.select(tab: tab, animated: true)
         }
-        let sidebarGlass = ChromeFactory.make(content: sidebar.view, cornerRadius: 0)
-        sidebarGlass.frame = NSRect(x: 0, y: 0, width: sidebarWidth, height: windowSize.height)
-        sidebarGlass.autoresizingMask = [.height]
-        root.addSubview(sidebarGlass)
+        // On macOS 26+ the sidebar is real Liquid Glass. Below that, the glass
+        // chip fallback is wrong for a full-height structural panel: its floating
+        // rim framed the sidebar in a white border and the HUD material washed the
+        // tabs out (the bug Intel/older-macOS users saw). Fall back to native
+        // `.sidebar` vibrancy, which is what a sidebar should be pre-26.
+        let sidebarBacking: NSView
+        if #available(macOS 26.0, *), !ChromeFactory.forceFallback {
+            sidebarBacking = ChromeFactory.make(content: sidebar.view, cornerRadius: 0)
+        } else {
+            let vev = NSVisualEffectView()
+            vev.material = .sidebar
+            vev.blendingMode = .behindWindow
+            vev.state = .active
+            sidebar.view.translatesAutoresizingMaskIntoConstraints = false
+            vev.addSubview(sidebar.view)
+            NSLayoutConstraint.activate([
+                sidebar.view.leadingAnchor.constraint(equalTo: vev.leadingAnchor),
+                sidebar.view.trailingAnchor.constraint(equalTo: vev.trailingAnchor),
+                sidebar.view.topAnchor.constraint(equalTo: vev.topAnchor),
+                sidebar.view.bottomAnchor.constraint(equalTo: vev.bottomAnchor),
+            ])
+            sidebarBacking = vev
+        }
+        sidebarBacking.frame = NSRect(x: 0, y: 0, width: sidebarWidth, height: windowSize.height)
+        sidebarBacking.autoresizingMask = [.height]
+        root.addSubview(sidebarBacking)
 
         // Hairline between sidebar and content. A separator color so it reads in
         // both light and dark instead of a fixed white alpha that vanished on light.

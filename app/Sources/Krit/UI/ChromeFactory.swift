@@ -36,12 +36,17 @@ enum ChromeFactory {
         static let pill: CGFloat = 6
     }
 
+    /// Debug switch to exercise the pre-macOS 26 blur fallback on a modern
+    /// machine (set KRIT_FORCE_GLASS_FALLBACK=1). Lets the Intel/older-macOS
+    /// rendering be reproduced and snapshotted without that hardware.
+    static var forceFallback: Bool { ProcessInfo.processInfo.environment["KRIT_FORCE_GLASS_FALLBACK"] == "1" }
+
     /// Wraps `content` in a glass (or blur) capsule with the given radius.
     /// The returned view owns `content`; size the returned view, not content.
     @MainActor
     static func make(content: NSView, cornerRadius: CGFloat, variant: Variant = .regular, tint: NSColor? = nil) -> NSView {
         content.translatesAutoresizingMaskIntoConstraints = false
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), !forceFallback {
             let glass = NSGlassEffectView()
             glass.contentView = content
             glass.cornerRadius = cornerRadius
@@ -64,7 +69,7 @@ enum ChromeFactory {
     /// to autoresize; the caller stacks its own controls above it.
     @MainActor
     static func backing(frame: NSRect, cornerRadius: CGFloat, variant: Variant = .regular, tint: NSColor? = nil) -> NSView {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), !forceFallback {
             let glass = NSGlassEffectView(frame: frame)
             glass.cornerRadius = cornerRadius
             if let tint { glass.tintColor = tint }
@@ -112,13 +117,17 @@ enum ChromeFactory {
         blur.layer?.masksToBounds = true
 
         // The hairline is fallback-only, real glass self-rims. It also doubles
-        // as the accessibility contrast edge.
-        let ws = NSWorkspace.shared
-        let highContrast = ws.accessibilityDisplayShouldIncreaseContrast
-        let lessTransparent = ws.accessibilityDisplayShouldReduceTransparency
-        let borderAlpha: CGFloat = highContrast ? 0.55 : (lessTransparent ? 0.30 : 0.18)
-        blur.layer?.borderWidth = highContrast ? 1.5 : 1
-        blur.layer?.borderColor = NSColor.white.withAlphaComponent(borderAlpha).cgColor
+        // as the accessibility contrast edge. Only a rounded, floating shape gets
+        // the rim: an edge-to-edge panel (cornerRadius 0) would draw it as a stray
+        // white border framing the whole surface, so skip it there.
+        if cornerRadius > 0 {
+            let ws = NSWorkspace.shared
+            let highContrast = ws.accessibilityDisplayShouldIncreaseContrast
+            let lessTransparent = ws.accessibilityDisplayShouldReduceTransparency
+            let borderAlpha: CGFloat = highContrast ? 0.55 : (lessTransparent ? 0.30 : 0.18)
+            blur.layer?.borderWidth = highContrast ? 1.5 : 1
+            blur.layer?.borderColor = NSColor.white.withAlphaComponent(borderAlpha).cgColor
+        }
 
         if let tint {
             // Tinted fallback: lay the accent wash over the blur at low alpha so
