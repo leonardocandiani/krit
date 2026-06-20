@@ -48,6 +48,9 @@ packages/tokens/build/
 # claude code runtime (kept local)
 .claude/
 
+# codex cli config (kept local)
+.codex/
+
 # stray root screenshots
 /krit-*.png
 
