@@ -79,6 +79,8 @@ private struct GeneralForm: View {
     @State private var copyToClipboard = Settings.afterCaptureCopyToClipboard
     @State private var saveAutomatically = Settings.afterCaptureSaveAutomatically
     @State private var magnifierOnControl = Settings.magnifierRequiresControl
+    @State private var aiCloudEnabled = Settings.aiCloudEnabled
+    @State private var claudeFound = false
     @State private var appearance = Settings.appearanceMode
 
     var body: some View {
@@ -172,6 +174,28 @@ private struct GeneralForm: View {
                 Text("Keeps the crosshair light; hold ⌃ for the zoom loupe and guide lines.")
             }
             .onChange(of: magnifierOnControl) { Settings.magnifierRequiresControl = $0 }
+        }
+
+        Section("AI") {
+            Toggle(isOn: $aiCloudEnabled) {
+                rowLabel("Cloud AI features", "sparkles", .purple)
+                Text("On-device AI (text recognition, translation) always works. Turn this on to also use cloud features through your own Claude subscription — KRIT runs the Claude Code app you installed and never stores an API key.")
+            }
+            .onChange(of: aiCloudEnabled) { Settings.aiCloudEnabled = $0 }
+
+            if aiCloudEnabled && !claudeFound {
+                Text("Claude Code not found — install it and run claude setup-token, then reopen this window.")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+        }
+        .task {
+            // Probe for the `claude` binary OFF the main thread: the absolute-path
+            // checks are cheap, but the login-shell fallback can block for hundreds
+            // of ms, and the default (no-claude) user always reaches it. Running it
+            // in a @State default would freeze the General tab on every open.
+            let found = await Task.detached { AICapability.claudeCLIPath != nil }.value
+            claudeFound = found
         }
     }
 }

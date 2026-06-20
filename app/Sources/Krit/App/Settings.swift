@@ -376,6 +376,17 @@ enum Settings {
         get { defaults.bool(forKey: "didPromptAccessibilityForPaste") }
         set { defaults.set(newValue, forKey: "didPromptAccessibilityForPaste") }
     }
+
+    // MARK: - AI
+
+    /// Opt-in for the cloud AI tier. OFF by default. On-device AI (Vision,
+    /// Translation) needs no opt-in; this gate is only for features that reach
+    /// the user's own Claude subscription via the installed `claude` binary.
+    /// KRIT stores no API key and never uses a paid API key.
+    static var aiCloudEnabled: Bool {
+        get { defaults.bool(forKey: "aiCloudEnabled") }
+        set { defaults.set(newValue, forKey: "aiCloudEnabled") }
+    }
 }
 
 
