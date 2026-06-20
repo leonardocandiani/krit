@@ -175,6 +175,25 @@ WHATSNEW_FILE="$APP_DIR/Sources/Krit/Resources/WhatsNew.md"
 { printf 'version: %s\n' "$VERSION"; cat "$NOTES_TMP"; } > "$WHATSNEW_FILE"
 ok "What's New notes bundled for $VERSION"
 
+# Prepend the same notes to CHANGELOG.md (Keep-a-Changelog style: newest first,
+# right under the "# Changelog" heading). Section headers in the notes are demoted
+# to ### so they nest under the ## version. Skipped if the entry already exists.
+CHANGELOG_FILE="$REPO_ROOT/CHANGELOG.md"
+if [ -f "$CHANGELOG_FILE" ] && ! grep -q "^## $VERSION$" "$CHANGELOG_FILE"; then
+    CL_TMP="$(mktemp -t krit-changelog)"
+    {
+        printf '# Changelog\n\nAll notable changes to KRIT, newest first.\n\n'
+        printf '## %s\n\n' "$VERSION"
+        sed 's/^## /### /' "$NOTES_TMP"
+        printf '\n'
+        # Everything after the existing header block (skip the first 4 lines:
+        # title, blank, intro, blank).
+        tail -n +5 "$CHANGELOG_FILE"
+    } > "$CL_TMP"
+    mv "$CL_TMP" "$CHANGELOG_FILE"
+    ok "CHANGELOG.md updated for $VERSION"
+fi
+
 # ---------------------------------------------------------------------------
 # Build the app
 # ---------------------------------------------------------------------------
@@ -249,7 +268,7 @@ fi
 # appcast entry and the cask digest; shipped apps read appcast.xml from main,
 # so main gets pushed before the release is published.
 info "Committing release metadata"
-git add "$INFO_PLIST" "$REPO_ROOT/appcast.xml" "$CASK_FILE" "$WHATSNEW_FILE"
+git add "$INFO_PLIST" "$REPO_ROOT/appcast.xml" "$CASK_FILE" "$WHATSNEW_FILE" "$CHANGELOG_FILE"
 git commit -m "chore: release $TAG
 
 - bump CFBundleShortVersionString to $VERSION
