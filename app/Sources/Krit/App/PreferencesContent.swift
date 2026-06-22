@@ -79,8 +79,10 @@ private struct GeneralForm: View {
     @State private var copyToClipboard = Settings.afterCaptureCopyToClipboard
     @State private var saveAutomatically = Settings.afterCaptureSaveAutomatically
     @State private var magnifierOnControl = Settings.magnifierRequiresControl
-    @State private var aiCloudEnabled = Settings.aiCloudEnabled
-    @State private var claudeFound = false
+    @State private var aiToken = ""
+    @State private var aiTokenStored = AICredentials.hasToken
+    @State private var aiTesting = false
+    @State private var aiTestResult: String?
     @State private var appearance = Settings.appearanceMode
 
     var body: some View {
@@ -177,25 +179,51 @@ private struct GeneralForm: View {
         }
 
         Section("AI") {
-            Toggle(isOn: $aiCloudEnabled) {
-                rowLabel("Cloud AI features", "sparkles", .purple)
-                Text("On-device AI (text recognition, translation) always works. Turn this on to also use cloud features through your own Claude subscription — KRIT runs the Claude Code app you installed and never stores an API key.")
-            }
-            .onChange(of: aiCloudEnabled) { Settings.aiCloudEnabled = $0 }
+            rowLabel("Cloud AI", "sparkles", .purple)
+            Text("On-device text recognition and translation always work, free and offline. For cloud features (describe, smart redact), KRIT uses your own Claude subscription: generate a token with claude setup-token and paste it below. No API key, no per-token billing; the token is stored in your Keychain and never leaves your Mac except to Anthropic.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
 
-            if aiCloudEnabled && !claudeFound {
-                Text("Claude Code not found — install it and run claude setup-token, then reopen this window.")
+            if aiTokenStored {
+                Text("Subscription token saved (\(AICredentials.maskedSuffix ?? "set")).")
                     .font(.callout)
-                    .foregroundStyle(.orange)
+                HStack {
+                    Button(aiTesting ? "Testing…" : "Test connection") {
+                        aiTesting = true
+                        aiTestResult = nil
+                        Task {
+                            let result = await AICredentials.validate()
+                            aiTesting = false
+                            switch result {
+                            case .ok:             aiTestResult = "Connected to your Claude subscription."
+                            case .invalid:        aiTestResult = "Token rejected. Generate a new one with claude setup-token."
+                            case .rateLimited:    aiTestResult = "Rate limited by Anthropic. Wait a moment and try again."
+                            case .network(let m): aiTestResult = "Could not reach Claude: \(m)"
+                            }
+                        }
+                    }
+                    .disabled(aiTesting)
+                    Spacer()
+                    Button("Remove") {
+                        AICredentials.remove()
+                        aiTokenStored = false
+                        aiToken = ""
+                        aiTestResult = nil
+                    }
+                }
+                if let aiTestResult {
+                    Text(aiTestResult).font(.callout).foregroundStyle(.secondary)
+                }
+            } else {
+                SecureField("Paste your claude setup-token here", text: $aiToken)
+                Button("Save token") {
+                    if AICredentials.store(aiToken) {
+                        aiTokenStored = true
+                        aiToken = ""
+                    }
+                }
+                .disabled(aiToken.trimmingCharacters(in: .whitespaces).isEmpty)
             }
-        }
-        .task {
-            // Probe for the `claude` binary OFF the main thread: the absolute-path
-            // checks are cheap, but the login-shell fallback can block for hundreds
-            // of ms, and the default (no-claude) user always reaches it. Running it
-            // in a @State default would freeze the General tab on every open.
-            let found = await Task.detached { AICapability.claudeCLIPath != nil }.value
-            claudeFound = found
         }
     }
 }
