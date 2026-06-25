@@ -396,7 +396,7 @@ struct VideoEditorView: View {
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
                     playerArea.frame(maxWidth: .infinity, maxHeight: .infinity)
-                    timeline.frame(height: 192).background(Color(white: 0.10))
+                    timeline.frame(height: 192).background(Color.kritCanvas)
                 }
                 if state.selectedSegment != nil {
                     Divider()
@@ -405,7 +405,7 @@ struct VideoEditorView: View {
             }
         }
         .frame(minWidth: 860, minHeight: 560)
-        .background(Color(white: 0.13))
+        .background(Color.kritEditorStageBottom)
     }
 
     private var playerArea: some View {
@@ -468,7 +468,7 @@ struct VideoEditorView: View {
         }
         .padding(.horizontal, 16)
         .frame(height: 48)
-        .background(Color(white: 0.16))
+        .background(Color.kritCanvas)
     }
 
     private var timeline: some View {
@@ -520,7 +520,7 @@ struct VideoEditorView: View {
         return RoundedRectangle(cornerRadius: 5)
             .fill(LinearGradient(colors: [color(p.startHex), color(p.endHex)], startPoint: .bottom, endPoint: .top))
             .frame(width: 30, height: 22)
-            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(selected ? Color.white : .clear, lineWidth: 2))
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(selected ? Color.kritAccent : .clear, lineWidth: 2))
             .onTapGesture { state.backgroundPresetIndex = i }
     }
 
@@ -535,7 +535,7 @@ struct VideoEditorView: View {
         }
         .frame(width: 30, height: 22)
         .clipShape(RoundedRectangle(cornerRadius: 5))
-        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(selected ? Color.white : .clear, lineWidth: 2))
+        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(selected ? Color.kritAccent : .clear, lineWidth: 2))
         .onTapGesture { state.selectedWallpaperIndex = i }
     }
 
@@ -549,8 +549,8 @@ struct VideoEditorView: View {
                         Text(seg.isAutoMode ? "Follows cursor" : "Manual")
                             .font(.system(size: 9, weight: .semibold))
                             .padding(.horizontal, 6).padding(.vertical, 3)
-                            .background((seg.isAutoMode ? Color.green : Color.accentColor).opacity(0.18))
-                            .foregroundColor(seg.isAutoMode ? .green : .accentColor)
+                            .background((seg.isAutoMode ? Color.green : Color.kritAccent).opacity(0.18))
+                            .foregroundColor(seg.isAutoMode ? .green : Color.kritAccent)
                             .cornerRadius(4)
                     }
 
@@ -599,7 +599,7 @@ struct VideoEditorView: View {
                 .padding(14)
             }
             .frame(width: 248)
-            .background(Color(white: 0.12))
+            .background(Color.kritCanvas)
         }
     }
 
@@ -643,7 +643,7 @@ final class VideoEditorWindowController: NSWindowController, NSWindowDelegate {
         let state = VideoEditorState(url: url)
         state.onExported = onExported
         self.state = state
-        let hosting = NSHostingController(rootView: VideoEditorView(state: state))
+        let hosting = NSHostingController(rootView: VideoEditorView(state: state).kritTheme())
         let window = NSWindow(contentViewController: hosting)
         window.title = "Edit Recording"
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
