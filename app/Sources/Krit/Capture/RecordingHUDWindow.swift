@@ -68,6 +68,19 @@ final class RecordingHUDWindow: NSWindow {
         let glassBacking = ChromeFactory.backing(frame: root.bounds, cornerRadius: hudRadius)
         root.addSubview(glassBacking)
 
+        // Contrast floor: a dark scrim over the glass so the white glyphs and the
+        // red indicator stay legible no matter what's behind the HUD. Recording a
+        // white document turned the clear glass light and the white controls
+        // vanished (white-on-white). The scrim is a non-interactive pass-through, so
+        // the controls above and the window-background drag keep working.
+        let scrim = RecordingHUDScrim(frame: root.bounds)
+        scrim.wantsLayer = true
+        scrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.68).cgColor
+        scrim.layer?.cornerRadius = hudRadius
+        scrim.layer?.cornerCurve = .continuous
+        scrim.autoresizingMask = [.width, .height]
+        root.addSubview(scrim)
+
         // Left group: red stop square + red timer (the recording indicator).
         stopButton.title = ""
         stopButton.target = self
@@ -241,6 +254,13 @@ final class RecordingHUDWindow: NSWindow {
 private final class RecordingHUDContentView: NSView {
     override var mouseDownCanMoveWindow: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// Purely visual contrast scrim: it never intercepts events, so it can sit above
+/// the glass without stealing clicks from the controls or the window-background drag.
+@MainActor
+private final class RecordingHUDScrim: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 @MainActor
