@@ -27,6 +27,7 @@ enum PreferencesContent {
         case .editor:    root = AnyView(EditorForm())
         case .shortcuts: root = AnyView(ShortcutsForm())
         case .presets:   root = AnyView(PresetsForm())
+        case .permissions: root = AnyView(PermissionsForm())
         case .about:     root = AnyView(AboutForm())
         }
 
@@ -861,6 +862,122 @@ private struct AboutForm: View {
 
     private func open(_ string: String) {
         if let url = URL(string: string) { NSWorkspace.shared.open(url) }
+    }
+}
+
+// MARK: - Permissions
+
+/// One place to see and grant every privacy permission KRIT uses. Each row shows
+/// the brand icon chip, the permission name, a live status pill, and a deep link
+/// straight to the matching System Settings pane. Status is re-read on appear and
+/// whenever the app becomes active again (returning from System Settings).
+private struct PermissionsForm: View {
+    @State private var screen: PermissionStatus = .denied
+    @State private var accessibility: PermissionStatus = .denied
+    @State private var camera: PermissionStatus = .notDetermined
+    @State private var microphone: PermissionStatus = .notDetermined
+
+    var body: some View {
+        Section {
+            PermissionRow(
+                title: "Screen Recording", detail: "Capture your screen for screenshots and recordings.",
+                symbol: "rectangle.dashed.badge.record", color: .red, status: screen
+            ) { PermissionsManager.openScreenRecordingSettings() }
+
+            PermissionRow(
+                title: "Accessibility", detail: "Lets KRIT run global shortcuts and overlay gestures.",
+                symbol: "accessibility", color: .blue, status: accessibility
+            ) { PermissionsManager.openAccessibilitySettings() }
+
+            PermissionRow(
+                title: "Camera", detail: "Record a camera overlay alongside your screen.",
+                symbol: "camera.fill", color: .green, status: camera
+            ) { PermissionsManager.openCameraSettings() }
+
+            PermissionRow(
+                title: "Microphone", detail: "Capture your voice while recording.",
+                symbol: "mic.fill", color: .orange, status: microphone
+            ) { PermissionsManager.openMicrophoneSettings() }
+        } header: {
+            Text("Privacy")
+        } footer: {
+            Text("KRIT only asks for what a capture tool needs. Use Open Settings to grant a permission in System Settings; the status here refreshes when you come back.")
+        }
+        .onAppear(perform: refresh)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refresh()
+        }
+    }
+
+    private func refresh() {
+        screen = PermissionsManager.screenRecordingStatus
+        accessibility = PermissionsManager.accessibilityStatus
+        camera = PermissionsManager.cameraStatus
+        microphone = PermissionsManager.microphoneStatus
+    }
+}
+
+/// A single permission row: brand icon chip + name/description on the left, a live
+/// status pill and an Open Settings button trailing.
+private struct PermissionRow: View {
+    let title: String
+    let detail: String
+    let symbol: String
+    let color: Color
+    let status: PermissionStatus
+    let onOpen: () -> Void
+
+    var body: some View {
+        LabeledContent {
+            HStack(spacing: 10) {
+                StatusPill(status: status)
+                Button("Open Settings", action: onOpen)
+            }
+        } label: {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                SettingIcon(symbol: symbol, color: color)
+            }
+        }
+    }
+}
+
+/// Coloured capsule reflecting a permission's live status: green granted, red
+/// denied, secondary when macOS has not been asked yet.
+private struct StatusPill: View {
+    let status: PermissionStatus
+
+    private var label: String {
+        switch status {
+        case .granted:       return "Granted"
+        case .denied:        return "Denied"
+        case .notDetermined: return "Not determined"
+        }
+    }
+
+    private var tint: Color {
+        switch status {
+        case .granted:       return .green
+        case .denied:        return .red
+        case .notDetermined: return .secondary
+        }
+    }
+
+    var body: some View {
+        Text(label)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill(tint.opacity(0.15))
+            )
     }
 }
 

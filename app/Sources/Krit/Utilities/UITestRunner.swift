@@ -63,6 +63,7 @@ final class UITestRunner: NSObject {
             case "sound":        report = Self.runSoundProbe()
             case "onboarding":   report = await Self.runOnboardingSuite()
             case "preferences":  report = await Self.runPreferencesSuite()
+            case "permissions-tab": report = await Self.runPermissionsTab()
             case "overlay-show": report = await Self.runOverlayShowSuite()
             case "blur-map":     report = await Self.runBlurMapSuite()
             case "overlay-trace": report = await Self.runOverlayCaptureTrace()
@@ -3794,6 +3795,38 @@ final class UITestRunner: NSObject {
         r["allPass"] = allRendered
             && (r["windowVisible"] as? Bool ?? false)
             && (expected == PreferencesTab.allCases.count)
+        return r
+    }
+
+    // MARK: - Cenário: permissions-tab (nova aba de permissões de privacidade)
+
+    /// Abre o Settings, seleciona a aba Permissions e fotografa a janela: prova que
+    /// a aba existe, que a seção monta (4 linhas de permissão com status pill) e
+    /// rende de fato. Snapshot em /tmp/krit-permissions-tab.png.
+    private static func runPermissionsTab() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "permissions-tab"]
+        let ctrl = PreferencesWindowController.shared
+        ctrl.uiTestForceShow()
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        guard let win = ctrl.uiTestWindow else {
+            r["windowFound"] = false
+            r["ok"] = false
+            return r
+        }
+        r["windowFound"] = true
+
+        let tabFound = PreferencesTab.allCases.contains(.permissions)
+        r["tabFound"] = tabFound
+
+        ctrl.uiTestSelect(.permissions)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+
+        let path = "/tmp/krit-permissions-tab.png"
+        let shotOK = Self.snapshotWindow(win, to: path)
+        r["snapshot"] = shotOK ? path : "FAILED"
+
+        ctrl.uiTestClose()
+        r["ok"] = tabFound && shotOK
         return r
     }
 
