@@ -47,6 +47,12 @@ Steps:
 What changed: Smart Redact now lays down the irreversible Secure Blur (heavy block
 mosaic) instead of a recoverable pixelate.
 
+> Now ALSO proven headless by the `redact-adversarial` UI test: it OCRs a known
+> secret cleanly, applies the real Secure Blur through the production flatten path,
+> and asserts OCR recovers no 4+ char fragment afterward. Measured run: OCR reads
+> "KRITSECRET42XQ" on the control, only noise after redaction. The steps below are
+> an optional human cross-check.
+
 Steps:
 1. Capture something with visible secret-looking text (a fake token / password).
 2. Run Smart Redact, apply, then export the image.

@@ -80,6 +80,7 @@ final class UITestRunner: NSObject {
             case "record-smoke-audio": report = await Self.runRecordSmoke(systemAudio: true)
             case "record-smoke-mic": report = await Self.runRecordSmoke(microphone: true)
             case "smart-redact":  report = await Self.runSmartRedactSuite()
+            case "redact-adversarial": report = await Self.runRedactAdversarial()
             case "glass-renders": report = await Self.runGlassRenders()
             case "default-template": report = await Self.runDefaultTemplateSuite()
             case "editor-fit-large": report = await Self.runEditorFitLargeSuite()
@@ -1868,6 +1869,137 @@ final class UITestRunner: NSObject {
             && boxesOK
             && (r["noFalsePositivesPass"] as? Bool ?? false)
         return r
+    }
+
+    // MARK: - Cenário: redact-adversarial (a Secure Blur derrota a própria OCR do app)
+
+    /// Adversarial proof that Secure Blur redaction is irreversible. It draws a
+    /// known secret into an image, runs the app's OWN Vision OCR
+    /// (`OCREngine.recognizeText`) as a CONTROL to prove the text was legible,
+    /// then flattens a `BlurAnnotation(secure: true)` (exactly what
+    /// `applySmartRedact` and the manual toggle create) over the secret through the
+    /// REAL export path (`AnnotationCanvas.flatten()`, the same call Save/Share use)
+    /// and runs OCR AGAIN on the exported pixels. The redaction passes only if OCR
+    /// recovered the secret before and recovers no 4+ char fragment of it after. If
+    /// Secure Blur were reversible, OCR would read the secret back and this would
+    /// correctly FAIL; the assertion is never weakened to force a pass.
+    private static func runRedactAdversarial() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let secret = "KRITSECRET42XQ"
+        r["secret"] = secret
+
+        // Control image: the secret in a large bold font, black on white, centred,
+        // backed by a 2x bitmap rep so `bestCGImage` carries real retina-class
+        // pixels (the same backing the OCR scenario proved Vision reads cleanly).
+        let logical = NSSize(width: 760, height: 200)
+        let scale = 2
+        let pxW = Int(logical.width) * scale
+        let pxH = Int(logical.height) * scale
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: pxW, pixelsHigh: pxH,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: pxW * 4, bitsPerPixel: 32
+        ), let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            r["error"] = "could not build bitmap rep"; r["allPass"] = false; return r
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: pxW, height: pxH).fill()
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: 56 * CGFloat(scale)),
+            .foregroundColor: NSColor.black,
+        ]
+        let textSize = (secret as NSString).size(withAttributes: attrs)
+        let textOrigin = NSPoint(x: (CGFloat(pxW) - textSize.width) / 2,
+                                 y: (CGFloat(pxH) - textSize.height) / 2)
+        (secret as NSString).draw(at: textOrigin, withAttributes: attrs)
+        NSGraphicsContext.restoreGraphicsState()
+        rep.size = logical
+        let img = NSImage(size: logical)
+        img.addRepresentation(rep)
+
+        let dir = "/tmp/krit-redact"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        if let png = rep.representation(using: .png, properties: [:]) {
+            let p = "\(dir)/control.png"; try? png.write(to: URL(fileURLWithPath: p)); r["controlImage"] = p
+        }
+
+        // CONTROL: the app's OCR must recover the secret from the clean image,
+        // otherwise the setup is broken and the redaction proof is meaningless.
+        let ocrControl = await OCREngine.recognizeText(in: img)
+        r["ocrControl"] = String(ocrControl.prefix(200))
+        let controlRun = Self.longestSharedRun(of: secret, in: ocrControl)
+        r["controlRun"] = controlRun
+        let controlReadable = controlRun >= 8   // a strong substring, robust to a stray glyph slip
+        r["controlReadable"] = controlReadable
+
+        // Apply Secure Blur exactly as production does: a BlurAnnotation with
+        // secure == true, flattened through the canvas export path. Background
+        // disabled so the slot is the whole screenshot and the mosaic samples the
+        // secret directly (the redaction band then covers the full canvas).
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController else {
+            r["error"] = "editor window did not open"; r["allPass"] = false; return r
+        }
+        defer { ctrl.window?.close() }
+        let canvas = ctrl.uiTestCanvas
+
+        var bg = ScreenshotBackgroundOptions.editorDefault
+        bg.isEnabled = false   // slot == full canvas == the whole screenshot
+        canvas.backgroundOptions = bg
+        canvas.backgroundImage = img
+        canvas.frame = NSRect(origin: .zero, size: logical)
+
+        // Same object production builds: default radius, secure == true (the
+        // secureBlur render ignores radius and mosaics from the image pixels). The
+        // region is the whole screenshot, which fully contains the secret.
+        let fx = BlurAnnotation(rect: NSRect(origin: .zero, size: logical))
+        fx.secure = true
+        canvas.objects = [fx]
+        canvas.needsDisplay = true
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        let redacted = canvas.flatten()
+        if let cg = redacted.bestCGImage,
+           let data = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
+            let p = "\(dir)/redacted.png"; try? data.write(to: URL(fileURLWithPath: p)); r["redactedImage"] = p
+        }
+
+        // ADVERSARIAL: OCR the exported, redacted pixels. Nothing of the secret may
+        // survive, not the whole string, not any 4+ char fragment of it.
+        let ocrRedacted = await OCREngine.recognizeText(in: redacted)
+        r["ocrRedacted"] = String(ocrRedacted.prefix(200))
+        let redactedRun = Self.longestSharedRun(of: secret, in: ocrRedacted)
+        r["redactedRun"] = redactedRun
+        let secretDestroyed = redactedRun < 4
+        r["secretDestroyed"] = secretDestroyed
+
+        r["allPass"] = controlReadable && secretDestroyed
+        return r
+    }
+
+    /// Longest contiguous run of `needle` that appears as a substring of `haystack`,
+    /// compared case-insensitively and ignoring whitespace (so OCR line breaks or
+    /// spacing never mask a leaked fragment). Returns the character count of the
+    /// longest such run, 0 if none.
+    private static func longestSharedRun(of needle: String, in haystack: String) -> Int {
+        func normalize(_ s: String) -> String {
+            String(s.lowercased().unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) })
+        }
+        let n = Array(normalize(needle))
+        let hay = normalize(haystack)
+        guard !n.isEmpty, !hay.isEmpty else { return 0 }
+        var best = 0
+        for i in 0..<n.count {
+            var j = i + 1
+            while j <= n.count {
+                let sub = String(n[i..<j])
+                if hay.contains(sub) { best = max(best, sub.count); j += 1 } else { break }
+            }
+        }
+        return best
     }
 
     // MARK: - Cenário: record-smoke (gravação real de 2s, dim e card no overlay)
