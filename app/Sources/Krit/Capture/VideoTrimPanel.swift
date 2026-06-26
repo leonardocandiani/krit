@@ -7,15 +7,11 @@ import CoreMedia
 /// the left, Quality / Audio on the right, an estimated size readout, and the
 /// Cancel / Trim Only / Trim & Convert actions at the foot.
 ///
-/// What is wired to the engine today: the TRIM range. `RecordingEngine.trim`
-/// takes a `CMTimeRange` and exports that span, so dragging the handles changes
-/// what gets written. Dimensions, Quality and the Audio mode are surfaced and
-/// drive the live size estimate, and they are handed back in `ConvertOptions`,
-/// but the engine's export path does not rescale or remux audio yet, so those
-/// fields are wired-but-pending: the controls are real and report their values,
-/// the convert step applies them only once the engine grows a scaling/audio
-/// export. This is called out where the values leave the panel so nothing here
-/// pretends to do more than it does.
+/// Everything here reaches the engine. The TRIM range (`CMTimeRange`) cuts the
+/// span, and "Trim & Convert" also hands `ConvertOptions` to `RecordingEngine.trim`,
+/// which rescales the video to the chosen dimensions, re-encodes at the chosen
+/// quality, and emits audio per the chosen mode (keep / mono downmix / mute).
+/// Dimensions, Quality and Audio also drive the live size estimate below.
 @MainActor
 final class VideoTrimPanel: NSView {
 
@@ -23,14 +19,13 @@ final class VideoTrimPanel: NSView {
     enum Action {
         /// Export only the selected span, no re-encode of dimensions/audio.
         case trimOnly(range: CMTimeRange)
-        /// Export the selected span and apply the convert options. The range is
-        /// always honored; the rest of `options` is wired-but-pending on the
-        /// engine (see the type doc).
+        /// Export the selected span and apply the convert options (rescale,
+        /// quality, audio mode). All of `options` is honored by the engine.
         case trimAndConvert(range: CMTimeRange, options: ConvertOptions)
     }
 
-    /// Convert parameters chosen in the panel. Carried back to the caller so the
-    /// engine can apply them when its export path supports scaling/audio.
+    /// Convert parameters chosen in the panel. Carried to the engine, which
+    /// rescales, re-encodes at `quality`, and applies the `audio` mode.
     struct ConvertOptions {
         var width: Int
         var height: Int
@@ -619,8 +614,8 @@ private final class TrimTimelineView: NSView {
 /// Glass sheet-style window that hosts the `VideoTrimPanel` (C3). Reads the
 /// asset's native pixel size to seed the Dimensions fields, then routes the
 /// panel's actions back to the engine. Trim Only and Trim & Convert both export
-/// the selected span via `RecordingResultActions.trim`; the convert options ride
-/// along for when the engine's export path can apply scaling/audio.
+/// the selected span via `RecordingResultActions.trim`; Trim & Convert passes the
+/// convert options so the engine rescales, re-encodes and remaps audio.
 @MainActor
 final class VideoTrimWindow: NSWindow, NSWindowDelegate {
 
@@ -704,12 +699,9 @@ final class VideoTrimWindow: NSWindow, NSWindowDelegate {
     private func handle(_ action: VideoTrimPanel.Action) {
         switch action {
         case .trimOnly(let range):
-            actions?.trim(url: url, range: range)
-        case .trimAndConvert(let range, _):
-            // Only the range reaches the engine today; the convert options are
-            // wired-but-pending (see VideoTrimPanel's type doc). The trim still
-            // runs so the action is never a no-op.
-            actions?.trim(url: url, range: range)
+            actions?.trim(url: url, range: range, convert: nil)
+        case .trimAndConvert(let range, let options):
+            actions?.trim(url: url, range: range, convert: options)
         }
         close()
     }

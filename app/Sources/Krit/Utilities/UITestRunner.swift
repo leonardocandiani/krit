@@ -113,6 +113,7 @@ final class UITestRunner: NSObject {
             case "autozoom-export": report = await Self.runAutoZoomExport()
             case "video-preview": report = await Self.runVideoPreview()
             case "video-editor": report = await Self.runVideoEditor()
+            case "trim-convert": report = await Self.runTrimConvert()
             case "whats-new": report = await Self.runWhatsNew()
             case "about": report = await Self.runAbout()
             case "prefs-icons": report = await Self.runPrefsIcons()
@@ -527,6 +528,214 @@ final class UITestRunner: NSObject {
         r["sharedCleared"] = VideoEditorWindowController.uiTestShared == nil
         r["allPass"] = state.duration > 0.1 && state.zoomSegments.count == 1 && outExists && outWidth > 320 && tornDown
         return r
+    }
+
+    // MARK: - Cenário: trim-convert (Trim & Convert aplica dimensão + audio mono)
+
+    /// Proves the "Trim & Convert" engine path actually converts: it builds a
+    /// 320x240 source carrying a real STEREO audio track, runs the engine's
+    /// `exportTrimConvert` with 160x120 / low quality / mono over a sub-range, then
+    /// loads the OUTPUT and asserts the video track is ~160x120 (a real rescale)
+    /// and the audio is a genuine single channel (the mono downmix). Mono is
+    /// validated because the source is verified stereo first.
+    private static func runTrimConvert() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "trim-convert"]
+        let dir = NSTemporaryDirectory()
+        let srcURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-src.mov")
+        let outURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-out.mp4")
+
+        let made = await makeSyntheticStereoSource(to: srcURL, size: CGSize(width: 320, height: 240), frames: 60, fps: 30)
+        r["sourceMade"] = made
+        guard made else { r["allPass"] = false; return r }
+
+        let (inW, inH) = await videoPixelSize(of: srcURL)
+        let inCh = await audioChannelCount(of: srcURL)
+        r["inputWidth"] = inW
+        r["inputHeight"] = inH
+        r["inputChannels"] = inCh ?? -1
+
+        // Sub-range (drop head + tail), low quality, mono downmix.
+        let quality = 0.1
+        r["quality"] = quality
+        let subRange = CMTimeRange(
+            start: CMTime(seconds: 0.4, preferredTimescale: 600),
+            end: CMTime(seconds: 1.4, preferredTimescale: 600)
+        )
+        let opts = VideoTrimPanel.ConvertOptions(width: 160, height: 120, quality: quality, audio: .mono)
+        let exportOK = await RecordingEngine.exportTrimConvert(source: srcURL, range: subRange, options: opts, to: outURL)
+        r["exportOK"] = exportOK
+        let outExists = FileManager.default.fileExists(atPath: outURL.path)
+        r["outExists"] = outExists
+
+        let (outW, outH) = await videoPixelSize(of: outURL)
+        let outCh = await audioChannelCount(of: outURL)
+        r["outputWidth"] = outW
+        r["outputHeight"] = outH
+        r["outputChannels"] = outCh ?? -1
+
+        let dimsPass = abs(outW - 160) <= 2 && abs(outH - 120) <= 2
+        let inputStereo = (inCh == 2)
+        let monoPass = (outCh == 1)
+        r["dimsPass"] = dimsPass
+        r["monoValidated"] = inputStereo   // mono check only trusted if the source was real stereo
+        r["monoPass"] = monoPass
+        let checks = [exportOK, outExists, dimsPass, inputStereo, monoPass]
+        r["allPass"] = checks.allSatisfy { $0 }
+
+        try? FileManager.default.removeItem(at: srcURL)
+        try? FileManager.default.removeItem(at: outURL)
+        return r
+    }
+
+    /// Displayed pixel size of the first video track (preferred transform applied).
+    private static func videoPixelSize(of url: URL) async -> (Int, Int) {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let size = try? await track.load(.naturalSize),
+              let transform = try? await track.load(.preferredTransform) else { return (0, 0) }
+        let display = size.applying(transform)
+        return (Int(abs(display.width).rounded()), Int(abs(display.height).rounded()))
+    }
+
+    /// Channel count of the first audio track, read from its stream description.
+    private static func audioChannelCount(of url: URL) async -> Int? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .audio).first,
+              let formats = try? await track.load(.formatDescriptions),
+              let fmt = formats.first,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) else { return nil }
+        return Int(asbd.pointee.mChannelsPerFrame)
+    }
+
+    /// Builds a source mov with a synthetic video track (the same black/white
+    /// pattern as `makeSyntheticZoomSource`) AND a real 2-channel audio track, so a
+    /// mono downmix can be proven headless.
+    private static func makeSyntheticStereoSource(to url: URL, size: CGSize, frames: Int, fps: Int) async -> Bool {
+        try? FileManager.default.removeItem(at: url)
+        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return false }
+
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(size.width),
+            AVVideoHeightKey: Int(size.height),
+        ])
+        videoInput.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                kCVPixelBufferWidthKey as String: Int(size.width),
+                kCVPixelBufferHeightKey as String: Int(size.height),
+            ]
+        )
+
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVNumberOfChannelsKey: 2,
+            AVSampleRateKey: 48_000,
+            AVEncoderBitRateKey: 128_000,
+        ])
+        audioInput.expectsMediaDataInRealTime = false
+
+        guard writer.canAdd(videoInput), writer.canAdd(audioInput) else { return false }
+        writer.add(videoInput)
+        writer.add(audioInput)
+        guard writer.startWriting() else { return false }
+        writer.startSession(atSourceTime: .zero)
+
+        guard writeSyntheticVideoFrames(adaptor: adaptor, input: videoInput, size: size, frames: frames, fps: fps) else { return false }
+        guard writeSyntheticStereoAudio(input: audioInput, durationSec: Double(frames) / Double(fps)) else { return false }
+
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            writer.finishWriting { c.resume() }
+        }
+        return writer.status == .completed
+    }
+
+    /// Draws the black frame with a white bottom-left quadrant into each frame.
+    private static func writeSyntheticVideoFrames(adaptor: AVAssetWriterInputPixelBufferAdaptor, input: AVAssetWriterInput, size: CGSize, frames: Int, fps: Int) -> Bool {
+        let w = Int(size.width), h = Int(size.height)
+        for i in 0..<frames {
+            while !input.isReadyForMoreMediaData { usleep(2000) }
+            guard let pool = adaptor.pixelBufferPool else { return false }
+            var pb: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
+            guard let buffer = pb else { return false }
+            CVPixelBufferLockBaseAddress(buffer, [])
+            if let base = CVPixelBufferGetBaseAddress(buffer) {
+                let bpr = CVPixelBufferGetBytesPerRow(buffer)
+                let cs = CGColorSpaceCreateDeviceRGB()
+                if let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8,
+                                       bytesPerRow: bpr, space: cs,
+                                       bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) {
+                    ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+                    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+                    ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+                    ctx.fill(CGRect(x: 0, y: h / 2, width: w / 2, height: h / 2))
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))
+        }
+        input.markAsFinished()
+        return true
+    }
+
+    /// Feeds the audio input a 440 Hz tone, the same value in both channels, as
+    /// interleaved float32 LPCM (the encoder turns it into 2-channel AAC).
+    private static func writeSyntheticStereoAudio(input: AVAssetWriterInput, durationSec: Double) -> Bool {
+        let sampleRate = 48_000.0
+        let channels = 2
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(4 * channels),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(4 * channels),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        var format: CMAudioFormatDescription?
+        guard CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &asbd, layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format) == noErr,
+              let fmt = format else { return false }
+
+        let totalFrames = Int(durationSec * sampleRate)
+        let chunk = 4_800
+        var frameOffset = 0
+        while frameOffset < totalFrames {
+            let count = min(chunk, totalFrames - frameOffset)
+            guard let sample = makeStereoSampleBuffer(format: fmt, sampleRate: sampleRate, channels: channels, frameOffset: frameOffset, frameCount: count) else { return false }
+            while !input.isReadyForMoreMediaData { usleep(2000) }
+            guard input.append(sample) else { return false }
+            frameOffset += count
+        }
+        input.markAsFinished()
+        return true
+    }
+
+    /// One LPCM CMSampleBuffer of `frameCount` stereo frames starting at `frameOffset`.
+    private static func makeStereoSampleBuffer(format: CMAudioFormatDescription, sampleRate: Double, channels: Int, frameOffset: Int, frameCount: Int) -> CMSampleBuffer? {
+        let byteCount = frameCount * channels * 4
+        var samples = [Float](repeating: 0, count: frameCount * channels)
+        for i in 0..<frameCount {
+            let t = Double(frameOffset + i) / sampleRate
+            let value = Float(0.2 * sin(2.0 * Double.pi * 440.0 * t))
+            samples[i * channels] = value
+            samples[i * channels + 1] = value
+        }
+        var blockBuffer: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: byteCount, blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: byteCount, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &blockBuffer) == kCMBlockBufferNoErr,
+              let block = blockBuffer else { return nil }
+        let copyStatus = samples.withUnsafeBytes { raw in
+            CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: byteCount)
+        }
+        guard copyStatus == kCMBlockBufferNoErr else { return nil }
+        var sampleBuffer: CMSampleBuffer?
+        let pts = CMTime(value: CMTimeValue(frameOffset), timescale: CMTimeScale(sampleRate))
+        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format, sampleCount: frameCount, presentationTimeStamp: pts, packetDescriptions: nil, sampleBufferOut: &sampleBuffer) == noErr else { return nil }
+        return sampleBuffer
     }
 
     // MARK: - Cenário: video-preview (Space toca o vídeo, não a thumb)
