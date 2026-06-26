@@ -231,15 +231,14 @@ final class KeystrokeClickOverlay {
         layoutKeyPills()
 
         pill.alphaValue = 0
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.12
+        Motion.animate(0.12) { _ in
             pill.animator().alphaValue = 1
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak pill] in
             guard let self, let pill else { return }
             NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.3
+                ctx.duration = Motion.reduced ? 0 : 0.3
                 pill.animator().alphaValue = 0
             }, completionHandler: {
                 pill.removeFromSuperview()

@@ -644,8 +644,7 @@ private final class HistoryCardItem: NSCollectionViewItem {
     private func setHovered(_ hovered: Bool) {
         restorePill.isHidden = !hovered
         onHover?(hovered)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.12
+        Motion.animate(0.12) { ctx in
             ctx.allowsImplicitAnimation = true
             well.layer?.borderWidth = hovered ? 2 : 0
             well.layer?.shadowOpacity = hovered ? 0.28 : 0.18
@@ -816,8 +815,7 @@ private final class HistoryRestorePill: NSButton {
     override func mouseExited(with event: NSEvent) { setHovered(false) }
 
     private func setHovered(_ hovered: Bool) {
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.12
+        Motion.animate(0.12) { ctx in
             ctx.allowsImplicitAnimation = true
             layer?.backgroundColor = (hovered
                 ? KritColors.accent.blended(withFraction: 0.12, of: .white) ?? KritColors.accent
@@ -1003,16 +1001,14 @@ private final class HistoryPreviewWindow: NSWindow {
 
     func present() {
         makeKeyAndOrderFront(nil)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.16
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        Motion.animate(0.16, timing: .easeOut) { _ in
             self.animator().alphaValue = 1
         }
     }
 
     func dismiss() {
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.12
+            ctx.duration = Motion.reduced ? 0 : 0.12
             self.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             self?.orderOut(nil)

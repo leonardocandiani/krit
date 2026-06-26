@@ -817,7 +817,7 @@ final class ColorPickerPanel: NSViewController, NSTextFieldDelegate {
         var colors = swatchButtons.map { $0.pickerColor }
         colors.removeAll { $0.hexString == button.pickerColor.hexString }
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.18
+            ctx.duration = Motion.reduced ? 0 : 0.18
             button.animator().alphaValue = 0
         }, completionHandler: {
             // The completion handler is typed nonisolated, so hop back to the main
