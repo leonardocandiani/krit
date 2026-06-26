@@ -667,15 +667,20 @@ final class AnnotationCanvas: NSView {
         return previews.count
     }
 
-    /// Confirms the staged preview: each red box becomes a real pixelate
-    /// annotation, pushed as one undoable edit so a single Cmd-Z removes the whole
-    /// batch. Clears the preview afterwards. No-op when nothing is staged.
+    /// Confirms the staged preview: each red box becomes an irreversible Secure
+    /// Blur annotation (heavy block mosaic + gaussian, NOT a recoverable pixelate),
+    /// pushed as one undoable edit so a single Cmd-Z removes the whole batch.
+    /// Clears the preview afterwards. No-op when nothing is staged.
     func applySmartRedact() {
         guard !smartRedactPreviews.isEmpty else { return }
         pushUndo()
         for preview in smartRedactPreviews {
-            let px = PixelateAnnotation(rect: preview.rect.standardized)
-            objects.append(px)
+            // Auto-redacted secrets must not be recoverable from the exported file,
+            // so use Secure Blur (irreversible) instead of PixelateAnnotation, whose
+            // coarse-grid pixelate can be partly reconstructed.
+            let redaction = BlurAnnotation(rect: preview.rect.standardized)
+            redaction.secure = true
+            objects.append(redaction)
         }
         smartRedactPreviews = []
         onSmartRedactStateChanged?(false)
