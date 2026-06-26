@@ -56,6 +56,13 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         return FileManager.default.fileExists(atPath: last.url.path)
     }
     private var recordingScreen: NSScreen?
+    /// Source of the active take, kept so a restart can re-arm the same capture.
+    private var lastSource: RecordingSource?
+    /// True while a discard/restart tears the take down, so finishRecording throws
+    /// the file away instead of presenting a card.
+    private var isDiscarding = false
+    /// True when the discard should be followed by a fresh take of the same source.
+    private var restartAfterDiscard = false
     private var firstPresentationTime: CMTime?
     private var lastPresentationTime: CMTime?
     /// Source-clock PTS of the most recently appended video frame. Used to anchor
@@ -119,6 +126,7 @@ final class RecordingEngine: NSObject, RecordingResultActions {
             ToastWindow.show(message: "Recording already in progress")
             return
         }
+        lastSource = source
 
         uiTestLastFinishOutcome = "none"
         uiTestLastStreamError = ""
@@ -149,6 +157,8 @@ final class RecordingEngine: NSObject, RecordingResultActions {
             )
             hud.stopHandler = { [weak self] in self?.stopRecording() }
             hud.togglePauseHandler = { [weak self] _ in self?.togglePause() }
+            hud.restartHandler = { [weak self] in self?.restartRecording() }
+            hud.discardHandler = { [weak self] in self?.discardRecording() }
             self.hud = hud
             self.recordingScreen = source.screen
             hud.show(on: source.screen)
@@ -229,6 +239,38 @@ final class RecordingEngine: NSObject, RecordingResultActions {
             ToastWindow.show(message: "Could not start recording. Check permissions.")
             print("[KRIT] Recording start failed: \(error)")
         }
+    }
+
+    /// Stop the in-progress take and throw the file away, no card. Wired to the
+    /// HUD trash button, so it performs a real action instead of sitting disabled.
+    func discardRecording() {
+        guard active else { return }
+        isDiscarding = true
+        stopRecording()
+    }
+
+    /// Discard the current take and immediately start a fresh one of the same
+    /// source. Wired to the HUD restart button.
+    func restartRecording() {
+        guard active, lastSource != nil else { return }
+        restartAfterDiscard = true
+        discardRecording()
+    }
+
+    /// If a discard/restart is in flight, drop the finished file, optionally
+    /// re-arm the same source, and return true so finishRecording skips the
+    /// normal card-presentation path.
+    private func consumeDiscardIfNeeded(url: URL) -> Bool {
+        guard isDiscarding else { return false }
+        isDiscarding = false
+        let shouldRestart = restartAfterDiscard
+        restartAfterDiscard = false
+        try? FileManager.default.removeItem(at: url)
+        ToastWindow.show(message: shouldRestart ? "Restarting\u{2026}" : "Recording discarded", duration: 2.0)
+        if shouldRestart, let src = lastSource {
+            Task { await startRecording(source: src) }
+        }
+        return true
     }
 
     /// Re-presents the result window for the last finished recording so GIF export,
@@ -812,6 +854,8 @@ final class RecordingEngine: NSObject, RecordingResultActions {
                     guard let self, self.finishSessionID == sessionID else { return }
                     self.cancelFinishTimeout()
                     self.cleanup()
+                    // Discard/restart: drop the file and skip the card entirely.
+                    if self.consumeDiscardIfNeeded(url: url) { return }
                     if let error {
                         self.showSaveFailure(reason: Self.saveFailureReason(error))
                         print("[KRIT] Recording stream error: \(error)")
