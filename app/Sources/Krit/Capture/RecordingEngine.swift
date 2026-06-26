@@ -1003,7 +1003,7 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         let base = url.deletingPathExtension().lastPathComponent
         let outURL = url.deletingLastPathComponent().appendingPathComponent("\(base) Trimmed.mp4")
         ToastWindow.show(message: "Trimming…")
-        Task {
+        Task { [weak self] in
             let asset = AVURLAsset(url: url)
             guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
                 ToastWindow.show(message: "Could not trim recording.")
@@ -1018,6 +1018,13 @@ final class RecordingEngine: NSObject, RecordingResultActions {
             }
             if export.status == .completed {
                 ToastWindow.show(message: "Saved trimmed: \(outURL.lastPathComponent)", duration: 3.0)
+                // Route the trimmed clip back through presentResult so it returns as
+                // a card (or the result window with the overlay off) instead of being
+                // left orphaned on disk, the same way exportAutoZoom does.
+                guard let self else { return }
+                let seconds = CMTimeGetSeconds(range.duration)
+                self.lastFinishedRecording = (outURL, seconds)
+                self.presentResult(url: outURL, duration: seconds)
             } else {
                 ToastWindow.show(message: "Could not trim recording.")
                 if let error = export.error { print("[KRIT] Trim failed: \(error)") }
