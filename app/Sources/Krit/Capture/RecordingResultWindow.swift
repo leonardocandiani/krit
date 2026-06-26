@@ -96,6 +96,12 @@ final class RecordingResultWindow: NSWindow, NSWindowDelegate {
         trimButton.bezelStyle = .rounded
         trimButton.frame = NSRect(x: x, y: buttonY, width: 70, height: 32)
         background.addSubview(trimButton)
+        x += 70 + gap
+
+        let editButton = NSButton(title: "Edit\u{2026}", target: self, action: #selector(editTapped))
+        editButton.bezelStyle = .rounded
+        editButton.frame = NSRect(x: x, y: buttonY, width: 64, height: 32)
+        background.addSubview(editButton)
 
         let revealButton = NSButton(title: "Reveal", target: self, action: #selector(revealTapped))
         revealButton.bezelStyle = .rounded
@@ -128,6 +134,13 @@ final class RecordingResultWindow: NSWindow, NSWindowDelegate {
         // the engine through the same `actions.trim`.
         guard let actions else { return }
         VideoTrimWindow.show(url: url, duration: durationSeconds, actions: actions)
+    }
+
+    @objc private func editTapped() {
+        // The Snapzy-style video editor (player + timeline + zoom lane). Reachable
+        // here so a recording finished with the overlay off still has a path to the
+        // full editor, not just GIF/trim.
+        actions?.openVideoEditor(url: url, duration: durationSeconds)
     }
 
     @objc private func revealTapped() {

@@ -2706,8 +2706,9 @@ private final class QuickAccessWindow: NSWindow {
     }
 
     @objc private func editAction() {
-        // Video: hand off to the recording's GIF/trim editor (the RecordingResult
-        // window) instead of the screenshot annotation tool.
+        // Video: hand off to the Snapzy-style video editor (player + timeline +
+        // zoom lane + trim), the real editing surface, instead of the screenshot
+        // annotation tool.
         if let payload = videoPayload {
             let actions = payload.actions
             let url = payload.url
@@ -2715,7 +2716,7 @@ private final class QuickAccessWindow: NSWindow {
             skipPolicyReset = true
             animatedClose()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                actions?.reopenResultWindow(url: url, duration: duration)
+                actions?.openVideoEditor(url: url, duration: duration)
             }
             return
         }

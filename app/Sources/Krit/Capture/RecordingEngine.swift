@@ -16,7 +16,7 @@ protocol RecordingResultActions: AnyObject {
     /// Re-presents the RecordingResultWindow (GIF / trim editor) for a finished
     /// recording. The overlay card's "Edit recording" routes here so the result
     /// window's exclusive features stay reachable after it stops being the default.
-    func reopenResultWindow(url: URL, duration: Double)
+    func openVideoEditor(url: URL, duration: Double)
 }
 
 @MainActor
@@ -264,7 +264,7 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         }
     }
 
-    func reopenResultWindow(url: URL, duration: Double) {
+    func openVideoEditor(url: URL, duration: Double) {
         // "Edit recording" opens the Snapzy-style video editor (player + timeline +
         // zoom lane + trim), the real editing surface. The exported clip comes back
         // as a fresh card.
