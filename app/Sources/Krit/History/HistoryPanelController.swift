@@ -524,6 +524,8 @@ private final class HistoryCardItem: NSCollectionViewItem {
     override func loadView() {
         let container = ClickThroughCardView(frame: NSRect(x: 0, y: 0, width: 200, height: 158))
         container.wantsLayer = true
+        container.setAccessibilityElement(true)
+        container.setAccessibilityRole(.button)
         // A plain click restores; double-click opens the editor; a drag past the
         // movement threshold starts a real file-drag of the capture on disk.
         container.onClick = { [weak self] in self?.onRestore?() }
@@ -618,6 +620,7 @@ private final class HistoryCardItem: NSCollectionViewItem {
         self.onHover = onHover
         thumbView.image = historyManager.cachedThumbnail(for: item) ?? item.thumbnail
         ageLabel.stringValue = Self.relativeFormatter.localizedString(for: item.createdAt, relativeTo: Date())
+        view.setAccessibilityLabel("Capture, \(ageLabel.stringValue)")
         sourceBadge.icon = item.sourceAppIcon
         setupTracking()
     }

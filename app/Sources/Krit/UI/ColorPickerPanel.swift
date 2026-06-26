@@ -239,6 +239,7 @@ final class SwatchButton: NSButton {
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
         toolTip = "#\(color.hexString)"
+        setAccessibilityLabel("Saved color #\(color.hexString)")
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -337,6 +338,7 @@ final class ColorWellButton: NSButton {
         imagePosition = .imageOnly
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
+        setAccessibilityLabel("Color")
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -585,6 +587,7 @@ final class ColorPickerPanel: NSViewController, NSTextFieldDelegate {
         eyedropper.imagePosition = .imageOnly
         eyedropper.contentTintColor = NSColor.secondaryLabelColor
         eyedropper.toolTip = "Pick color from screen"
+        eyedropper.setAccessibilityLabel("Pick color from screen")
         eyedropper.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(eyedropper)
 

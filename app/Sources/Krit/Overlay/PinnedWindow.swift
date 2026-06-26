@@ -108,6 +108,7 @@ final class PinnedWindow: NSWindow {
         btn.isBordered = false
         btn.target = self
         btn.action = #selector(closeTapped)
+        btn.setAccessibilityLabel("Close")
         btn.alphaValue = 0
         // Stick to top-right corner during live window resize.
         btn.autoresizingMask = [.minXMargin, .minYMargin]

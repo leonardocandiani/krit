@@ -445,6 +445,7 @@ struct VideoEditorView: View {
                 Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
             }
             .keyboardShortcut(.space, modifiers: [])
+            .accessibilityLabel(state.isPlaying ? "Pause" : "Play")
             Text(timeString(state.currentTime) + " / " + timeString(state.duration))
                 .font(.system(size: 12, weight: .medium).monospacedDigit())
                 .foregroundColor(.secondary)
