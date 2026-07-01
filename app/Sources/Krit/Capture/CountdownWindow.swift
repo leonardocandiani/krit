@@ -16,7 +16,7 @@ enum CountdownWindow {
     static func run(seconds: Int, on screen: NSScreen) async -> Bool {
         guard seconds > 0 else { return true }
 
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let reduceMotion = Motion.reduced
 
         // Square badge centered on the captured display.
         let side: CGFloat = 132

@@ -49,7 +49,7 @@ enum CaptureFlash {
         flash.cornerCurve = .continuous
         host.layer?.addSublayer(flash)
 
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        if Motion.reduced {
             let fade = CABasicAnimation(keyPath: "opacity")
             fade.fromValue = 0.55
             fade.toValue = 0
@@ -94,7 +94,7 @@ enum CaptureFlash {
     @discardableResult
     static func play(rect: CGRect, on screen: NSScreen, image: NSImage?, landLeft: Bool,
                      target globalTarget: CGRect? = nil, includeBlink: Bool = true) -> TimeInterval {
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let reduceMotion = Motion.reduced
         // Ghost-only call with nothing to fly: nothing to draw at all.
         if !includeBlink && image == nil { return 0 }
 
