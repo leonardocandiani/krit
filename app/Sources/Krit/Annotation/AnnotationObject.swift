@@ -830,8 +830,14 @@ final class TextAnnotation: AnnotationObject {
     }
 
     var textSize: CGSize {
-        let size = (text as NSString).size(withAttributes: [.font: font])
-        return CGSize(width: max(size.width, 10), height: max(size.height, fontSize * 1.2))
+        // Measure the multiline bounding box so embedded newlines report the real
+        // height and the width tracks the widest line, not just the first.
+        let size = (text as NSString).boundingRect(
+            with: CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font]
+        ).size
+        return CGSize(width: max(ceil(size.width), 10), height: max(ceil(size.height), fontSize * 1.2))
     }
 
     var bounds: CGRect {
