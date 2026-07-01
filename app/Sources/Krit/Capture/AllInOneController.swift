@@ -47,12 +47,15 @@ final class AllInOneController: NSObject {
     }
 
     func prepareAndShow(engine: CaptureEngine) async {
-        NSApp.setActivationPolicy(.accessory)
-        NSApp.activate(ignoringOtherApps: true)
-
+        // Grab the frozen backdrop BEFORE activating/raising anything, mirroring the
+        // area path: the grab must catch the live dark desktop, never a paused
+        // wallpaper still nor our own overlay.
         let image = await engine.captureRectToImage(screen.frame, on: screen)
         var imgRect = NSRect(origin: .zero, size: screen.frame.size)
         let frozen = image?.cgImage(forProposedRect: &imgRect, context: nil, hints: nil)
+
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.activate(ignoringOtherApps: true)
 
         // Overlay rect is in the overlay view's local space (origin at the
         // screen's bottom-left), so shift the global rect by the screen origin.
@@ -168,8 +171,12 @@ private final class AllInOneOverlayWindow: NSWindow {
             backing: .buffered,
             defer: false
         )
-        isOpaque = false
-        backgroundColor = .clear
+        // Opaque when the frozen backdrop is in hand: a clear panel would let the
+        // layer-backed first frame composite the live (paused→light) wallpaper
+        // through, the dark→light flash. Same fix as the area overlay.
+        let hasFrozenBackdrop = frozenImage != nil
+        isOpaque = hasFrozenBackdrop
+        backgroundColor = hasFrozenBackdrop ? .black : .clear
         level = .screenSaver
         ignoresMouseEvents = false
         acceptsMouseMovedEvents = true
@@ -183,7 +190,14 @@ private final class AllInOneOverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 
-    func show() { orderFrontRegardless() }
+    func show() {
+        // Force the opaque backdrop onto the first composited frame; a layer-backed
+        // view defers its first draw otherwise, leaving a clear gap the paused
+        // aerial flashes light through. Same as the area overlay's show().
+        overlayView.setNeedsDisplay(overlayView.bounds)
+        overlayView.displayIfNeeded()
+        orderFrontRegardless()
+    }
     func focusContent() { makeFirstResponder(overlayView) }
 }
 
@@ -237,6 +251,11 @@ private final class AllInOneOverlayView: NSView {
                 ctx.draw(frozenImage, in: bounds)
                 ctx.restoreGState()
             }
+        } else {
+            // No frozen grab: a solid dark base, never a clear panel that would let
+            // the live (paused→light) wallpaper flash through.
+            NSColor.windowBackgroundColor.setFill()
+            NSBezierPath.fill(bounds)
         }
 
         // Dim everywhere except inside the selection.

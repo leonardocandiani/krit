@@ -143,25 +143,35 @@ final class CaptureEngine {
         // Snapshot the source app BEFORE the overlay activates KRIT and steals focus,
         // so the history thumbnail can badge where the shot came from.
         historyManager.prepareForCapture()
-        // Hide the icons in PARALLEL with the selection UI: the 350ms settle
-        // inside hideDesktopIconsForCaptureIfNeeded must never hold the overlay
-        // back (it was part of the seconds-long hotkey delay). The capture only
-        // happens on mouse release, long after the icons are gone.
-        let hideTask = Task { await self.hideDesktopIconsForCaptureIfNeeded() }
+        // Desktop icons are hidden the Snapzy way — by excluding Finder from the
+        // SCK grab (both prepareAndShow's frozen backdrop and the final shot) — not
+        // with a light cover window, so nothing light is ever painted on screen.
+        let hideIcons = Settings.hideDesktopIconsWhileCapturing
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
-            self.areaSelectionWindow = nil
             guard let rect else {
+                self.areaSelectionWindow = nil
                 self.clearOnNextCaptureFinished()
                 self.snapAndPasteTarget = nil
-                Task { self.restoreDesktopIconsIfNeeded(await hideTask.value) }
                 return
             }
             self.lastCaptureRect = rect
-            Task {
-                await self.captureRect(rect, on: screen, historyManager: historyManager)
-                self.restoreDesktopIconsIfNeeded(await hideTask.value)
+            // Fast path (no self-timer): build the shot by cropping the frozen frame
+            // the overlay already holds (dark, icon-free) instead of tearing the
+            // overlay down to re-grab the live screen. The re-grab is what briefly
+            // reveals the desktop — the paused aerial's light poster — the dark→light
+            // flash at print time. Cropping is instant and keeps the dark overlay up
+            // through the shutter, so the live screen is never exposed mid-capture.
+            if Settings.captureCountdownSeconds == 0,
+               let shot = self.areaSelectionWindow?.croppedFrozenImage(globalRect: rect, on: screen) {
+                self.captureMoment(rect: rect, on: screen)
+                self.areaSelectionWindow = nil
+                self.finishCapture(image: shot, rect: rect, on: screen, historyManager: historyManager, isWindowCapture: false)
+                return
             }
+            // Self-timer (or a missing frozen frame): re-grab live, still icon-free.
+            self.areaSelectionWindow = nil
+            Task { await self.captureRect(rect, on: screen, historyManager: historyManager, excludeDesktopIcons: hideIcons) }
         }
         await areaSelectionWindow?.prepareAndShow(engine: self)
     }
@@ -279,16 +289,15 @@ final class CaptureEngine {
         }
         guard areaSelectionWindow == nil else { return }
         historyManager.prepareForCapture()
-        // Same as startAreaCapture: never let the icon-hide settle delay the
-        // picker UI; the capture happens on click, long after.
-        let hideTask = Task { await self.hideDesktopIconsForCaptureIfNeeded() }
+        // Desktop icons are hidden by excluding Finder from the picker's frozen
+        // grab (Snapzy style, see prepareAndShow), not with a light cover window —
+        // so the theme never flicks to white when the picker opens.
         areaSelectionWindow = AreaSelectionWindow(mode: .window) { [weak self] rect, screen, windowID in
             guard let self else { return }
             self.areaSelectionWindow = nil
             guard let rect else {
                 self.clearOnNextCaptureFinished()
                 self.snapAndPasteTarget = nil
-                Task { self.restoreDesktopIconsIfNeeded(await hideTask.value) }
                 return
             }
             Task {
@@ -297,9 +306,8 @@ final class CaptureEngine {
                 if #available(macOS 14.0, *), let windowID {
                     await self.captureWindowIsolated(windowID: windowID, rect: rect, on: screen, historyManager: historyManager)
                 } else {
-                    await self.captureRect(rect, on: screen, historyManager: historyManager, isWindowCapture: true)
+                    await self.captureRect(rect, on: screen, historyManager: historyManager, isWindowCapture: true, excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
                 }
-                self.restoreDesktopIconsIfNeeded(await hideTask.value)
             }
         }
         await areaSelectionWindow?.prepareAndShow(engine: self)
@@ -862,7 +870,7 @@ final class CaptureEngine {
 
     // MARK: - Core capture
 
-    func captureRect(_ rect: CGRect, on screen: NSScreen, historyManager: HistoryManager, isWindowCapture: Bool = false) async {
+    func captureRect(_ rect: CGRect, on screen: NSScreen, historyManager: HistoryManager, isWindowCapture: Bool = false, excludeDesktopIcons: Bool = false) async {
         // D1 self-timer: count down on the captured display before grabbing.
         // Gating here covers all four screenshot modes (area/window/fullscreen/
         // previous) and leaves OCR/QR/automation untouched, they call
@@ -874,7 +882,7 @@ final class CaptureEngine {
             guard proceed else { return }            // Esc cancels the whole capture
         }
         captureMoment(rect: rect, on: screen)
-        guard let image = await captureRectToImage(rect, on: screen) else {
+        guard let image = await captureRectToImage(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons) else {
             clearOnNextCaptureFinished()
             snapAndPasteTarget = nil
             if lastCaptureFailureWasPermission {
@@ -1150,20 +1158,45 @@ final class CaptureEngine {
     /// no quality knob: the screen content has no detail past its native density,
     /// so the native grab is always the sharpest possible and any upscale would
     /// only soften it.
-    func captureRectToImage(_ rect: CGRect, on screen: NSScreen) async -> NSImage? {
+    func captureRectToImage(_ rect: CGRect, on screen: NSScreen, excludeDesktopIcons: Bool = false) async -> NSImage? {
         if #available(macOS 14.0, *) {
-            return await captureRectSCK(rect, on: screen)
+            return await captureRectSCK(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons)
         } else {
             return fallbackCapture(rect: rect)
         }
     }
 
+    /// Builds the capture filter, copying Snapzy's icon-hiding approach. To hide
+    /// desktop icons we EXCLUDE the Finder application (its desktop-icon windows
+    /// live on layer > 0) plus KRIT's own windows, and re-include normal Finder
+    /// windows via exceptingWindows. The wallpaper is drawn by the Dock/Wallpaper
+    /// Agent, NOT Finder, so it survives at its REAL (dark) appearance — no cover
+    /// window painting a light fallback still. With icons shown, nothing excluded.
     @available(macOS 14.0, *)
-    private func captureRectSCK(_ rect: CGRect, on screen: NSScreen) async -> NSImage? {
+    private static func captureContentFilter(display: SCDisplay, content: SCShareableContent, excludeDesktopIcons: Bool) -> SCContentFilter {
+        guard excludeDesktopIcons else {
+            return SCContentFilter(display: display, excludingWindows: [])
+        }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let excludedApps = content.applications.filter {
+            $0.bundleIdentifier == "com.apple.finder" || $0.processID == ownPID
+        }
+        guard !excludedApps.isEmpty else {
+            return SCContentFilter(display: display, excludingWindows: [])
+        }
+        let keepFinderWindows = content.windows.filter {
+            $0.owningApplication?.bundleIdentifier == "com.apple.finder" && $0.windowLayer == 0 && $0.isOnScreen
+        }
+        return SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: keepFinderWindows)
+    }
+
+    @available(macOS 14.0, *)
+    private func captureRectSCK(_ rect: CGRect, on screen: NSScreen, excludeDesktopIcons: Bool) async -> NSImage? {
         lastCaptureFailureWasPermission = false
         do {
-            // captureRectSCK only needs the display list, no window enumeration.
-            let content = try await Self.shareableContent(includeWindows: false)
+            // Enumerate windows only when hiding icons (the filter needs the app /
+            // window list); otherwise the display list alone is enough and cheaper.
+            let content = try await Self.shareableContent(includeWindows: excludeDesktopIcons)
             // Casar por displayID, nunca por frame: rect está em coordenadas
             // AppKit (y pra cima) e SCDisplay.frame em CoreGraphics (y pra
             // baixo), a interseção só coincide no monitor principal; num
@@ -1174,7 +1207,7 @@ final class CaptureEngine {
                 Self.captureLog.error("captureRectSCK: no display matches screen \(String(describing: screenID)); falling back")
                 return fallbackCapture(rect: rect)
             }
-            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let filter = Self.captureContentFilter(display: display, content: content, excludeDesktopIcons: excludeDesktopIcons)
             // Use the display's REAL backing scale, not filter.pointPixelScale: on
             // a non-Retina external display SCK can report pointPixelScale 2 while
             // the panel is genuinely 1x. That sized the buffer at 2x the content SCK

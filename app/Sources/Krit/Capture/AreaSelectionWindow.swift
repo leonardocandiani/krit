@@ -32,49 +32,72 @@ final class AreaSelectionWindow: NSObject {
 
     func prepareAndShow(engine: CaptureEngine) async {
         AreaSelectionDiag.mark("prepareEntry")
+
+        // Freeze each display's desktop FIRST, before activating KRIT or raising
+        // the overlay. Two reasons, both proven on a video (aerial) wallpaper:
+        //   1. Activating KRIT and covering the screen with the full-screen panel
+        //      make macOS pause the wallpaper video and fall back to its still
+        //      poster frame, which on a dynamic light/dark wallpaper is the LIGHT
+        //      variant — that was the "screen flips to light on selection" bug.
+        //      Grabbing first catches the live DARK desktop the user actually has.
+        //   2. The grab does not exclude KRIT's own windows, so once the overlay
+        //      (now an opaque backdrop) is up the freeze would capture the overlay
+        //      ITSELF — a black frame — painting the backdrop black forever.
+        // Captured in parallel at native scale so the hotkey-to-overlay latency
+        // stays small; the overlay opens already backed by a real frozen frame.
+        // If a grab fails the overlay falls back to the original near-transparent
+        // tint (see drawFrozenBackdrop), never a dead black panel.
+        let screens = NSScreen.screens
+        // Hide desktop icons the Snapzy way: exclude Finder from the SCK grab, so
+        // the frozen frame is the real dark wallpaper WITHOUT icons — and without a
+        // light cover window. Color-pick keeps icons (it samples the screen as-is).
+        let excludeIcons = mode != .colorPick && Settings.hideDesktopIconsWhileCapturing
+        let frozenFrames: [CGImage?] = await withTaskGroup(of: (Int, CGImage?).self) { group in
+            for (index, screen) in screens.enumerated() {
+                group.addTask {
+                    let image = await engine.captureRectToImage(screen.frame, on: screen, excludeDesktopIcons: excludeIcons)
+                    var rect = NSRect(origin: .zero, size: screen.frame.size)
+                    guard let cg = image?.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
+                        return (index, nil)
+                    }
+                    // A uniform all-black/all-white grab is a failed capture (the
+                    // -3811 frame this Mac hits on a video wallpaper), not a real
+                    // desktop. Painting it would black out the selection, so drop it
+                    // and let the overlay fall back to the transparent tint.
+                    if CaptureEngine.uniformColorDescription(cg) != nil { return (index, nil) }
+                    return (index, cg)
+                }
+            }
+            var frames = [CGImage?](repeating: nil, count: screens.count)
+            for await (index, cg) in group { frames[index] = cg }
+            return frames
+        }
+        AreaSelectionDiag.mark("freezesCaptured")
+
         // KRIT is an LSUIElement accessory app: while another app is frontmost it
         // stays inactive, and a non-activating panel of an inactive accessory app
         // does NOT reliably order in front of the active app's window — the
         // overlay "didn't show up" when any app was in front. Activating KRIT
         // makes the overlay appear and take the drag on every app. The capture
         // re-grabs the live screen on mouse-up (at the configured supersampling),
-        // so the result is the screen at release time. Trade-off: the target
-        // app's focus appearance changes during selection (the #30 concern); the
-        // robust both-ways fix is a frozen-frame pipeline (capture on hotkey,
-        // crop from the freeze), which would fix that at the cost of the
-        // configurable capture scale — a separate product call.
-        // Activating KRIT (next line) is what makes the overlay appear over the
-        // frontmost app — see the note above. The activation POLICY only decides
-        // whether that activation also flashes a Dock icon for the selection's
-        // duration: `.regular` shows one, `.accessory` does not. Default to
-        // `.accessory` (no Dock flash, like every other KRIT window); the
-        // showDockIconDuringCapture setting opts back into `.regular`.
+        // so the result is the screen at release time. The activation POLICY only
+        // decides whether that activation also flashes a Dock icon for the
+        // selection's duration: `.regular` shows one, `.accessory` does not.
+        // Default to `.accessory` (no Dock flash, like every other KRIT window);
+        // the showDockIconDuringCapture setting opts back into `.regular`.
         NSApp.setActivationPolicy(Settings.showDockIconDuringCapture ? .regular : .accessory)
         NSApp.activate(ignoringOtherApps: true)
 
-        // Overlays go up IMMEDIATELY so the selection is usable the instant the
-        // hotkey fires. The frozen frames (loupe sampling + legacy crop source)
-        // arrive asynchronously below; the loupe simply stays hidden until its
-        // frame lands. The old order (full-screen grab per display, serial, at
-        // the user's supersampling scale) held the whole UI back for seconds.
-        for screen in NSScreen.screens {
-            let overlay = SelectionOverlayWindow(screen: screen, mode: mode, frozenImage: nil)
+        // Overlays go up with their frozen frame already in hand, so the backdrop
+        // is opaque (and correct) from the very first draw — no transparent
+        // window through which the paused wallpaper could flash.
+        for (index, screen) in screens.enumerated() {
+            let overlay = SelectionOverlayWindow(screen: screen, mode: mode, frozenImage: frozenFrames[index])
             overlay.selectionHandler = { [weak self] rect, windowID in self?.finish(rect: rect, screen: screen, windowID: windowID) }
             overlay.cancelHandler = { [weak self] in self?.cancel() }
             overlay.colorPickHandler = { [weak self] hex in self?.finishColorPick(hex) }
             overlay.show()
             overlays.append(overlay)
-        }
-        for (overlay, screen) in zip(overlays, NSScreen.screens) {
-            Task { [weak overlay] in
-                // This frame backs the loupe and the fallback crop; the real
-                // capture re-grabs the selected rect on release. Both are native
-                // pixel-exact now, so they match.
-                let image = await engine.captureRectToImage(screen.frame, on: screen)
-                var rect = NSRect(origin: .zero, size: screen.frame.size)
-                guard let frozenCG = image?.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return }
-                await MainActor.run { overlay?.setFrozenImage(frozenCG) }
-            }
         }
 
         AreaSelectionDiag.mark("overlaysShown")
@@ -121,6 +144,16 @@ final class AreaSelectionWindow: NSObject {
     /// (CGEvent fights the user's physical mouse). Runs the exact mouseDown
     /// sampling path against the real frozen frame.
     var uiTestHasFrozenFrame: Bool { overlays.contains { $0.uiTestHasFrozenFrame } }
+
+    /// Crops the already-grabbed frozen frame of `screen` to `globalRect`, so the
+    /// area shot is produced without a live re-grab (which would flash the screen
+    /// light at print time). nil if no overlay covers that screen or the grab was
+    /// missing, so the caller falls back to a live capture.
+    func croppedFrozenImage(globalRect: CGRect, on screen: NSScreen) -> NSImage? {
+        (overlays.first { $0.coversScreen(screen) } ?? overlays.first)?
+            .croppedFrozenImage(globalRect: globalRect)
+    }
+
     func uiTestPickColor(atScreen screenPoint: NSPoint) {
         let overlay = overlays.first(where: { $0.frame.contains(screenPoint) }) ?? overlays.first
         overlay?.uiTestPickColor(atScreen: screenPoint)
@@ -227,8 +260,15 @@ private final class SelectionOverlayWindow: NSPanel {
             backing: .buffered,
             defer: false
         )
-        isOpaque = false
-        backgroundColor = .clear
+        // Opaque whenever we already hold the frozen backdrop (the common path: it
+        // is grabbed BEFORE the overlay goes up). A clear panel lets the live
+        // (paused→light) wallpaper composite through the layer-backed first-frame
+        // gap; opaque + the synchronous draw in show() guarantees the dark backdrop
+        // is the first thing on screen. Only the freeze-nil fallback stays clear (it
+        // paints a solid dark fill instead, see drawFrozenBackdrop).
+        let hasFrozenBackdrop = frozenImage != nil
+        isOpaque = hasFrozenBackdrop
+        backgroundColor = hasFrozenBackdrop ? .black : .clear
         // Shielding level (the capture-overlay level macOS uses for the login/screen
         // shield) instead of .screenSaver: some apps float their own window ABOVE
         // .screenSaver (Zentty and other always-on-top typing/teleprompter tools),
@@ -260,7 +300,22 @@ private final class SelectionOverlayWindow: NSPanel {
         overlayView.setFrozenImage(image)
     }
 
+    func coversScreen(_ screen: NSScreen) -> Bool { targetScreen.frame == screen.frame }
+    func croppedFrozenImage(globalRect: CGRect) -> NSImage? {
+        overlayView.croppedFrozenImage(globalRect: globalRect, screenFrame: targetScreen.frame)
+    }
+
     func show() {
+        // Commit the opaque backdrop into the layer BEFORE the panel is ever on
+        // screen. The content view is layer-backed (.onSetNeedsDisplay), so without
+        // a forced synchronous draw the first composited frame is the CLEAR panel
+        // and drawFrozenBackdrop() only lands on the NEXT CATransaction. During that
+        // one-frame gap the panel already covers the desktop, macOS pauses the
+        // aerial wallpaper to its LIGHT poster frame, and that light composites
+        // straight through the clear panel — the dark→light flash the user saw.
+        // Drawing here puts the opaque dark backdrop on the very first frame.
+        overlayView.setNeedsDisplay(overlayView.bounds)
+        overlayView.displayIfNeeded()
         orderFrontRegardless()
     }
 
@@ -336,6 +391,34 @@ private final class SelectionOverlayView: NSView {
     }
     func uiTestSample(at point: NSPoint) -> String? { sampledHex(at: point) }
 
+    /// Crops the frozen backdrop to a global selection rect, reusing the loupe's
+    /// orientation math (the frozen frame is this screen at native density, view
+    /// coords are screen-local). This lets area capture produce the shot from the
+    /// dark frozen frame already in hand instead of tearing the overlay down and
+    /// re-grabbing the live screen — the re-grab is what reveals the icon-cover
+    /// light still and the paused aerial poster (the dark→light flash at print
+    /// time). Returns nil if the frame is missing or the rect degenerates, so the
+    /// caller can fall back to a live grab.
+    func croppedFrozenImage(globalRect: CGRect, screenFrame: CGRect) -> NSImage? {
+        guard let frozenImage else { return nil }
+        let local = CGRect(
+            x: globalRect.minX - screenFrame.minX,
+            y: globalRect.minY - screenFrame.minY,
+            width: globalRect.width,
+            height: globalRect.height
+        )
+        let imgScale = CGFloat(frozenImage.width) / max(bounds.width, 1)
+        let pxRect = CGRect(
+            x: local.minX * imgScale,
+            y: (bounds.height - local.maxY) * imgScale,
+            width: local.width * imgScale,
+            height: local.height * imgScale
+        ).integral
+        guard pxRect.width >= 1, pxRect.height >= 1,
+              let cg = frozenImage.cropping(to: pxRect) else { return nil }
+        return NSImage(cgImage: cg, size: local.size)
+    }
+
     init(mode: SelectionMode, frozenImage: CGImage?) {
         self.mode = mode
         self.frozenImage = frozenImage
@@ -372,72 +455,125 @@ private final class SelectionOverlayView: NSView {
     // MARK: - Drawing
 
     override func draw(_ dirtyRect: NSRect) {
+        // Opaque frozen backdrop FIRST. The overlay used to paint a ~transparent
+        // tint (alpha 0.001) and let the LIVE desktop show through. With a video
+        // wallpaper (aerial), macOS pauses the wallpaper the instant this
+        // full-screen panel covers the desktop and falls back to the still poster
+        // frame, which on a dynamic light/dark wallpaper is the LIGHT variant, so
+        // the screen appeared to flip dark to light the moment selection started.
+        // Painting the frozen screenshot (or a dark fill until it lands) as an
+        // opaque base means whatever the paused wallpaper does underneath never
+        // shows through. The dim/highlight below now layers over this base.
+        drawFrozenBackdrop()
+
         if mode == .window {
-            // Window mode: dimmed background with cut-out for highlighted window
+            drawWindowHighlight()
+        } else if isSelecting && !currentRect.isEmpty {
+            drawActiveSelection()
+        } else if mode == .area || mode == .colorPick {
+            drawPreDragArtifacts()
+        }
+    }
+
+    /// Opaque base for the overlay: the frozen screenshot of this display, grabbed
+    /// at hotkey time BEFORE the overlay went up (so it is the real dark desktop,
+    /// not the paused-wallpaper light still nor the overlay itself). NSImage keeps
+    /// the screenshot's natural orientation regardless of the view's flip.
+    ///
+    /// Fallback when the grab failed (frozenImage nil, rare): a SOLID,
+    /// appearance-correct dark fill. NOT the old near-transparent tint (alpha
+    /// 0.001) — that re-exposed the live wallpaper, which on a video wallpaper
+    /// pauses to a LIGHT poster and brings the flash right back. NOT pure black
+    /// either (a dead panel you can't aim through). windowBackgroundColor is dark
+    /// in dark mode, light in light mode; fill opacity never affects hit-testing.
+    private func drawFrozenBackdrop() {
+        if let frozenImage {
+            NSImage(cgImage: frozenImage, size: bounds.size)
+                .draw(in: bounds, from: .zero, operation: .copy, fraction: 1.0)
+        } else {
+            NSColor.windowBackgroundColor.setFill()
+            NSBezierPath.fill(bounds)
+        }
+    }
+
+    /// Window mode: dim everything, punch a clean hole over the hovered window so
+    /// the frozen backdrop reads through it (even-odd, NOT a clear fill: clearing
+    /// would re-expose the live desktop we just covered).
+    private func drawWindowHighlight() {
+        guard let winRect = highlightedWindowRect else {
             NSColor.black.withAlphaComponent(0.4).setFill()
             NSBezierPath.fill(bounds)
-            if let winRect = highlightedWindowRect {
-                NSColor.clear.setFill()
-                let path = NSBezierPath(rect: winRect)
-                path.fill()
-                KritColors.accent.setStroke()
-                path.lineWidth = 2
-                path.stroke()
-            }
-        } else if isSelecting && !currentRect.isEmpty {
-            // Area mode, during drag: dim outside selection, clear inside
-            let outer = NSBezierPath(rect: bounds)
-            let inner = NSBezierPath(rect: currentRect)
-            outer.append(inner)
-            outer.windingRule = .evenOdd
-            NSColor.black.withAlphaComponent(0.3).setFill()
-            outer.fill()
-
-            // Blue selection border
-            KritColors.accent.setStroke()
-            let border = NSBezierPath(rect: currentRect)
-            border.lineWidth = 1.5
-            border.stroke()
-
-            // Subtle rule-of-thirds grid for premium framing (like CleanShot X)
-            if currentRect.width > 50 && currentRect.height > 50 {
-                NSColor.white.withAlphaComponent(0.25).setStroke()
-                let grid = NSBezierPath()
-                let w3 = currentRect.width / 3
-                let h3 = currentRect.height / 3
-                grid.move(to: NSPoint(x: currentRect.minX + w3, y: currentRect.minY))
-                grid.line(to: NSPoint(x: currentRect.minX + w3, y: currentRect.maxY))
-                grid.move(to: NSPoint(x: currentRect.minX + w3 * 2, y: currentRect.minY))
-                grid.line(to: NSPoint(x: currentRect.minX + w3 * 2, y: currentRect.maxY))
-                grid.move(to: NSPoint(x: currentRect.minX, y: currentRect.minY + h3))
-                grid.line(to: NSPoint(x: currentRect.maxX, y: currentRect.minY + h3))
-                grid.move(to: NSPoint(x: currentRect.minX, y: currentRect.minY + h3 * 2))
-                grid.line(to: NSPoint(x: currentRect.maxX, y: currentRect.minY + h3 * 2))
-                grid.lineWidth = 1.0
-                grid.stroke()
-            }
-
-            drawCornerHandles(for: currentRect)
-            drawDimensionLabel(near: currentRect)
-            // Loupe during the drag: pixel-precise feedback while sizing the rect,
-            // but only when the magnifier is active (Control held, or always-on).
-            if showsLoupeArtifacts, let pos = mousePosition {
-                drawMagnifierLoupe(at: pos)
-            }
-        } else if mode == .area || mode == .colorPick {
-            // Pre-drag (area) and color-pick: near-invisible tint so macOS
-            // hit-tests this region and delivers mouseDown. Fully clear windows
-            // pass clicks through.
-            NSColor.black.withAlphaComponent(0.001).setFill()
-            NSBezierPath.fill(bounds)
-            if showsLoupeArtifacts, let pos = mousePosition {
-                drawCrosshair(at: pos)
-                // The hex pill under the loupe already names the pixel; screen
-                // coordinates would be noise while picking a color.
-                if mode == .area { drawCoordinateLabel(at: pos) }
-                drawMagnifierLoupe(at: pos)
-            }
+            return
         }
+        let outer = NSBezierPath(rect: bounds)
+        let inner = NSBezierPath(rect: winRect)
+        outer.append(inner)
+        outer.windingRule = .evenOdd
+        NSColor.black.withAlphaComponent(0.4).setFill()
+        outer.fill()
+        KritColors.accent.setStroke()
+        inner.lineWidth = 2
+        inner.stroke()
+    }
+
+    /// Area mode during the drag: dim outside the selection (frozen backdrop reads
+    /// clean inside), plus border, rule-of-thirds grid, corner handles, size label
+    /// and, when active, the magnifier loupe.
+    private func drawActiveSelection() {
+        let outer = NSBezierPath(rect: bounds)
+        let inner = NSBezierPath(rect: currentRect)
+        outer.append(inner)
+        outer.windingRule = .evenOdd
+        NSColor.black.withAlphaComponent(0.3).setFill()
+        outer.fill()
+
+        // Blue selection border
+        KritColors.accent.setStroke()
+        let border = NSBezierPath(rect: currentRect)
+        border.lineWidth = 1.5
+        border.stroke()
+
+        drawRuleOfThirdsGrid(in: currentRect)
+        drawCornerHandles(for: currentRect)
+        drawDimensionLabel(near: currentRect)
+        // Loupe during the drag: pixel-precise feedback while sizing the rect,
+        // but only when the magnifier is active (Control held, or always-on).
+        if showsLoupeArtifacts, let pos = mousePosition {
+            drawMagnifierLoupe(at: pos)
+        }
+    }
+
+    /// Subtle rule-of-thirds guides for premium framing (like CleanShot X), only
+    /// once the rect is big enough for them to read.
+    private func drawRuleOfThirdsGrid(in rect: NSRect) {
+        guard rect.width > 50 && rect.height > 50 else { return }
+        NSColor.white.withAlphaComponent(0.25).setStroke()
+        let grid = NSBezierPath()
+        let w3 = rect.width / 3
+        let h3 = rect.height / 3
+        grid.move(to: NSPoint(x: rect.minX + w3, y: rect.minY))
+        grid.line(to: NSPoint(x: rect.minX + w3, y: rect.maxY))
+        grid.move(to: NSPoint(x: rect.minX + w3 * 2, y: rect.minY))
+        grid.line(to: NSPoint(x: rect.minX + w3 * 2, y: rect.maxY))
+        grid.move(to: NSPoint(x: rect.minX, y: rect.minY + h3))
+        grid.line(to: NSPoint(x: rect.maxX, y: rect.minY + h3))
+        grid.move(to: NSPoint(x: rect.minX, y: rect.minY + h3 * 2))
+        grid.line(to: NSPoint(x: rect.maxX, y: rect.minY + h3 * 2))
+        grid.lineWidth = 1.0
+        grid.stroke()
+    }
+
+    /// Pre-drag (area) and color-pick: the opaque frozen backdrop already fills the
+    /// view, so macOS hit-tests it and delivers mouseDown. No scrim: the frozen
+    /// screen reads at full brightness until the drag starts, matching the old
+    /// live-through feel minus the wallpaper flash.
+    private func drawPreDragArtifacts() {
+        guard showsLoupeArtifacts, let pos = mousePosition else { return }
+        drawCrosshair(at: pos)
+        // The hex pill under the loupe already names the pixel; screen coordinates
+        // would be noise while picking a color.
+        if mode == .area { drawCoordinateLabel(at: pos) }
+        drawMagnifierLoupe(at: pos)
     }
 
     // MARK: - Magnifier Loupe
