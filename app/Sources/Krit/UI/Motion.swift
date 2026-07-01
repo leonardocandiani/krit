@@ -55,12 +55,18 @@ extension NSWindow {
     /// Reduce Motion: when the user asked for less motion the window just appears,
     /// no scale or fade, instead of springing in regardless (the old behavior
     /// ignored the setting entirely).
+    ///
+    /// - Parameter takesKey: whether to make the window key and take first
+    ///   responder. True for chooser-style surfaces the user drives; pass false
+    ///   for a passive HUD that must never steal focus mid-recording.
     @MainActor
-    func animateSpringEntrance() {
+    func animateSpringEntrance(takesKey: Bool = true) {
         alphaValue = 0
         orderFrontRegardless()
-        makeKeyAndOrderFront(nil)
-        makeFirstResponder(contentView)
+        if takesKey {
+            makeKeyAndOrderFront(nil)
+            makeFirstResponder(contentView)
+        }
         guard !Motion.reduced else { alphaValue = 1; return }
         if let layer = contentView?.layer {
             layer.transform = CATransform3DMakeScale(0.96, 0.96, 1)

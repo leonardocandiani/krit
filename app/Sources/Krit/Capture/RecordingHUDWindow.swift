@@ -195,7 +195,9 @@ final class RecordingHUDWindow: NSWindow {
         let visibleFrame = screen.visibleFrame
         let origin = NSPoint(x: visibleFrame.midX - frame.width / 2, y: visibleFrame.maxY - frame.height - 18)
         setFrameOrigin(pixelAligned(origin, scale: screen.backingScaleFactor))
-        orderFrontRegardless()
+        // Spring+fade in like the other recording surfaces, but never take key: the
+        // HUD is a passive readout and must not steal focus mid-recording.
+        animateSpringEntrance(takesKey: false)
     }
 
     private func pixelAligned(_ point: NSPoint, scale: CGFloat) -> NSPoint {
@@ -206,7 +208,15 @@ final class RecordingHUDWindow: NSWindow {
         timer?.invalidate()
         timer = nil
         microphoneLevelMeter.setLevel(0)
-        orderOut(nil)
+        guard !Motion.reduced else { orderOut(nil); return }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.15
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            self?.orderOut(nil)
+            self?.alphaValue = 1   // reset so the next show() starts opaque-ready
+        })
     }
 
     private func updateTime() {
