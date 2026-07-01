@@ -280,7 +280,7 @@ final class RecordingEngine: NSObject, RecordingResultActions {
 
     /// Re-presents the result window for the last finished recording so GIF export,
     /// trim and reveal stay reachable after the window was dismissed.
-    func reopenLastResult() {
+    func reopenResultPanel() {
         guard let last = lastFinishedRecording,
               FileManager.default.fileExists(atPath: last.url.path) else { return }
         RecordingResultWindow.show(url: last.url, duration: last.duration, actions: self)

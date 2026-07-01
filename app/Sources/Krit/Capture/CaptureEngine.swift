@@ -612,7 +612,7 @@ final class CaptureEngine {
     var hasLastRecording: Bool { recordingEngine.hasLastRecording }
 
     func reopenLastRecording() {
-        recordingEngine.reopenLastResult()
+        recordingEngine.reopenResultPanel()
     }
 
     // MARK: - Previous Area
