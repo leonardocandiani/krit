@@ -328,6 +328,28 @@ final class VideoEditorState: ObservableObject {
             }
         }
     }
+
+    /// Grab the frame under the playhead at full resolution and open it in the
+    /// print annotation editor. This is the bridge the recording flow was missing:
+    /// a still pulled from a recording lands in the SAME editor a screenshot does,
+    /// so arrows, blur and text work on a video frame without a separate tool.
+    func annotateCurrentFrame() {
+        pause()
+        let asset = AVURLAsset(url: url)
+        let time = CMTime(seconds: currentTime, preferredTimescale: 600)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        Task { @MainActor in
+            guard let cg = try? await generator.image(at: time).image else {
+                ToastWindow.show(message: "Could not grab that frame.")
+                return
+            }
+            let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+            AnnotationWindowController.open(image: image)
+        }
+    }
 }
 
 // MARK: - Player view (AVPlayerLayer with live zoom transform)
@@ -453,6 +475,12 @@ struct VideoEditorView: View {
             Button(action: { state.addZoomAtPlayhead() }) {
                 Label("Add Zoom", systemImage: "plus.magnifyingglass")
             }
+            Button(action: { state.annotateCurrentFrame() }) {
+                Label("Annotate", systemImage: "pencil.tip.crop.circle")
+            }
+            .disabled(state.isExporting)
+            .help("Open the frame under the playhead in the annotation editor")
+            .accessibilityLabel("Annotate current frame")
             Button(action: { state.exportGIF() }) {
                 Label("GIF", systemImage: "photo.stack")
             }
