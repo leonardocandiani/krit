@@ -68,11 +68,25 @@ final class RecordingHUDWindow: NSWindow {
         let glassBacking = ChromeFactory.backing(frame: root.bounds, cornerRadius: hudRadius)
         root.addSubview(glassBacking)
 
+        // Contrast floor: a dark scrim over the glass so the white glyphs and the
+        // red indicator stay legible no matter what's behind the HUD. Recording a
+        // white document turned the clear glass light and the white controls
+        // vanished (white-on-white). The scrim is a non-interactive pass-through, so
+        // the controls above and the window-background drag keep working.
+        let scrim = RecordingHUDScrim(frame: root.bounds)
+        scrim.wantsLayer = true
+        scrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.68).cgColor
+        scrim.layer?.cornerRadius = hudRadius
+        scrim.layer?.cornerCurve = .continuous
+        scrim.autoresizingMask = [.width, .height]
+        root.addSubview(scrim)
+
         // Left group: red stop square + red timer (the recording indicator).
         stopButton.title = ""
         stopButton.target = self
         stopButton.action = #selector(stopTapped)
         stopButton.toolTip = "Stop recording"
+        stopButton.setAccessibilityLabel("Stop recording")
         stopButton.frame = NSRect(x: 8, y: 7, width: 30, height: 30)
         root.addSubview(stopButton)
 
@@ -110,6 +124,7 @@ final class RecordingHUDWindow: NSWindow {
         restartButton.target = self
         restartButton.action = #selector(restartTapped)
         restartButton.toolTip = "Restart recording"
+        restartButton.setAccessibilityLabel("Restart recording")
         restartButton.isEnabled = false
         restartButton.frame = NSRect(x: 140, y: 7, width: 30, height: 30)
         root.addSubview(restartButton)
@@ -117,6 +132,7 @@ final class RecordingHUDWindow: NSWindow {
         trashButton.target = self
         trashButton.action = #selector(discardTapped)
         trashButton.toolTip = "Discard recording"
+        trashButton.setAccessibilityLabel("Discard recording")
         trashButton.isEnabled = false
         trashButton.frame = NSRect(x: 176, y: 7, width: 30, height: 30)
         root.addSubview(trashButton)
@@ -243,6 +259,13 @@ private final class RecordingHUDContentView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+/// Purely visual contrast scrim: it never intercepts events, so it can sit above
+/// the glass without stealing clicks from the controls or the window-background drag.
+@MainActor
+private final class RecordingHUDScrim: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 @MainActor
 private final class RecordingHUDPauseButton: NSButton {
     override var mouseDownCanMoveWindow: Bool { false }
@@ -269,6 +292,7 @@ private final class RecordingHUDPauseButton: NSButton {
         let name = paused ? "play.fill" : "pause.fill"
         image = NSImage(systemSymbolName: name, accessibilityDescription: paused ? "Resume" : "Pause")?
             .withSymbolConfiguration(pauseConfig)
+        setAccessibilityLabel(paused ? "Resume recording" : "Pause recording")
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -363,6 +387,9 @@ private final class RecordingHUDLevelMeter: NSView {
             bar.layer?.cornerCurve = .continuous
             addSubview(bar)
         }
+        setAccessibilityElement(true)
+        setAccessibilityRole(.levelIndicator)
+        setAccessibilityLabel("Microphone input level")
         setLevel(0)
     }
 

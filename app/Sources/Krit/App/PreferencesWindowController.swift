@@ -13,31 +13,34 @@ enum PreferencesTab: Int, CaseIterable {
     case editor = 4
     case shortcuts = 5
     case presets = 7
+    case permissions = 8
     case about = 6
 
     var title: String {
         switch self {
-        case .general:   return "General"
-        case .capture:   return "Capture"
-        case .recording: return "Recording"
-        case .preview:   return "Preview Overlay"
-        case .editor:    return "Editor"
-        case .shortcuts: return "Shortcuts"
-        case .presets:   return "Presets"
-        case .about:     return "About"
+        case .general:     return "General"
+        case .capture:     return "Capture"
+        case .recording:   return "Recording"
+        case .preview:     return "Preview Overlay"
+        case .editor:      return "Editor"
+        case .shortcuts:   return "Shortcuts"
+        case .presets:     return "Presets"
+        case .permissions: return "Permissions"
+        case .about:       return "About"
         }
     }
 
     var symbol: String {
         switch self {
-        case .general:   return "gearshape"
-        case .capture:   return "camera"
-        case .recording: return "record.circle"
-        case .preview:   return "rectangle.on.rectangle"
-        case .editor:    return "pencil.tip.crop.circle"
-        case .shortcuts: return "keyboard"
-        case .presets:   return "wand.and.stars"
-        case .about:     return "info.circle"
+        case .general:     return "gearshape"
+        case .capture:     return "camera"
+        case .recording:   return "record.circle"
+        case .preview:     return "rectangle.on.rectangle"
+        case .editor:      return "pencil.tip.crop.circle"
+        case .shortcuts:   return "keyboard"
+        case .presets:     return "wand.and.stars"
+        case .permissions: return "lock.shield"
+        case .about:       return "info.circle"
         }
     }
 }

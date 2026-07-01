@@ -100,3 +100,28 @@ com.apple.quarantine` step. Signing is on the v1.0 roadmap.
   app relaunch after the first grant, which the onboarding accounts for.
 - **Apple Silicon** for the current release binary; an Intel/universal build is
   a build-config change, not a code change.
+
+## ADR — Deployment target: stay on macOS 13, gate 14+ behind `#available` (2026-06-25)
+
+**Context.** The master plan weighed raising the deployment target to macOS 14 to
+unlock the SwiftUI Shader API family (Glur/Variablur) and modern native
+animation (`KeyframeAnimator`, `PhaseAnimator`, `.bouncy`/`.snappy`). The repo
+ships at `.macOS(.v13)` (`app/Package.swift`).
+
+**Decision.** Keep the deployment target at **macOS 13**. Guard every macOS 14+
+API behind `if #available(macOS 14, *)` with a graceful fallback, instead of
+raising the floor and dropping Ventura users. Liquid Glass
+(`NSGlassEffectView`) stays conditional on macOS 26 with the existing blur
+fallback in `ChromeFactory`.
+
+**Why.** Staying on 13 keeps Ventura users while still letting Sonoma+ machines
+opt into the newer APIs where they exist. Subject-lifting (Vision
+`VNGenerateForegroundInstanceMaskRequest`), `.symbolEffect` and the
+progressive-blur shaders are additive polish, not core flows, so they fit
+cleanly behind availability checks. Raise the floor to 14 only if Glur/Variablur
+become a hard requirement.
+
+**Consequences.** Any 14+ API ships behind `#available`; a grep gate confirms
+none leak in unguarded. The design-system tokens that unify the app
+(`KritColors`, `ChromeFactory`, `KritType`, `KritSpacing`, `KritTheme`) are all
+target-13-safe.

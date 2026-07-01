@@ -108,6 +108,7 @@ final class PinnedWindow: NSWindow {
         btn.isBordered = false
         btn.target = self
         btn.action = #selector(closeTapped)
+        btn.setAccessibilityLabel("Close")
         btn.alphaValue = 0
         // Stick to top-right corner during live window resize.
         btn.autoresizingMask = [.minXMargin, .minYMargin]
@@ -123,8 +124,7 @@ final class PinnedWindow: NSWindow {
         content.addSubview(grip)
         resizeGrip = grip
 
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.2
+        Motion.animate(0.2) { _ in
             btn.animator().alphaValue = 1
             grip.animator().alphaValue = 1
         }
@@ -134,7 +134,7 @@ final class PinnedWindow: NSWindow {
         guard let btn = closeButton else { return }
         let grip = resizeGrip
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.2
+            ctx.duration = Motion.reduced ? 0 : 0.2
             btn.animator().alphaValue = 0
             grip?.animator().alphaValue = 0
         }, completionHandler: {

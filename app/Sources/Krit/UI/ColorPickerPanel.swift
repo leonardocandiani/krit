@@ -239,6 +239,7 @@ final class SwatchButton: NSButton {
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
         toolTip = "#\(color.hexString)"
+        setAccessibilityLabel("Saved color #\(color.hexString)")
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -337,6 +338,7 @@ final class ColorWellButton: NSButton {
         imagePosition = .imageOnly
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
+        setAccessibilityLabel("Color")
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -585,6 +587,7 @@ final class ColorPickerPanel: NSViewController, NSTextFieldDelegate {
         eyedropper.imagePosition = .imageOnly
         eyedropper.contentTintColor = NSColor.secondaryLabelColor
         eyedropper.toolTip = "Pick color from screen"
+        eyedropper.setAccessibilityLabel("Pick color from screen")
         eyedropper.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(eyedropper)
 
@@ -817,7 +820,7 @@ final class ColorPickerPanel: NSViewController, NSTextFieldDelegate {
         var colors = swatchButtons.map { $0.pickerColor }
         colors.removeAll { $0.hexString == button.pickerColor.hexString }
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.18
+            ctx.duration = Motion.reduced ? 0 : 0.18
             button.animator().alphaValue = 0
         }, completionHandler: {
             // The completion handler is typed nonisolated, so hop back to the main

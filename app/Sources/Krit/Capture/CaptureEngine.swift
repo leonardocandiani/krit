@@ -2305,6 +2305,19 @@ private final class RecordingControlsWindow: NSWindow {
         root.addSubview(barShadowHost)
         root.addSubview(barGlass)
 
+        // Contrast floor: a dark scrim over the glass so the bar's controls and
+        // labels stay legible when recording over light content. The clear glass
+        // went light over a white document and the white labels/glyphs washed out
+        // (white-on-white). It sits under the controls view, which covers the same
+        // frame, so it never affects hit-testing or the window-background drag.
+        let barScrim = NSView(frame: barFrame)
+        barScrim.wantsLayer = true
+        barScrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.68).cgColor
+        barScrim.layer?.cornerRadius = ChromeFactory.Radius.dock
+        barScrim.layer?.cornerCurve = .continuous
+        barScrim.autoresizingMask = [.maxYMargin]
+        root.addSubview(barScrim)
+
         let bar = RecordingPanelContentView(frame: barFrame)
         bar.autoresizingMask = [.maxYMargin]
         root.addSubview(bar)

@@ -336,10 +336,7 @@ private final class SpacePreviewWindow: NSWindow {
     /// Fade the preview (and its pill) in beside the card.
     func present() {
         orderFrontRegardless()
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = reduceMotion ? 0.12 : 0.18
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        Motion.animate(0.18, timing: .easeOut) { _ in
             self.animator().alphaValue = 1
             self.pillWindow?.animator().alphaValue = 1
         }
@@ -356,7 +353,7 @@ private final class SpacePreviewWindow: NSWindow {
         let pill = pillWindow
         pillWindow = nil
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.14
+            ctx.duration = Motion.reduced ? 0 : 0.14
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             self.animator().alphaValue = 0
             pill?.animator().alphaValue = 0
