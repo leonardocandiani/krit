@@ -773,7 +773,10 @@ private func rowLabel(_ title: String, _ symbol: String, _ color: Color) -> some
 }
 
 private struct AboutForm: View {
-    private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.15.4"
+    // Info.plist is the single source of truth for the version. The fallback only
+    // shows when the raw binary runs outside an .app bundle (dev), so keep it honest
+    // instead of a stale real-looking number that drifts every release.
+    private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
     private let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
     private let repo = "https://github.com/leonardocandiani/krit"
 
