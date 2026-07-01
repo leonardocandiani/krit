@@ -1562,29 +1562,7 @@ private final class RecordingWindowChooserWindow: NSWindow {
         positionChooser()
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
-        alphaValue = 0
-        orderFrontRegardless()
-        makeKeyAndOrderFront(nil)
-        makeFirstResponder(contentView)
-
-        if let layer = contentView?.layer {
-            layer.transform = CATransform3DMakeScale(0.96, 0.96, 1)
-            let scale = CASpringAnimation(keyPath: "transform.scale")
-            scale.fromValue = 0.96
-            scale.toValue = 1.0
-            scale.mass = 1
-            scale.stiffness = 320
-            scale.damping = 24
-            scale.duration = scale.settlingDuration
-            layer.add(scale, forKey: "entranceScale")
-            layer.transform = CATransform3DIdentity
-        }
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            animator().alphaValue = 1
-        }
+        animateSpringEntrance()
     }
 
     private func buildContent() {
@@ -1940,29 +1918,7 @@ private final class RecordingScreenChooserWindow: NSWindow {
         positionChooser()
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
-        alphaValue = 0
-        orderFrontRegardless()
-        makeKeyAndOrderFront(nil)
-        makeFirstResponder(contentView)
-
-        if let layer = contentView?.layer {
-            layer.transform = CATransform3DMakeScale(0.96, 0.96, 1)
-            let scale = CASpringAnimation(keyPath: "transform.scale")
-            scale.fromValue = 0.96
-            scale.toValue = 1.0
-            scale.mass = 1
-            scale.stiffness = 320
-            scale.damping = 24
-            scale.duration = scale.settlingDuration
-            layer.add(scale, forKey: "entranceScale")
-            layer.transform = CATransform3DIdentity
-        }
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            animator().alphaValue = 1
-        }
+        animateSpringEntrance()
     }
 
     func closeChooser() {
@@ -2225,29 +2181,7 @@ private final class RecordingControlsWindow: NSWindow {
         positionPanel()
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
-        alphaValue = 0
-        orderFrontRegardless()
-        makeKeyAndOrderFront(nil)
-        makeFirstResponder(contentView)
-
-        if let layer = contentView?.layer {
-            layer.transform = CATransform3DMakeScale(0.96, 0.96, 1)
-            let scale = CASpringAnimation(keyPath: "transform.scale")
-            scale.fromValue = 0.96
-            scale.toValue = 1.0
-            scale.mass = 1
-            scale.stiffness = 320
-            scale.damping = 24
-            scale.duration = scale.settlingDuration
-            layer.add(scale, forKey: "entranceScale")
-            layer.transform = CATransform3DIdentity
-        }
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            animator().alphaValue = 1
-        }
+        animateSpringEntrance()
     }
 
     private func buildContent() {

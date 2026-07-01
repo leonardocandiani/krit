@@ -48,3 +48,36 @@ enum Motion {
         }
     }
 }
+
+extension NSWindow {
+    /// Spring-scale + fade entrance shared by the recording surfaces (preflight,
+    /// controls, HUD), which each carried a byte-identical copy of this. Honors
+    /// Reduce Motion: when the user asked for less motion the window just appears,
+    /// no scale or fade, instead of springing in regardless (the old behavior
+    /// ignored the setting entirely).
+    @MainActor
+    func animateSpringEntrance() {
+        alphaValue = 0
+        orderFrontRegardless()
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(contentView)
+        guard !Motion.reduced else { alphaValue = 1; return }
+        if let layer = contentView?.layer {
+            layer.transform = CATransform3DMakeScale(0.96, 0.96, 1)
+            let scale = CASpringAnimation(keyPath: "transform.scale")
+            scale.fromValue = 0.96
+            scale.toValue = 1.0
+            scale.mass = 1
+            scale.stiffness = 320
+            scale.damping = 24
+            scale.duration = scale.settlingDuration
+            layer.add(scale, forKey: "entranceScale")
+            layer.transform = CATransform3DIdentity
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            animator().alphaValue = 1
+        }
+    }
+}
