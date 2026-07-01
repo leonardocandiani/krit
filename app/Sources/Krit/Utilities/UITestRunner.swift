@@ -81,6 +81,7 @@ final class UITestRunner: NSObject {
             case "record-smoke-mic": report = await Self.runRecordSmoke(microphone: true)
             case "smart-redact":  report = await Self.runSmartRedactSuite()
             case "redact-adversarial": report = await Self.runRedactAdversarial()
+            case "redact-sharpness": report = await Self.runRedactSharpness()
             case "glass-renders": report = await Self.runGlassRenders()
             case "default-template": report = await Self.runDefaultTemplateSuite()
             case "editor-fit-large": report = await Self.runEditorFitLargeSuite()
@@ -1998,6 +1999,103 @@ final class UITestRunner: NSObject {
         r["secretDestroyed"] = secretDestroyed
 
         r["allPass"] = controlReadable && secretDestroyed
+        return r
+    }
+
+    // MARK: - Cenário: redact-sharpness (export do redact na resolução nativa)
+
+    /// Prova que o efeito exporta na resolução da captura, não na escala da tela.
+    /// A fonte é sintetizada a 3x (nenhuma tela Mac é 3x), então se o render ainda
+    /// dependesse da escala do display (o bug), o bitmap cacheado sairia a 1x/2x e a
+    /// razão pixels/pontos NÃO bateria 3. Bater 3 exato, mais o export sair em
+    /// pixels nativos, prova que a faixa de redação nunca é ampliada suave.
+    private static func runRedactSharpness() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "redact-sharpness"]
+
+        // 3x synthetic capture. logical points 400x200, native pixels 1200x600.
+        let logical = NSSize(width: 400, height: 200)
+        let srcScale = 3
+        let pxW = Int(logical.width) * srcScale
+        let pxH = Int(logical.height) * srcScale
+        guard let srcRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: pxW, pixelsHigh: pxH,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: pxW * 4, bitsPerPixel: 32
+        ), let sctx = NSGraphicsContext(bitmapImageRep: srcRep) else {
+            r["error"] = "could not build source rep"; r["allPass"] = false; return r
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = sctx
+        NSColor.white.setFill(); NSRect(x: 0, y: 0, width: pxW, height: pxH).fill()
+        for x in stride(from: 0, to: pxW, by: 12) {
+            NSColor.black.setFill()
+            NSRect(x: CGFloat(x), y: 0, width: 6, height: CGFloat(pxH)).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        srcRep.size = logical
+        let img = NSImage(size: logical)
+        img.addRepresentation(srcRep)
+
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController else {
+            r["error"] = "editor window did not open"; r["allPass"] = false; return r
+        }
+        defer { ctrl.window?.close() }
+        let canvas = ctrl.uiTestCanvas
+
+        var bg = ScreenshotBackgroundOptions.editorDefault
+        bg.isEnabled = false   // slot == full canvas == the whole screenshot
+        canvas.backgroundOptions = bg
+        canvas.backgroundImage = img
+        canvas.frame = NSRect(origin: .zero, size: logical)
+
+        let region = NSRect(x: 50, y: 40, width: 300, height: 120)
+        let fx = PixelateAnnotation(rect: region)
+        fx.scale = 10
+        canvas.objects = [fx]
+        canvas.needsDisplay = true
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        // flatten drives the same drawPixelate the export uses; it renders and
+        // caches the effect at the native scale under the fixed EffectCacheKey.
+        let export = canvas.flatten()
+
+        guard let cached = fx.cachedRender,
+              let crep = cached.representations.first as? NSBitmapImageRep else {
+            r["error"] = "no cached render"; r["allPass"] = false; return r
+        }
+        let expectedCW = Int(ceil(region.width * CGFloat(srcScale)))
+        let expectedCH = Int(ceil(region.height * CGFloat(srcScale)))
+        r["cachedPxW"] = crep.pixelsWide; r["cachedPxH"] = crep.pixelsHigh
+        r["expectedCachedW"] = expectedCW; r["expectedCachedH"] = expectedCH
+        // Machine-independent: no Mac display is 3x, so a cache still tied to screen
+        // scale could never land on region x 3. Landing there proves it decoupled.
+        let scaleDecoupled = crep.pixelsWide == expectedCW && crep.pixelsHigh == expectedCH
+        r["scaleDecoupled"] = scaleDecoupled
+
+        guard let ecg = export.bestCGImage else {
+            r["error"] = "no export image"; r["allPass"] = false; return r
+        }
+        r["exportPxW"] = ecg.width; r["exportPxH"] = ecg.height
+        let exportNative = ecg.width == pxW && ecg.height == pxH
+        r["exportNative"] = exportNative
+
+        // Corroboration (reported, not gated): a native-res mosaic of a striped
+        // source keeps hard block edges. Scan one row through the band and record
+        // the steepest adjacent-pixel luma jump; an upscaled-soft band smears these.
+        let erep = NSBitmapImageRep(cgImage: ecg)
+        let y = min(max(Int(region.midY) * srcScale, 0), ecg.height - 1)
+        var maxJump = 0.0; var prev = -1.0
+        for x in stride(from: Int(region.minX) * srcScale, to: Int(region.maxX) * srcScale, by: 1) {
+            guard let c = erep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+            let luma = (c.redComponent * 0.299 + c.greenComponent * 0.587 + c.blueComponent * 0.114) * 255
+            if prev >= 0 { maxJump = max(maxJump, abs(luma - prev)) }
+            prev = luma
+        }
+        r["maxBlockEdgeJump"] = Int(maxJump)
+
+        r["allPass"] = scaleDecoupled && exportNative
         return r
     }
 

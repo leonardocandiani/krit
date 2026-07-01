@@ -929,6 +929,17 @@ final class AnnotationCanvas: NSView {
         px.cachedKey = key
     }
 
+    /// Source pixel/point ratio. Effects and the flattened export both rasterize at
+    /// this scale so a redaction band stays sharp when a Retina capture is exported
+    /// from a 1x display: the live screen scale must never cap the cached render.
+    private var nativeRenderScale: CGFloat {
+        if let bg = backgroundImage, let srcCG = bg.bestCGImage, bg.size.width > 0, bg.size.height > 0 {
+            return max(CGFloat(srcCG.width) / bg.size.width,
+                       CGFloat(srcCG.height) / bg.size.height, 1)
+        }
+        return max(window?.backingScaleFactor ?? 2, 1)
+    }
+
     private func effectCacheKey(region: CGRect, strength: Double, secure: Bool = false) -> EffectCacheKey? {
         guard let bg = backgroundImage, let cg = bg.bestCGImage else { return nil }
         return EffectCacheKey(
@@ -938,7 +949,8 @@ final class AnnotationCanvas: NSView {
             secure: secure,
             options: backgroundOptions,
             imagePixelWidth: cg.width,
-            imagePixelHeight: cg.height
+            imagePixelHeight: cg.height,
+            renderScale: Int((nativeRenderScale * 100).rounded())
         )
     }
 
@@ -952,10 +964,24 @@ final class AnnotationCanvas: NSView {
         guard region.width >= 1, region.height >= 1 else { return nil }
         guard let bg = backgroundImage, let cgImg = bg.bestCGImage else { return nil }
 
-        let result = NSImage(size: region.size)
-        result.lockFocusFlipped(true)
-        defer { result.unlockFocus() }
-        guard let local = NSGraphicsContext.current?.cgContext else { return nil }
+        // Rasterize at the source's native scale, not the live screen scale that
+        // lockFocus would pick. A cache baked at 1x on an external display would
+        // otherwise upscale soft once the Retina capture is exported at full res.
+        let scale = nativeRenderScale
+        let pixelW = max(1, Int(ceil(region.width * scale)))
+        let pixelH = max(1, Int(ceil(region.height * scale)))
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let local = CGContext(
+            data: nil, width: pixelW, height: pixelH,
+            bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        local.translateBy(x: 0, y: CGFloat(pixelH))
+        local.scaleBy(x: scale, y: -scale)
+        local.interpolationQuality = .high
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: local, flipped: true)
+        defer { NSGraphicsContext.restoreGraphicsState() }
 
         // Veil the whole region first as the floor: wherever the real effect lands
         // it paints over this, and any out-of-slot remainder keeps the veil.
@@ -1013,6 +1039,13 @@ final class AnnotationCanvas: NSView {
                 piece.draw(in: localRect)
             }
         }
+        guard let cg = local.makeImage() else { return nil }
+        // rep reports point size but carries native pixels, so the cached render
+        // draws sharp at the export scale instead of upscaling a screen-scale bitmap.
+        let rep = NSBitmapImageRep(cgImage: cg)
+        rep.size = region.size
+        let result = NSImage(size: region.size)
+        result.addRepresentation(rep)
         return result
     }
 
@@ -3112,14 +3145,9 @@ final class AnnotationCanvas: NSView {
         guard pointSize.width > 0, pointSize.height > 0 else { return NSImage() }
 
         // Native pixel/point ratio: from the screenshot's own pixels when present,
-        // else the window backing scale (detached canvas falls back to 2).
-        let nativeScale: CGFloat
-        if let bg = backgroundImage, let srcCG = bg.bestCGImage, bg.size.width > 0, bg.size.height > 0 {
-            nativeScale = max(CGFloat(srcCG.width) / bg.size.width,
-                              CGFloat(srcCG.height) / bg.size.height, 1)
-        } else {
-            nativeScale = max(window?.backingScaleFactor ?? 2, 1)
-        }
+        // else the window backing scale (detached canvas falls back to 2). Same
+        // source as the effect renders, so a cached redaction matches the export.
+        let nativeScale = nativeRenderScale
 
         let pixelW = max(1, Int(ceil(pointSize.width * nativeScale)))
         let pixelH = max(1, Int(ceil(pointSize.height * nativeScale)))
