@@ -151,15 +151,27 @@ enum SystemWallpaperSource {
             return fresh
         }
         let target = screen ?? NSScreen.main ?? NSScreen.screens.first
-        let fromFile = target.flatMap { resolveImageFile(from: NSWorkspace.shared.desktopImageURL(for: $0)) }
-        let resolved = fromFile ?? all.first?.url
-        uiTestLastWallpaperSource = resolved == nil ? "none" : (fromFile != nil ? "desktop-image-url" : "builtin-first")
-        guard let url = resolved else { return nil }
-        // Dynamic HEICs pack the light variant first and the dark one last.
-        // Follow the user's CURRENT appearance: composing the light frame for a
-        // dark-mode desktop hands back a near-white backdrop that looks nothing
-        // like the wallpaper on screen.
         let darkMode = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let desktopURL = target.flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
+        let fromFile = resolveImageFile(from: desktopURL)
+        // When the real wallpaper is a video/aerial macOS can't resolve to a still,
+        // desktopImageURL hands back the generic DefaultDesktop.heic — a single
+        // LIGHT frame (luminance ~141). Composing that under a dark-mode window shot
+        // is the "white background" bug. In dark mode, swap that light generic for a
+        // bundled DARK wallpaper so the backdrop matches the dark desktop on screen.
+        let isGenericLightDefault = desktopURL?.lastPathComponent == "DefaultDesktop.heic"
+        let resolved: URL?
+        if darkMode, isGenericLightDefault,
+           let darkURL = all.first(where: { $0.url.lastPathComponent.localizedCaseInsensitiveContains("dark") })?.url {
+            resolved = darkURL
+            uiTestLastWallpaperSource = "builtin-dark"
+        } else {
+            resolved = fromFile ?? all.first?.url
+            uiTestLastWallpaperSource = resolved == nil ? "none" : (fromFile != nil ? "desktop-image-url" : "builtin-first")
+        }
+        guard let url = resolved else { return nil }
+        // Dynamic HEICs pack the light variant first and the dark one last; follow
+        // the user's appearance (the light frame on a dark desktop reads near-white).
         let frameIndex = darkMode ? Int.max : 0  // downscaled clamps to the last frame
         return downscaled(url: url, index: frameIndex, maxPixel: maxPixel).flatMap { cg -> Data? in
             NSBitmapImageRep(cgImage: cg).representation(using: .jpeg, properties: [.compressionFactor: 0.9])
@@ -177,13 +189,13 @@ enum SystemWallpaperSource {
     /// any error so the caller keeps its static fallback.
     @available(macOS 14.0, *)
     private static func captureWallpaperWindowImage(for screen: NSScreen) async -> CGImage? {
-        // Primary path on macOS 26/27: the Dock no longer exposes a "Wallpaper"
-        // window to SCK (the only Dock window reported is the Dock bar itself), so
-        // window-finding fails. Instead capture the whole DISPLAY with every window
-        // excluded; what remains composited is the live wallpaper exactly as the
-        // WindowServer renders it, which resolves the dynamic HEIC variant and the
-        // right monitor for free, no desktopImageURL guessing.
-        if let cg = await captureDisplayWallpaper(for: screen) {
+        // First try capturing the whole DISPLAY with every window excluded: what
+        // remains composited is the live wallpaper, resolving the dynamic HEIC
+        // variant and the right monitor for free. This works for STATIC wallpapers,
+        // but a video/aerial wallpaper returns a uniform BLACK frame this way
+        // (proven empirically), so reject a uniform grab and fall through to the
+        // wallpaper-window path below, which DOES capture the live aerial.
+        if let cg = await captureDisplayWallpaper(for: screen), CaptureEngine.uniformColorDescription(cg) == nil {
             uiTestLastWallpaperGrab = "sck-display"
             return cg
         }
@@ -239,12 +251,17 @@ enum SystemWallpaperSource {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: onScreenOnly)
             let screenFrameCG = cgFrame(of: screen)
+            // The desktop wallpaper layer is owned by the Dock on older macOS, but
+            // by WindowManager / wallpaper.agent on macOS 26/27 — that "Wallpaper"
+            // window's isolated grab returns the real aerial frame (proven: lum ~30
+            // dark, where the display-exclude path returned black).
+            let wallpaperOwners: Set<String> = ["com.apple.dock", "com.apple.WindowManager", "com.apple.wallpaper.agent"]
             let candidates = content.windows.filter { window in
-                guard window.owningApplication?.bundleIdentifier == "com.apple.dock" else { return false }
+                guard let owner = window.owningApplication?.bundleIdentifier, wallpaperOwners.contains(owner) else { return false }
                 let title = window.title ?? ""
                 if title.hasPrefix("Wallpaper") { return true }
-                // Fallback: a Dock window that exactly fills a display is the
-                // desktop wallpaper layer even when the title doesn't match.
+                // Fallback: a wallpaper-layer window that exactly fills a display is
+                // the desktop layer even when the title doesn't match.
                 return screenFrameCG.map { frameMatches(window.frame, $0) } ?? false
             }
             // Every Space keeps a Wallpaper window with the SAME frame, so the

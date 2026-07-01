@@ -82,6 +82,7 @@ final class UITestRunner: NSObject {
             case "smart-redact":  report = await Self.runSmartRedactSuite()
             case "redact-adversarial": report = await Self.runRedactAdversarial()
             case "redact-sharpness": report = await Self.runRedactSharpness()
+            case "uniform-grab-guard": report = Self.runUniformGrabGuard()
             case "glass-renders": report = await Self.runGlassRenders()
             case "default-template": report = await Self.runDefaultTemplateSuite()
             case "editor-fit-large": report = await Self.runEditorFitLargeSuite()
@@ -2096,6 +2097,59 @@ final class UITestRunner: NSObject {
         r["maxBlockEdgeJump"] = Int(maxJump)
 
         r["allPass"] = scaleDecoupled && exportNative
+        return r
+    }
+
+    // MARK: - Cenário: uniform-grab-guard (rejeição do frame -3811 que causaria o flash)
+
+    /// The frozen-frame flash fix drops a grab that came back a uniform black/white
+    /// frame (the -3811 failure this Mac hits on a video wallpaper) instead of
+    /// painting it as the backdrop, which would black out or light-flash the whole
+    /// selection. Prove the guard: uniformColorDescription flags uniform grabs and
+    /// passes real (varied) content. Pure function, no SCK grab, so it never hangs
+    /// the way a real capture does headless.
+    private static func runUniformGrabGuard() -> [String: Any] {
+        var r: [String: Any] = ["scenario": "uniform-grab-guard"]
+
+        func bitmap() -> (NSBitmapImageRep, NSGraphicsContext)? {
+            guard let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 40,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 40 * 4, bitsPerPixel: 32
+            ), let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+            return (rep, ctx)
+        }
+        func solid(_ gray: CGFloat) -> CGImage? {
+            guard let (rep, ctx) = bitmap() else { return nil }
+            NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = ctx
+            NSColor(white: gray, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: 40, height: 40).fill()
+            NSGraphicsContext.restoreGraphicsState()
+            return rep.cgImage
+        }
+        func striped() -> CGImage? {
+            guard let (rep, ctx) = bitmap() else { return nil }
+            NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = ctx
+            NSColor.white.setFill(); NSRect(x: 0, y: 0, width: 40, height: 40).fill()
+            NSColor.black.setFill()
+            for x in stride(from: 0, to: 40, by: 8) { NSRect(x: CGFloat(x), y: 0, width: 4, height: 40).fill() }
+            NSGraphicsContext.restoreGraphicsState()
+            return rep.cgImage
+        }
+
+        let blackDesc = solid(0).flatMap { CaptureEngine.uniformColorDescription($0) }
+        let whiteDesc = solid(1).flatMap { CaptureEngine.uniformColorDescription($0) }
+        let variedDesc = striped().flatMap { CaptureEngine.uniformColorDescription($0) }
+        r["blackDesc"] = blackDesc ?? "nil"
+        r["whiteDesc"] = whiteDesc ?? "nil"
+        r["variedDesc"] = variedDesc ?? "nil"
+
+        let blackRejected = blackDesc?.hasPrefix("black") == true
+        let whiteRejected = whiteDesc?.hasPrefix("white") == true
+        let variedAccepted = variedDesc == nil   // varied content is a real desktop, kept
+        r["blackRejected"] = blackRejected
+        r["whiteRejected"] = whiteRejected
+        r["variedAccepted"] = variedAccepted
+        r["allPass"] = blackRejected && whiteRejected && variedAccepted
         return r
     }
 
