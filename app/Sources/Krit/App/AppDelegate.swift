@@ -106,7 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             return
         }
         guard let screen = screenForTopLeftRect(rect) else { completion(nil); return }
-        let appKit = appKitRect(fromTopLeft: rect)
+        let appKit = CoordinateSpace.appKitRect(fromTopLeft: rect)
         Task {
             let image = await captureEngine.captureRectToImage(appKit, on: screen)
             completion(image)
@@ -127,7 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             return
         }
         guard let screen = screenForTopLeftRect(rect) else { return }
-        let appKit = appKitRect(fromTopLeft: rect)
+        let appKit = CoordinateSpace.appKitRect(fromTopLeft: rect)
         Task { await captureEngine.uiTestStartRecording(rect: appKit, on: screen) }
     }
 
@@ -182,18 +182,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     /// macOS global top-left space (origin at the primary display's top-left) to
-    /// AppKit's bottom-left global space: flip Y about the primary display height.
-    /// Matches AutomationService so URL and CFMessagePort callers agree on coords.
-    private func appKitRect(fromTopLeft rect: CGRect) -> CGRect {
-        let primaryHeight = (NSScreen.screens.first(where: { $0.frame.origin == .zero })
-            ?? NSScreen.main
-            ?? NSScreen.screens.first)?.frame.height ?? rect.maxY
-        let appKitY = primaryHeight - rect.origin.y - rect.height
-        return CGRect(x: rect.origin.x, y: appKitY, width: rect.width, height: rect.height)
-    }
-
     private func screenForTopLeftRect(_ rect: CGRect) -> NSScreen? {
-        let appKit = appKitRect(fromTopLeft: rect)
+        let appKit = CoordinateSpace.appKitRect(fromTopLeft: rect)
         return NSScreen.screens.first(where: { $0.frame.intersects(appKit) })
             ?? NSScreen.main
             ?? NSScreen.screens.first

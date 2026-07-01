@@ -59,7 +59,7 @@ final class AutomationService {
         guard let screen = screenForTopLeftRect(topLeftRect, displayIndex: display) else {
             throw AutomationError.noDisplay
         }
-        let appKitRect = appKitRect(fromTopLeft: topLeftRect)
+        let appKitRect = CoordinateSpace.appKitRect(fromTopLeft: topLeftRect)
         return try await capture(rect: appKitRect, on: screen, explicitOut: explicitOut)
     }
 
@@ -152,7 +152,7 @@ final class AutomationService {
         guard w > 0, h > 0 else { return nil }
         let topLeftRect = CGRect(x: x, y: y, width: w, height: h)
         guard let screen = screenForTopLeftRect(topLeftRect, displayIndex: nil) else { return nil }
-        let appKitRect = appKitRect(fromTopLeft: topLeftRect)
+        let appKitRect = CoordinateSpace.appKitRect(fromTopLeft: topLeftRect)
         guard let image = await engine.captureRectToImage(appKitRect, on: screen),
               let tiff = image.tiffRepresentation,
               let rep = NSBitmapImageRep(data: tiff),
@@ -175,23 +175,12 @@ final class AutomationService {
 
     // MARK: - Coordinate conversion
 
-    /// macOS global top-left coordinate space has its origin at the top-left of the
-    /// primary display. AppKit's global space is bottom-left with the same origin.
-    /// Flip Y about the primary display's height.
-    private func appKitRect(fromTopLeft rect: CGRect) -> CGRect {
-        let primaryHeight = (NSScreen.screens.first(where: { $0.frame.origin == .zero })
-            ?? NSScreen.main
-            ?? NSScreen.screens.first)?.frame.height ?? rect.maxY
-        let appKitY = primaryHeight - rect.origin.y - rect.height
-        return CGRect(x: rect.origin.x, y: appKitY, width: rect.width, height: rect.height)
-    }
-
     private func screenForTopLeftRect(_ rect: CGRect, displayIndex: Int?) -> NSScreen? {
         let screens = NSScreen.screens
         if let displayIndex, displayIndex >= 0, displayIndex < screens.count {
             return screens[displayIndex]
         }
-        let appKit = appKitRect(fromTopLeft: rect)
+        let appKit = CoordinateSpace.appKitRect(fromTopLeft: rect)
         return screens.first(where: { $0.frame.intersects(appKit) })
             ?? screens.max(by: { lhs, rhs in
                 lhs.frame.intersection(appKit).area < rhs.frame.intersection(appKit).area
