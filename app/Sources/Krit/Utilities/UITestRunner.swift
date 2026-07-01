@@ -582,10 +582,31 @@ final class UITestRunner: NSObject {
         r["monoValidated"] = inputStereo   // mono check only trusted if the source was real stereo
         r["monoPass"] = monoPass
         let checks = [exportOK, outExists, dimsPass, inputStereo, monoPass]
-        r["allPass"] = checks.allSatisfy { $0 }
+
+        // Prove the other two audio modes through the same pipeline: keep
+        // preserves the stereo track, mute drops audio entirely.
+        let keepURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-keep.mp4")
+        let keepOpts = VideoTrimPanel.ConvertOptions(width: 160, height: 120, quality: quality, audio: .keep)
+        let keepOK = await RecordingEngine.exportTrimConvert(source: srcURL, range: subRange, options: keepOpts, to: keepURL)
+        let keepCh = await audioChannelCount(of: keepURL)
+        r["keepChannels"] = keepCh ?? -1
+        let keepPass = keepOK && keepCh == 2
+
+        let muteURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-mute.mp4")
+        let muteOpts = VideoTrimPanel.ConvertOptions(width: 160, height: 120, quality: quality, audio: .mute)
+        let muteOK = await RecordingEngine.exportTrimConvert(source: srcURL, range: subRange, options: muteOpts, to: muteURL)
+        let muteCh = await audioChannelCount(of: muteURL)
+        r["muteChannels"] = muteCh ?? -1   // -1 means no audio track, the expected mute result
+        let mutePass = muteOK && muteCh == nil
+
+        r["keepPass"] = keepPass
+        r["mutePass"] = mutePass
+        r["allPass"] = (checks + [keepPass, mutePass]).allSatisfy { $0 }
 
         try? FileManager.default.removeItem(at: srcURL)
         try? FileManager.default.removeItem(at: outURL)
+        try? FileManager.default.removeItem(at: keepURL)
+        try? FileManager.default.removeItem(at: muteURL)
         return r
     }
 
