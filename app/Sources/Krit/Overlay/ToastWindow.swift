@@ -21,9 +21,9 @@ final class ToastWindow: NSWindow {
         }
         toast.orderFrontRegardless()
 
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.3
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        // Entrance honors Reduce Motion through the Motion token: the duration
+        // collapses to 0 (instant) and the spring below is skipped entirely.
+        Motion.animate(0.3) { _ in
             toast.animator().alphaValue = 1
             // animator().setFrame, not setFrameOrigin: NSWindow only animates the
             // whole "frame" key; setFrameOrigin through the animator is a no-op.
@@ -34,22 +34,26 @@ final class ToastWindow: NSWindow {
         }
 
         if let layer = toast.contentView?.layer {
-            let spring = CASpringAnimation(keyPath: "transform.scale")
-            spring.fromValue = 0.92
-            spring.toValue = 1.0
-            spring.mass = 1.0
-            spring.stiffness = 200
-            spring.damping = 12
-            spring.initialVelocity = 0
-            spring.duration = spring.settlingDuration
-            layer.add(spring, forKey: "entranceScale")
-            layer.transform = CATransform3DIdentity
+            if Motion.reduced {
+                layer.transform = CATransform3DIdentity
+            } else {
+                let spring = CASpringAnimation(keyPath: "transform.scale")
+                spring.fromValue = 0.92
+                spring.toValue = 1.0
+                spring.mass = 1.0
+                spring.stiffness = 200
+                spring.damping = 12
+                spring.initialVelocity = 0
+                spring.duration = spring.settlingDuration
+                layer.add(spring, forKey: "entranceScale")
+                layer.transform = CATransform3DIdentity
+            }
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak toast] in
             guard let toast else { return }
             NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.3
+                ctx.duration = Motion.reduced ? 0 : 0.3
                 toast.animator().alphaValue = 0
             }, completionHandler: { [weak toast] in
                 DispatchQueue.main.async {

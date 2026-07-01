@@ -623,6 +623,11 @@ struct EffectCacheKey: Equatable {
     let options: ScreenshotBackgroundOptions
     let imagePixelWidth: Int
     let imagePixelHeight: Int
+    // Rasterization scale (× 100) the cached render was baked at. The live screen
+    // scale must not cap it: a Retina capture edited on a 1x display then exported
+    // at native resolution would upscale a 1x cache and leave the redaction band
+    // soft. Keying on it forces a re-render if the output scale ever changes.
+    let renderScale: Int
 }
 
 // MARK: - Blur

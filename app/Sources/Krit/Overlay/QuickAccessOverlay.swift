@@ -916,6 +916,13 @@ private final class QuickAccessWindow: NSWindow {
     /// the thumb once it decides the gesture is a downward card drag.
     func cardDragBegin() {
         guard !isClosing, !isParked, !isPreviewZoomed else { return }
+        // Raise the grabbed card above its siblings for the whole gesture. Without
+        // this, dragging a card that overlaps another could slide it BEHIND the
+        // sibling (the resting stack cascades, so frames overlap), which read as
+        // "the card disappeared while I dragged it" with more than one card open.
+        // orderFrontRegardless matches how the rest of the overlay surfaces cards
+        // (non-activating floating windows) without stealing the user's focus.
+        orderFrontRegardless()
         // A drag that starts while ANY frame animation is in flight (the 0.35s
         // entrance slide, a reflow spring, a snap-back, a zoom collapse) fights it:
         // both write the frame, so the drag's setFrameOrigin and the animator's
@@ -2706,8 +2713,9 @@ private final class QuickAccessWindow: NSWindow {
     }
 
     @objc private func editAction() {
-        // Video: hand off to the recording's GIF/trim editor (the RecordingResult
-        // window) instead of the screenshot annotation tool.
+        // Video: hand off to the Snapzy-style video editor (player + timeline +
+        // zoom lane + trim), the real editing surface, instead of the screenshot
+        // annotation tool.
         if let payload = videoPayload {
             let actions = payload.actions
             let url = payload.url
@@ -2715,7 +2723,7 @@ private final class QuickAccessWindow: NSWindow {
             skipPolicyReset = true
             animatedClose()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                actions?.reopenResultWindow(url: url, duration: duration)
+                actions?.openVideoEditor(url: url, duration: duration)
             }
             return
         }

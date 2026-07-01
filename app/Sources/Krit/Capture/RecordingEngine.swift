@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import AudioToolbox
 import CoreVideo
 import CoreMedia
 import ScreenCaptureKit
@@ -9,14 +10,18 @@ import ScreenCaptureKit
 @MainActor
 protocol RecordingResultActions: AnyObject {
     func exportGIF(from url: URL)
-    func trim(url: URL, range: CMTimeRange)
+    /// Exports `range` of `url`. When `convert` is nil it is a plain range trim
+    /// (no rescale or audio remux). When `convert` is set, the output is rescaled
+    /// to the chosen dimensions, re-encoded at the chosen quality, and its audio
+    /// follows the chosen mode (keep / mono downmix / mute).
+    func trim(url: URL, range: CMTimeRange, convert: VideoTrimPanel.ConvertOptions?)
     /// Bakes screen-studio-style auto-zoom into a copy of the clip, following the
     /// recorded cursor path. No-ops with a toast when the clip has no cursor data.
     func exportAutoZoom(from url: URL)
     /// Re-presents the RecordingResultWindow (GIF / trim editor) for a finished
     /// recording. The overlay card's "Edit recording" routes here so the result
     /// window's exclusive features stay reachable after it stops being the default.
-    func reopenResultWindow(url: URL, duration: Double)
+    func openVideoEditor(url: URL, duration: Double)
 }
 
 @MainActor
@@ -56,6 +61,13 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         return FileManager.default.fileExists(atPath: last.url.path)
     }
     private var recordingScreen: NSScreen?
+    /// Source of the active take, kept so a restart can re-arm the same capture.
+    private var lastSource: RecordingSource?
+    /// True while a discard/restart tears the take down, so finishRecording throws
+    /// the file away instead of presenting a card.
+    private var isDiscarding = false
+    /// True when the discard should be followed by a fresh take of the same source.
+    private var restartAfterDiscard = false
     private var firstPresentationTime: CMTime?
     private var lastPresentationTime: CMTime?
     /// Source-clock PTS of the most recently appended video frame. Used to anchor
@@ -119,6 +131,7 @@ final class RecordingEngine: NSObject, RecordingResultActions {
             ToastWindow.show(message: "Recording already in progress")
             return
         }
+        lastSource = source
 
         uiTestLastFinishOutcome = "none"
         uiTestLastStreamError = ""
@@ -149,6 +162,8 @@ final class RecordingEngine: NSObject, RecordingResultActions {
             )
             hud.stopHandler = { [weak self] in self?.stopRecording() }
             hud.togglePauseHandler = { [weak self] _ in self?.togglePause() }
+            hud.restartHandler = { [weak self] in self?.restartRecording() }
+            hud.discardHandler = { [weak self] in self?.discardRecording() }
             self.hud = hud
             self.recordingScreen = source.screen
             hud.show(on: source.screen)
@@ -231,6 +246,38 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         }
     }
 
+    /// Stop the in-progress take and throw the file away, no card. Wired to the
+    /// HUD trash button, so it performs a real action instead of sitting disabled.
+    func discardRecording() {
+        guard active else { return }
+        isDiscarding = true
+        stopRecording()
+    }
+
+    /// Discard the current take and immediately start a fresh one of the same
+    /// source. Wired to the HUD restart button.
+    func restartRecording() {
+        guard active, lastSource != nil else { return }
+        restartAfterDiscard = true
+        discardRecording()
+    }
+
+    /// If a discard/restart is in flight, drop the finished file, optionally
+    /// re-arm the same source, and return true so finishRecording skips the
+    /// normal card-presentation path.
+    private func consumeDiscardIfNeeded(url: URL) -> Bool {
+        guard isDiscarding else { return false }
+        isDiscarding = false
+        let shouldRestart = restartAfterDiscard
+        restartAfterDiscard = false
+        try? FileManager.default.removeItem(at: url)
+        ToastWindow.show(message: shouldRestart ? "Restarting\u{2026}" : "Recording discarded", duration: 2.0)
+        if shouldRestart, let src = lastSource {
+            Task { await startRecording(source: src) }
+        }
+        return true
+    }
+
     /// Re-presents the result window for the last finished recording so GIF export,
     /// trim and reveal stay reachable after the window was dismissed.
     func reopenLastResult() {
@@ -264,7 +311,7 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         }
     }
 
-    func reopenResultWindow(url: URL, duration: Double) {
+    func openVideoEditor(url: URL, duration: Double) {
         // "Edit recording" opens the Snapzy-style video editor (player + timeline +
         // zoom lane + trim), the real editing surface. The exported clip comes back
         // as a fresh card.
@@ -812,6 +859,8 @@ final class RecordingEngine: NSObject, RecordingResultActions {
                     guard let self, self.finishSessionID == sessionID else { return }
                     self.cancelFinishTimeout()
                     self.cleanup()
+                    // Discard/restart: drop the file and skip the card entirely.
+                    if self.consumeDiscardIfNeeded(url: url) { return }
                     if let error {
                         self.showSaveFailure(reason: Self.saveFailureReason(error))
                         print("[KRIT] Recording stream error: \(error)")
@@ -999,30 +1048,308 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         }
     }
 
-    func trim(url: URL, range: CMTimeRange) {
+    func trim(url: URL, range: CMTimeRange, convert: VideoTrimPanel.ConvertOptions?) {
         let base = url.deletingPathExtension().lastPathComponent
         let outURL = url.deletingLastPathComponent().appendingPathComponent("\(base) Trimmed.mp4")
         ToastWindow.show(message: "Trimming…")
-        Task {
-            let asset = AVURLAsset(url: url)
-            guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
+        Task { [weak self] in
+            let ok: Bool
+            if let convert {
+                ok = await Self.exportTrimConvert(source: url, range: range, options: convert, to: outURL)
+            } else {
+                ok = await Self.exportTrimOnly(source: url, range: range, to: outURL)
+            }
+            guard ok else {
                 ToastWindow.show(message: "Could not trim recording.")
                 return
             }
+            ToastWindow.show(message: "Saved trimmed: \(outURL.lastPathComponent)", duration: 3.0)
+            // Route the trimmed clip back through presentResult so it returns as
+            // a card (or the result window with the overlay off) instead of being
+            // left orphaned on disk, the same way exportAutoZoom does.
+            guard let self else { return }
+            let seconds = CMTimeGetSeconds(range.duration)
+            self.lastFinishedRecording = (outURL, seconds)
+            self.presentResult(url: outURL, duration: seconds)
+        }
+    }
+
+    // MARK: - Trim export pipeline
+
+    /// Plain range trim: exports `range` at the source's native dimensions and
+    /// audio, with no rescale or remux. This is the historical "Trim Only" path.
+    static func exportTrimOnly(source url: URL, range: CMTimeRange, to outURL: URL) async -> Bool {
+        let asset = AVURLAsset(url: url)
+        guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
+            return false
+        }
+        try? FileManager.default.removeItem(at: outURL)
+        export.outputURL = outURL
+        export.outputFileType = .mp4
+        export.timeRange = range
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            export.exportAsynchronously { continuation.resume() }
+        }
+        if export.status != .completed, let error = export.error { print("[KRIT] Trim failed: \(error)") }
+        return export.status == .completed
+    }
+
+    /// Range trim that also honors the convert options: rescales the video to
+    /// `options.width` x `options.height`, applies a quality-driven byte budget,
+    /// and emits audio per `options.audio`.
+    ///
+    /// Strategy: the video (and, for `.keep`, its audio) goes through one
+    /// `AVAssetExportSession` driven by an `AVMutableVideoComposition` whose
+    /// `renderSize` does the real rescale. `.mute` simply omits the audio track.
+    /// `.mono` cannot be downmixed by an export session, so phase 1 stays
+    /// video-only, phase 2 reader/writer-encodes a genuine 1-channel track, and
+    /// phase 3 muxes the two together.
+    static func exportTrimConvert(
+        source url: URL,
+        range: CMTimeRange,
+        options: VideoTrimPanel.ConvertOptions,
+        to outURL: URL
+    ) async -> Bool {
+        let asset = AVURLAsset(url: url)
+        guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first else { return false }
+        let rawFps = (try? await videoTrack.load(.nominalFrameRate)) ?? 30
+        let fps = max(Int(rawFps.rounded()), 1)
+        // Even dimensions keep H.264 happy; clamp to a 2px floor.
+        let target = CGSize(width: evenClamp(options.width), height: evenClamp(options.height))
+
+        // Phase 1: rescaled video, cut to `range`, plus original audio when keep.
+        guard let (comp, compVideo) = await buildTrimComposition(
+            asset: asset, videoTrack: videoTrack, range: range, keepAudio: options.audio == .keep
+        ) else {
+            return false
+        }
+        let transform = await renderTransform(for: videoTrack, target: target)
+        let videoComposition = scalingVideoComposition(
+            track: compVideo, transform: transform, target: target, fps: fps, duration: range.duration
+        )
+
+        let needsMono = (options.audio == .mono)
+        // For mono, phase 1 writes video-only to a temp file; for keep/mute the
+        // export already produces the final file.
+        let phase1URL = needsMono
+            ? URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("krit-trim-v-\(UUID().uuidString).mp4")
+            : outURL
+
+        let budget = qualityByteBudget(
+            target: target, fps: fps, quality: options.quality,
+            durationSec: CMTimeGetSeconds(range.duration), includeAudio: options.audio == .keep
+        )
+        guard await runVideoExport(comp, videoComposition: videoComposition, budget: budget, to: phase1URL) else {
+            return false
+        }
+        if !needsMono { return true }
+
+        // Phase 2 + 3: downmix the source audio to a real 1-channel track and mux
+        // it onto the rescaled video.
+        return await muxMonoAudio(source: url, range: range, videoOnly: phase1URL, to: outURL)
+    }
+
+    /// Composition for the trim: video over `range`, plus the original audio when
+    /// `keepAudio`. Returns the composition and its video track so the caller can
+    /// hang a scaling video composition on it.
+    private static func buildTrimComposition(
+        asset: AVURLAsset, videoTrack: AVAssetTrack, range: CMTimeRange, keepAudio: Bool
+    ) async -> (AVMutableComposition, AVCompositionTrack)? {
+        let comp = AVMutableComposition()
+        guard let compVideo = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
+              (try? compVideo.insertTimeRange(range, of: videoTrack, at: .zero)) != nil else {
+            return nil
+        }
+        if keepAudio,
+           let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
+           let compAudio = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
+            try? compAudio.insertTimeRange(range, of: audioTrack, at: .zero)
+        }
+        return (comp, compVideo)
+    }
+
+    /// Orient (preferred transform, identity for screen recordings) then scale the
+    /// source into the `target` render box.
+    private static func renderTransform(for track: AVAssetTrack, target: CGSize) async -> CGAffineTransform {
+        let naturalSize = (try? await track.load(.naturalSize)) ?? target
+        let preferredTransform = (try? await track.load(.preferredTransform)) ?? .identity
+        let display = naturalSize.applying(preferredTransform)
+        let displayWidth = abs(display.width) > 0 ? abs(display.width) : max(naturalSize.width, 1)
+        let displayHeight = abs(display.height) > 0 ? abs(display.height) : max(naturalSize.height, 1)
+        let scale = CGAffineTransform(scaleX: target.width / displayWidth, y: target.height / displayHeight)
+        return preferredTransform.concatenating(scale)
+    }
+
+    /// Runs the phase-1 export session that rescales and re-encodes the video.
+    private static func runVideoExport(
+        _ comp: AVMutableComposition, videoComposition: AVMutableVideoComposition, budget: Int64, to outURL: URL
+    ) async -> Bool {
+        guard let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHighestQuality) else {
+            return false
+        }
+        try? FileManager.default.removeItem(at: outURL)
+        export.outputURL = outURL
+        export.outputFileType = .mp4
+        export.videoComposition = videoComposition
+        export.fileLengthLimit = budget
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            export.exportAsynchronously { continuation.resume() }
+        }
+        if export.status != .completed, let error = export.error { print("[KRIT] Trim+convert video failed: \(error)") }
+        return export.status == .completed
+    }
+
+    /// Phases 2 + 3 of the mono path: downmix the source audio over `range` to a
+    /// real 1-channel track, then mux it onto the rescaled `videoOnly` file. If the
+    /// source has no audio, the rescaled video alone becomes the result.
+    private static func muxMonoAudio(source url: URL, range: CMTimeRange, videoOnly phase1URL: URL, to outURL: URL) async -> Bool {
+        let audioURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("krit-trim-a-\(UUID().uuidString).m4a")
+        defer {
+            try? FileManager.default.removeItem(at: phase1URL)
+            try? FileManager.default.removeItem(at: audioURL)
+        }
+        guard await writeMonoAudio(from: url, range: range, to: audioURL) else {
             try? FileManager.default.removeItem(at: outURL)
-            export.outputURL = outURL
-            export.outputFileType = .mp4
-            export.timeRange = range
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                export.exportAsynchronously { continuation.resume() }
-            }
-            if export.status == .completed {
-                ToastWindow.show(message: "Saved trimmed: \(outURL.lastPathComponent)", duration: 3.0)
-            } else {
-                ToastWindow.show(message: "Could not trim recording.")
-                if let error = export.error { print("[KRIT] Trim failed: \(error)") }
+            try? FileManager.default.moveItem(at: phase1URL, to: outURL)
+            return FileManager.default.fileExists(atPath: outURL.path)
+        }
+        return await mux(videoURL: phase1URL, audioURL: audioURL, to: outURL)
+    }
+
+    /// Rounds down to an even value with a 2px floor (H.264 dislikes odd sizes).
+    private static func evenClamp(_ value: Int) -> Int { max(2, value - (value % 2)) }
+
+    /// Byte budget fed to `AVAssetExportSession.fileLengthLimit`. Mirrors the
+    /// panel's bits-per-pixel-per-frame estimate so a low quality slider yields a
+    /// visibly smaller file. The 64 KB floor avoids a budget so tight the export
+    /// would fail outright on tiny clips.
+    private static func qualityByteBudget(target: CGSize, fps: Int, quality: Double, durationSec: Double, includeAudio: Bool) -> Int64 {
+        let bitsPerPixelPerFrame = 0.06 + max(0, min(1, quality)) * 0.20
+        let pixels = Double(Int(target.width) * Int(target.height))
+        let videoBitsPerSecond = pixels * Double(fps) * bitsPerPixelPerFrame
+        let audioBitsPerSecond: Double = includeAudio ? 192_000 : 0
+        let bytes = (videoBitsPerSecond + audioBitsPerSecond) * max(durationSec, 0.05) / 8.0
+        return Int64(max(bytes, 64_000))
+    }
+
+    /// Builds the video composition that rescales the composition's video track to
+    /// `target` by applying `transform` (orient + scale) at a `renderSize` of
+    /// `target`.
+    private static func scalingVideoComposition(
+        track: AVCompositionTrack,
+        transform: CGAffineTransform,
+        target: CGSize,
+        fps: Int,
+        duration: CMTime
+    ) -> AVMutableVideoComposition {
+        let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+        layer.setTransform(transform, at: .zero)
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+        instruction.layerInstructions = [layer]
+
+        let videoComposition = AVMutableVideoComposition()
+        videoComposition.renderSize = target
+        videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
+        videoComposition.instructions = [instruction]
+        return videoComposition
+    }
+
+    /// Reads the source audio over `range` and writes a genuine single-channel AAC
+    /// track. The mono channel layout makes the reader DOWNMIX (sum both channels)
+    /// rather than drop one. Returns false when the source has no audio.
+    private static func writeMonoAudio(from url: URL, range: CMTimeRange, to outURL: URL) async -> Bool {
+        let asset = AVURLAsset(url: url)
+        guard let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
+              let reader = try? AVAssetReader(asset: asset),
+              let writer = try? AVAssetWriter(outputURL: outURL, fileType: .m4a) else {
+            return false
+        }
+        reader.timeRange = range
+
+        var monoLayout = AudioChannelLayout()
+        monoLayout.mChannelLayoutTag = kAudioChannelLayoutTag_Mono
+        let layoutData = Data(bytes: &monoLayout, count: MemoryLayout<AudioChannelLayout>.size)
+
+        let readerOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: false,
+            AVSampleRateKey: 48_000,
+            AVNumberOfChannelsKey: 1,
+            AVChannelLayoutKey: layoutData
+        ])
+        guard reader.canAdd(readerOutput) else { return false }
+        reader.add(readerOutput)
+
+        let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVNumberOfChannelsKey: 1,
+            AVChannelLayoutKey: layoutData,
+            AVSampleRateKey: 48_000,
+            AVEncoderBitRateKey: 96_000
+        ])
+        writerInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(writerInput) else { return false }
+        writer.add(writerInput)
+
+        try? FileManager.default.removeItem(at: outURL)
+        guard reader.startReading(), writer.startWriting() else { return false }
+        writer.startSession(atSourceTime: .zero)
+
+        let queue = DispatchQueue(label: "com.krit.trim.audio")
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            writerInput.requestMediaDataWhenReady(on: queue) {
+                while writerInput.isReadyForMoreMediaData {
+                    guard let sample = readerOutput.copyNextSampleBuffer() else {
+                        writerInput.markAsFinished()
+                        continuation.resume()
+                        return
+                    }
+                    // Shift samples so the clip starts at zero, matching the
+                    // already-trimmed video the audio will be muxed onto.
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                    let shifted = Self.audioCopy(sampleBuffer: sample, shiftedTo: CMTimeSubtract(pts, range.start)) ?? sample
+                    writerInput.append(shifted)
+                }
             }
         }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            writer.finishWriting { continuation.resume() }
+        }
+        return writer.status == .completed && reader.status == .completed
+    }
+
+    /// Muxes a video-only file and an audio-only file into one mp4 without
+    /// re-encoding either track (passthrough).
+    private static func mux(videoURL: URL, audioURL: URL, to outURL: URL) async -> Bool {
+        let comp = AVMutableComposition()
+        let videoAsset = AVURLAsset(url: videoURL)
+        let audioAsset = AVURLAsset(url: audioURL)
+        guard let videoTrack = try? await videoAsset.loadTracks(withMediaType: .video).first,
+              let audioTrack = try? await audioAsset.loadTracks(withMediaType: .audio).first,
+              let videoDuration = try? await videoAsset.load(.duration),
+              let audioDuration = try? await audioAsset.load(.duration),
+              let compVideo = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
+              let compAudio = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            return false
+        }
+        try? compVideo.insertTimeRange(CMTimeRange(start: .zero, duration: videoDuration), of: videoTrack, at: .zero)
+        // Clamp audio to the video length so a slightly longer audio tail does not
+        // stretch the clip.
+        let audioRange = CMTimeRange(start: .zero, duration: min(audioDuration, videoDuration))
+        try? compAudio.insertTimeRange(audioRange, of: audioTrack, at: .zero)
+
+        guard let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough) else { return false }
+        try? FileManager.default.removeItem(at: outURL)
+        export.outputURL = outURL
+        export.outputFileType = .mp4
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            export.exportAsynchronously { continuation.resume() }
+        }
+        if export.status != .completed, let error = export.error { print("[KRIT] Trim+convert mux failed: \(error)") }
+        return export.status == .completed
     }
 
     func exportAutoZoom(from url: URL) {

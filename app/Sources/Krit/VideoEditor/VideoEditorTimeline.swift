@@ -302,8 +302,8 @@ private struct ZoomBlockVisual: View {
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius: 6)
                 .fill(fill)
-                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(isSelected ? Color.white : .clear, lineWidth: 2))
-                .shadow(color: isSelected ? Color.accentColor.opacity(0.4) : .clear, radius: 4, y: 2)
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(isSelected ? Color.kritAccent : .clear, lineWidth: 2))
+                .shadow(color: isSelected ? Color.kritAccent.opacity(0.4) : .clear, radius: 4, y: 2)
 
             HStack(spacing: 4) {
                 Image(systemName: segment.isAutoMode ? "cursorarrow.click" : "plus.magnifyingglass")
@@ -345,7 +345,7 @@ private struct ZoomBlockVisual: View {
 
     private var fill: Color {
         if !segment.isEnabled { return Color.gray.opacity(0.5) }
-        return isDragging ? Color.accentColor.opacity(0.85) : Color.accentColor
+        return isDragging ? Color.kritAccent.opacity(0.85) : Color.kritAccent
     }
 }
 
@@ -357,17 +357,17 @@ private struct ZoomPlaceholder: View {
 
     var body: some View {
         RoundedRectangle(cornerRadius: 6)
-            .fill(Color.accentColor.opacity(0.2))
+            .fill(Color.kritAccent.opacity(0.2))
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
-                    .strokeBorder(Color.accentColor.opacity(0.5), style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+                    .strokeBorder(Color.kritAccent.opacity(0.5), style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
             )
             .overlay(
                 HStack(spacing: 4) {
                     Image(systemName: "plus.magnifyingglass").font(.system(size: 10, weight: .medium))
                     Text("Click to add").font(.system(size: 9, weight: .medium))
                 }
-                .foregroundColor(Color.accentColor.opacity(0.85))
+                .foregroundColor(Color.kritAccent.opacity(0.85))
             )
             .frame(width: width, height: 28)
             .offset(x: x)

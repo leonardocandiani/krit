@@ -146,9 +146,7 @@ final class AnnotationWindowController: NSWindowController {
         if let win = controller.window {
             win.alphaValue = 0
             controller.bringEditorToFront()
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.2
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            Motion.animate(0.2, timing: .easeOut) { _ in
                 win.animator().alphaValue = 1
             }
         }
@@ -1893,8 +1891,7 @@ final class AnnotationToolbar: NSView {
     /// control in both bands, keeping only Save as/Done, so the header reads
     /// as plain chrome while the user inspects the final result.
     func setPreviewMode(_ on: Bool) {
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
+        Motion.animate(0.15) { context in
             context.allowsImplicitAnimation = true
             canvasGroup?.animator().isHidden = on
             headerDivider?.animator().isHidden = on
@@ -1906,8 +1903,7 @@ final class AnnotationToolbar: NSView {
     /// Contextual action slot: while a crop region is staged, Save as/Done fade
     /// out and Cancel/Apply fade in (NSStackView collapses the hidden pair).
     func setCropApplyVisible(_ visible: Bool) {
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
+        Motion.animate(0.15) { context in
             context.allowsImplicitAnimation = true
             saveAsButton?.animator().isHidden = visible
             doneButton?.animator().isHidden = visible

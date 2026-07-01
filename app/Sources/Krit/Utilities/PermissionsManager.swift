@@ -1,5 +1,15 @@
 import AppKit
+import AVFoundation
 import ScreenCaptureKit
+
+/// Live state of a single privacy permission. `notDetermined` only applies to the
+/// permissions macOS can prompt for on demand (camera, microphone); Screen
+/// Recording and Accessibility resolve to a simple granted/denied.
+enum PermissionStatus {
+    case granted
+    case denied
+    case notDetermined
+}
 
 enum PermissionsManager {
 
@@ -30,6 +40,59 @@ enum PermissionsManager {
     static func openScreenRecordingSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    // MARK: - Screen Recording (status form for the Permissions tab)
+
+    /// Screen Recording has no `notDetermined`: the CG preflight is a plain yes/no.
+    static var screenRecordingStatus: PermissionStatus {
+        hasScreenRecordingPermission ? .granted : .denied
+    }
+
+    // MARK: - Accessibility
+
+    /// True once the user has trusted KRIT for Accessibility (needed for global
+    /// gesture/event injection). Like Screen Recording, this is a plain yes/no.
+    static var accessibilityStatus: PermissionStatus {
+        AXIsProcessTrusted() ? .granted : .denied
+    }
+
+    @MainActor
+    static func openAccessibilitySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    // MARK: - Camera
+
+    static var cameraStatus: PermissionStatus {
+        status(for: AVCaptureDevice.authorizationStatus(for: .video))
+    }
+
+    @MainActor
+    static func openCameraSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    // MARK: - Microphone
+
+    static var microphoneStatus: PermissionStatus {
+        status(for: AVCaptureDevice.authorizationStatus(for: .audio))
+    }
+
+    @MainActor
+    static func openMicrophoneSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private static func status(for auth: AVAuthorizationStatus) -> PermissionStatus {
+        switch auth {
+        case .authorized:    return .granted
+        case .notDetermined: return .notDetermined
+        default:             return .denied   // .denied, .restricted
+        }
     }
 
     /// Show an alert directing the user to System Settings if permission was denied.

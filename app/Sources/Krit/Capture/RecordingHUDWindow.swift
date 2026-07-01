@@ -86,6 +86,7 @@ final class RecordingHUDWindow: NSWindow {
         stopButton.target = self
         stopButton.action = #selector(stopTapped)
         stopButton.toolTip = "Stop recording"
+        stopButton.setAccessibilityLabel("Stop recording")
         stopButton.frame = NSRect(x: 8, y: 7, width: 30, height: 30)
         root.addSubview(stopButton)
 
@@ -123,6 +124,7 @@ final class RecordingHUDWindow: NSWindow {
         restartButton.target = self
         restartButton.action = #selector(restartTapped)
         restartButton.toolTip = "Restart recording"
+        restartButton.setAccessibilityLabel("Restart recording")
         restartButton.isEnabled = false
         restartButton.frame = NSRect(x: 140, y: 7, width: 30, height: 30)
         root.addSubview(restartButton)
@@ -130,6 +132,7 @@ final class RecordingHUDWindow: NSWindow {
         trashButton.target = self
         trashButton.action = #selector(discardTapped)
         trashButton.toolTip = "Discard recording"
+        trashButton.setAccessibilityLabel("Discard recording")
         trashButton.isEnabled = false
         trashButton.frame = NSRect(x: 176, y: 7, width: 30, height: 30)
         root.addSubview(trashButton)
@@ -289,6 +292,7 @@ private final class RecordingHUDPauseButton: NSButton {
         let name = paused ? "play.fill" : "pause.fill"
         image = NSImage(systemSymbolName: name, accessibilityDescription: paused ? "Resume" : "Pause")?
             .withSymbolConfiguration(pauseConfig)
+        setAccessibilityLabel(paused ? "Resume recording" : "Pause recording")
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -383,6 +387,9 @@ private final class RecordingHUDLevelMeter: NSView {
             bar.layer?.cornerCurve = .continuous
             addSubview(bar)
         }
+        setAccessibilityElement(true)
+        setAccessibilityRole(.levelIndicator)
+        setAccessibilityLabel("Microphone input level")
         setLevel(0)
     }
 

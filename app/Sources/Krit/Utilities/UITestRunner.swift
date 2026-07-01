@@ -63,6 +63,7 @@ final class UITestRunner: NSObject {
             case "sound":        report = Self.runSoundProbe()
             case "onboarding":   report = await Self.runOnboardingSuite()
             case "preferences":  report = await Self.runPreferencesSuite()
+            case "permissions-tab": report = await Self.runPermissionsTab()
             case "overlay-show": report = await Self.runOverlayShowSuite()
             case "blur-map":     report = await Self.runBlurMapSuite()
             case "overlay-trace": report = await Self.runOverlayCaptureTrace()
@@ -79,6 +80,8 @@ final class UITestRunner: NSObject {
             case "record-smoke-audio": report = await Self.runRecordSmoke(systemAudio: true)
             case "record-smoke-mic": report = await Self.runRecordSmoke(microphone: true)
             case "smart-redact":  report = await Self.runSmartRedactSuite()
+            case "redact-adversarial": report = await Self.runRedactAdversarial()
+            case "redact-sharpness": report = await Self.runRedactSharpness()
             case "glass-renders": report = await Self.runGlassRenders()
             case "default-template": report = await Self.runDefaultTemplateSuite()
             case "editor-fit-large": report = await Self.runEditorFitLargeSuite()
@@ -113,6 +116,7 @@ final class UITestRunner: NSObject {
             case "autozoom-export": report = await Self.runAutoZoomExport()
             case "video-preview": report = await Self.runVideoPreview()
             case "video-editor": report = await Self.runVideoEditor()
+            case "trim-convert": report = await Self.runTrimConvert()
             case "whats-new": report = await Self.runWhatsNew()
             case "about": report = await Self.runAbout()
             case "prefs-icons": report = await Self.runPrefsIcons()
@@ -527,6 +531,235 @@ final class UITestRunner: NSObject {
         r["sharedCleared"] = VideoEditorWindowController.uiTestShared == nil
         r["allPass"] = state.duration > 0.1 && state.zoomSegments.count == 1 && outExists && outWidth > 320 && tornDown
         return r
+    }
+
+    // MARK: - Cenário: trim-convert (Trim & Convert aplica dimensão + audio mono)
+
+    /// Proves the "Trim & Convert" engine path actually converts: it builds a
+    /// 320x240 source carrying a real STEREO audio track, runs the engine's
+    /// `exportTrimConvert` with 160x120 / low quality / mono over a sub-range, then
+    /// loads the OUTPUT and asserts the video track is ~160x120 (a real rescale)
+    /// and the audio is a genuine single channel (the mono downmix). Mono is
+    /// validated because the source is verified stereo first.
+    private static func runTrimConvert() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "trim-convert"]
+        let dir = NSTemporaryDirectory()
+        let srcURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-src.mov")
+        let outURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-out.mp4")
+
+        let made = await makeSyntheticStereoSource(to: srcURL, size: CGSize(width: 320, height: 240), frames: 60, fps: 30)
+        r["sourceMade"] = made
+        guard made else { r["allPass"] = false; return r }
+
+        let (inW, inH) = await videoPixelSize(of: srcURL)
+        let inCh = await audioChannelCount(of: srcURL)
+        r["inputWidth"] = inW
+        r["inputHeight"] = inH
+        r["inputChannels"] = inCh ?? -1
+
+        // Sub-range (drop head + tail), low quality, mono downmix.
+        let quality = 0.1
+        r["quality"] = quality
+        let subRange = CMTimeRange(
+            start: CMTime(seconds: 0.4, preferredTimescale: 600),
+            end: CMTime(seconds: 1.4, preferredTimescale: 600)
+        )
+        let opts = VideoTrimPanel.ConvertOptions(width: 160, height: 120, quality: quality, audio: .mono)
+        let exportOK = await RecordingEngine.exportTrimConvert(source: srcURL, range: subRange, options: opts, to: outURL)
+        r["exportOK"] = exportOK
+        let outExists = FileManager.default.fileExists(atPath: outURL.path)
+        r["outExists"] = outExists
+
+        let (outW, outH) = await videoPixelSize(of: outURL)
+        let outCh = await audioChannelCount(of: outURL)
+        r["outputWidth"] = outW
+        r["outputHeight"] = outH
+        r["outputChannels"] = outCh ?? -1
+
+        let dimsPass = abs(outW - 160) <= 2 && abs(outH - 120) <= 2
+        let inputStereo = (inCh == 2)
+        let monoPass = (outCh == 1)
+        r["dimsPass"] = dimsPass
+        r["monoValidated"] = inputStereo   // mono check only trusted if the source was real stereo
+        r["monoPass"] = monoPass
+        let checks = [exportOK, outExists, dimsPass, inputStereo, monoPass]
+
+        // Prove the other two audio modes through the same pipeline: keep
+        // preserves the stereo track, mute drops audio entirely.
+        let keepURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-keep.mp4")
+        let keepOpts = VideoTrimPanel.ConvertOptions(width: 160, height: 120, quality: quality, audio: .keep)
+        let keepOK = await RecordingEngine.exportTrimConvert(source: srcURL, range: subRange, options: keepOpts, to: keepURL)
+        let keepCh = await audioChannelCount(of: keepURL)
+        r["keepChannels"] = keepCh ?? -1
+        let keepPass = keepOK && keepCh == 2
+
+        let muteURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-mute.mp4")
+        let muteOpts = VideoTrimPanel.ConvertOptions(width: 160, height: 120, quality: quality, audio: .mute)
+        let muteOK = await RecordingEngine.exportTrimConvert(source: srcURL, range: subRange, options: muteOpts, to: muteURL)
+        let muteCh = await audioChannelCount(of: muteURL)
+        r["muteChannels"] = muteCh ?? -1   // -1 means no audio track, the expected mute result
+        let mutePass = muteOK && muteCh == nil
+
+        r["keepPass"] = keepPass
+        r["mutePass"] = mutePass
+        r["allPass"] = (checks + [keepPass, mutePass]).allSatisfy { $0 }
+
+        try? FileManager.default.removeItem(at: srcURL)
+        try? FileManager.default.removeItem(at: outURL)
+        try? FileManager.default.removeItem(at: keepURL)
+        try? FileManager.default.removeItem(at: muteURL)
+        return r
+    }
+
+    /// Displayed pixel size of the first video track (preferred transform applied).
+    private static func videoPixelSize(of url: URL) async -> (Int, Int) {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let size = try? await track.load(.naturalSize),
+              let transform = try? await track.load(.preferredTransform) else { return (0, 0) }
+        let display = size.applying(transform)
+        return (Int(abs(display.width).rounded()), Int(abs(display.height).rounded()))
+    }
+
+    /// Channel count of the first audio track, read from its stream description.
+    private static func audioChannelCount(of url: URL) async -> Int? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .audio).first,
+              let formats = try? await track.load(.formatDescriptions),
+              let fmt = formats.first,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) else { return nil }
+        return Int(asbd.pointee.mChannelsPerFrame)
+    }
+
+    /// Builds a source mov with a synthetic video track (the same black/white
+    /// pattern as `makeSyntheticZoomSource`) AND a real 2-channel audio track, so a
+    /// mono downmix can be proven headless.
+    private static func makeSyntheticStereoSource(to url: URL, size: CGSize, frames: Int, fps: Int) async -> Bool {
+        try? FileManager.default.removeItem(at: url)
+        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return false }
+
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(size.width),
+            AVVideoHeightKey: Int(size.height),
+        ])
+        videoInput.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                kCVPixelBufferWidthKey as String: Int(size.width),
+                kCVPixelBufferHeightKey as String: Int(size.height),
+            ]
+        )
+
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVNumberOfChannelsKey: 2,
+            AVSampleRateKey: 48_000,
+            AVEncoderBitRateKey: 128_000,
+        ])
+        audioInput.expectsMediaDataInRealTime = false
+
+        guard writer.canAdd(videoInput), writer.canAdd(audioInput) else { return false }
+        writer.add(videoInput)
+        writer.add(audioInput)
+        guard writer.startWriting() else { return false }
+        writer.startSession(atSourceTime: .zero)
+
+        guard writeSyntheticVideoFrames(adaptor: adaptor, input: videoInput, size: size, frames: frames, fps: fps) else { return false }
+        guard writeSyntheticStereoAudio(input: audioInput, durationSec: Double(frames) / Double(fps)) else { return false }
+
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            writer.finishWriting { c.resume() }
+        }
+        return writer.status == .completed
+    }
+
+    /// Draws the black frame with a white bottom-left quadrant into each frame.
+    private static func writeSyntheticVideoFrames(adaptor: AVAssetWriterInputPixelBufferAdaptor, input: AVAssetWriterInput, size: CGSize, frames: Int, fps: Int) -> Bool {
+        let w = Int(size.width), h = Int(size.height)
+        for i in 0..<frames {
+            while !input.isReadyForMoreMediaData { usleep(2000) }
+            guard let pool = adaptor.pixelBufferPool else { return false }
+            var pb: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
+            guard let buffer = pb else { return false }
+            CVPixelBufferLockBaseAddress(buffer, [])
+            if let base = CVPixelBufferGetBaseAddress(buffer) {
+                let bpr = CVPixelBufferGetBytesPerRow(buffer)
+                let cs = CGColorSpaceCreateDeviceRGB()
+                if let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8,
+                                       bytesPerRow: bpr, space: cs,
+                                       bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) {
+                    ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+                    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+                    ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+                    ctx.fill(CGRect(x: 0, y: h / 2, width: w / 2, height: h / 2))
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))
+        }
+        input.markAsFinished()
+        return true
+    }
+
+    /// Feeds the audio input a 440 Hz tone, the same value in both channels, as
+    /// interleaved float32 LPCM (the encoder turns it into 2-channel AAC).
+    private static func writeSyntheticStereoAudio(input: AVAssetWriterInput, durationSec: Double) -> Bool {
+        let sampleRate = 48_000.0
+        let channels = 2
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(4 * channels),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(4 * channels),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        var format: CMAudioFormatDescription?
+        guard CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &asbd, layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format) == noErr,
+              let fmt = format else { return false }
+
+        let totalFrames = Int(durationSec * sampleRate)
+        let chunk = 4_800
+        var frameOffset = 0
+        while frameOffset < totalFrames {
+            let count = min(chunk, totalFrames - frameOffset)
+            guard let sample = makeStereoSampleBuffer(format: fmt, sampleRate: sampleRate, channels: channels, frameOffset: frameOffset, frameCount: count) else { return false }
+            while !input.isReadyForMoreMediaData { usleep(2000) }
+            guard input.append(sample) else { return false }
+            frameOffset += count
+        }
+        input.markAsFinished()
+        return true
+    }
+
+    /// One LPCM CMSampleBuffer of `frameCount` stereo frames starting at `frameOffset`.
+    private static func makeStereoSampleBuffer(format: CMAudioFormatDescription, sampleRate: Double, channels: Int, frameOffset: Int, frameCount: Int) -> CMSampleBuffer? {
+        let byteCount = frameCount * channels * 4
+        var samples = [Float](repeating: 0, count: frameCount * channels)
+        for i in 0..<frameCount {
+            let t = Double(frameOffset + i) / sampleRate
+            let value = Float(0.2 * sin(2.0 * Double.pi * 440.0 * t))
+            samples[i * channels] = value
+            samples[i * channels + 1] = value
+        }
+        var blockBuffer: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: byteCount, blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: byteCount, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &blockBuffer) == kCMBlockBufferNoErr,
+              let block = blockBuffer else { return nil }
+        let copyStatus = samples.withUnsafeBytes { raw in
+            CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: byteCount)
+        }
+        guard copyStatus == kCMBlockBufferNoErr else { return nil }
+        var sampleBuffer: CMSampleBuffer?
+        let pts = CMTime(value: CMTimeValue(frameOffset), timescale: CMTimeScale(sampleRate))
+        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format, sampleCount: frameCount, presentationTimeStamp: pts, packetDescriptions: nil, sampleBufferOut: &sampleBuffer) == noErr else { return nil }
+        return sampleBuffer
     }
 
     // MARK: - Cenário: video-preview (Space toca o vídeo, não a thumb)
@@ -1658,6 +1891,234 @@ final class UITestRunner: NSObject {
             && boxesOK
             && (r["noFalsePositivesPass"] as? Bool ?? false)
         return r
+    }
+
+    // MARK: - Cenário: redact-adversarial (a Secure Blur derrota a própria OCR do app)
+
+    /// Adversarial proof that Secure Blur redaction is irreversible. It draws a
+    /// known secret into an image, runs the app's OWN Vision OCR
+    /// (`OCREngine.recognizeText`) as a CONTROL to prove the text was legible,
+    /// then flattens a `BlurAnnotation(secure: true)` (exactly what
+    /// `applySmartRedact` and the manual toggle create) over the secret through the
+    /// REAL export path (`AnnotationCanvas.flatten()`, the same call Save/Share use)
+    /// and runs OCR AGAIN on the exported pixels. The redaction passes only if OCR
+    /// recovered the secret before and recovers no 4+ char fragment of it after. If
+    /// Secure Blur were reversible, OCR would read the secret back and this would
+    /// correctly FAIL; the assertion is never weakened to force a pass.
+    private static func runRedactAdversarial() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let secret = "KRITSECRET42XQ"
+        r["secret"] = secret
+
+        // Control image: the secret in a large bold font, black on white, centred,
+        // backed by a 2x bitmap rep so `bestCGImage` carries real retina-class
+        // pixels (the same backing the OCR scenario proved Vision reads cleanly).
+        let logical = NSSize(width: 760, height: 200)
+        let scale = 2
+        let pxW = Int(logical.width) * scale
+        let pxH = Int(logical.height) * scale
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: pxW, pixelsHigh: pxH,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: pxW * 4, bitsPerPixel: 32
+        ), let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            r["error"] = "could not build bitmap rep"; r["allPass"] = false; return r
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: pxW, height: pxH).fill()
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: 56 * CGFloat(scale)),
+            .foregroundColor: NSColor.black,
+        ]
+        let textSize = (secret as NSString).size(withAttributes: attrs)
+        let textOrigin = NSPoint(x: (CGFloat(pxW) - textSize.width) / 2,
+                                 y: (CGFloat(pxH) - textSize.height) / 2)
+        (secret as NSString).draw(at: textOrigin, withAttributes: attrs)
+        NSGraphicsContext.restoreGraphicsState()
+        rep.size = logical
+        let img = NSImage(size: logical)
+        img.addRepresentation(rep)
+
+        let dir = "/tmp/krit-redact"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        if let png = rep.representation(using: .png, properties: [:]) {
+            let p = "\(dir)/control.png"; try? png.write(to: URL(fileURLWithPath: p)); r["controlImage"] = p
+        }
+
+        // CONTROL: the app's OCR must recover the secret from the clean image,
+        // otherwise the setup is broken and the redaction proof is meaningless.
+        let ocrControl = await OCREngine.recognizeText(in: img)
+        r["ocrControl"] = String(ocrControl.prefix(200))
+        let controlRun = Self.longestSharedRun(of: secret, in: ocrControl)
+        r["controlRun"] = controlRun
+        let controlReadable = controlRun >= 8   // a strong substring, robust to a stray glyph slip
+        r["controlReadable"] = controlReadable
+
+        // Apply Secure Blur exactly as production does: a BlurAnnotation with
+        // secure == true, flattened through the canvas export path. Background
+        // disabled so the slot is the whole screenshot and the mosaic samples the
+        // secret directly (the redaction band then covers the full canvas).
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController else {
+            r["error"] = "editor window did not open"; r["allPass"] = false; return r
+        }
+        defer { ctrl.window?.close() }
+        let canvas = ctrl.uiTestCanvas
+
+        var bg = ScreenshotBackgroundOptions.editorDefault
+        bg.isEnabled = false   // slot == full canvas == the whole screenshot
+        canvas.backgroundOptions = bg
+        canvas.backgroundImage = img
+        canvas.frame = NSRect(origin: .zero, size: logical)
+
+        // Same object production builds: default radius, secure == true (the
+        // secureBlur render ignores radius and mosaics from the image pixels). The
+        // region is the whole screenshot, which fully contains the secret.
+        let fx = BlurAnnotation(rect: NSRect(origin: .zero, size: logical))
+        fx.secure = true
+        canvas.objects = [fx]
+        canvas.needsDisplay = true
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        let redacted = canvas.flatten()
+        if let cg = redacted.bestCGImage,
+           let data = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
+            let p = "\(dir)/redacted.png"; try? data.write(to: URL(fileURLWithPath: p)); r["redactedImage"] = p
+        }
+
+        // ADVERSARIAL: OCR the exported, redacted pixels. Nothing of the secret may
+        // survive, not the whole string, not any 4+ char fragment of it.
+        let ocrRedacted = await OCREngine.recognizeText(in: redacted)
+        r["ocrRedacted"] = String(ocrRedacted.prefix(200))
+        let redactedRun = Self.longestSharedRun(of: secret, in: ocrRedacted)
+        r["redactedRun"] = redactedRun
+        let secretDestroyed = redactedRun < 4
+        r["secretDestroyed"] = secretDestroyed
+
+        r["allPass"] = controlReadable && secretDestroyed
+        return r
+    }
+
+    // MARK: - Cenário: redact-sharpness (export do redact na resolução nativa)
+
+    /// Prova que o efeito exporta na resolução da captura, não na escala da tela.
+    /// A fonte é sintetizada a 3x (nenhuma tela Mac é 3x), então se o render ainda
+    /// dependesse da escala do display (o bug), o bitmap cacheado sairia a 1x/2x e a
+    /// razão pixels/pontos NÃO bateria 3. Bater 3 exato, mais o export sair em
+    /// pixels nativos, prova que a faixa de redação nunca é ampliada suave.
+    private static func runRedactSharpness() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "redact-sharpness"]
+
+        // 3x synthetic capture. logical points 400x200, native pixels 1200x600.
+        let logical = NSSize(width: 400, height: 200)
+        let srcScale = 3
+        let pxW = Int(logical.width) * srcScale
+        let pxH = Int(logical.height) * srcScale
+        guard let srcRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: pxW, pixelsHigh: pxH,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: pxW * 4, bitsPerPixel: 32
+        ), let sctx = NSGraphicsContext(bitmapImageRep: srcRep) else {
+            r["error"] = "could not build source rep"; r["allPass"] = false; return r
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = sctx
+        NSColor.white.setFill(); NSRect(x: 0, y: 0, width: pxW, height: pxH).fill()
+        for x in stride(from: 0, to: pxW, by: 12) {
+            NSColor.black.setFill()
+            NSRect(x: CGFloat(x), y: 0, width: 6, height: CGFloat(pxH)).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        srcRep.size = logical
+        let img = NSImage(size: logical)
+        img.addRepresentation(srcRep)
+
+        AnnotationWindowController.open(image: img)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        guard let ctrl = AnnotationWindowController.uiTestLastController else {
+            r["error"] = "editor window did not open"; r["allPass"] = false; return r
+        }
+        defer { ctrl.window?.close() }
+        let canvas = ctrl.uiTestCanvas
+
+        var bg = ScreenshotBackgroundOptions.editorDefault
+        bg.isEnabled = false   // slot == full canvas == the whole screenshot
+        canvas.backgroundOptions = bg
+        canvas.backgroundImage = img
+        canvas.frame = NSRect(origin: .zero, size: logical)
+
+        let region = NSRect(x: 50, y: 40, width: 300, height: 120)
+        let fx = PixelateAnnotation(rect: region)
+        fx.scale = 10
+        canvas.objects = [fx]
+        canvas.needsDisplay = true
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        // flatten drives the same drawPixelate the export uses; it renders and
+        // caches the effect at the native scale under the fixed EffectCacheKey.
+        let export = canvas.flatten()
+
+        guard let cached = fx.cachedRender,
+              let crep = cached.representations.first as? NSBitmapImageRep else {
+            r["error"] = "no cached render"; r["allPass"] = false; return r
+        }
+        let expectedCW = Int(ceil(region.width * CGFloat(srcScale)))
+        let expectedCH = Int(ceil(region.height * CGFloat(srcScale)))
+        r["cachedPxW"] = crep.pixelsWide; r["cachedPxH"] = crep.pixelsHigh
+        r["expectedCachedW"] = expectedCW; r["expectedCachedH"] = expectedCH
+        // Machine-independent: no Mac display is 3x, so a cache still tied to screen
+        // scale could never land on region x 3. Landing there proves it decoupled.
+        let scaleDecoupled = crep.pixelsWide == expectedCW && crep.pixelsHigh == expectedCH
+        r["scaleDecoupled"] = scaleDecoupled
+
+        guard let ecg = export.bestCGImage else {
+            r["error"] = "no export image"; r["allPass"] = false; return r
+        }
+        r["exportPxW"] = ecg.width; r["exportPxH"] = ecg.height
+        let exportNative = ecg.width == pxW && ecg.height == pxH
+        r["exportNative"] = exportNative
+
+        // Corroboration (reported, not gated): a native-res mosaic of a striped
+        // source keeps hard block edges. Scan one row through the band and record
+        // the steepest adjacent-pixel luma jump; an upscaled-soft band smears these.
+        let erep = NSBitmapImageRep(cgImage: ecg)
+        let y = min(max(Int(region.midY) * srcScale, 0), ecg.height - 1)
+        var maxJump = 0.0; var prev = -1.0
+        for x in stride(from: Int(region.minX) * srcScale, to: Int(region.maxX) * srcScale, by: 1) {
+            guard let c = erep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+            let luma = (c.redComponent * 0.299 + c.greenComponent * 0.587 + c.blueComponent * 0.114) * 255
+            if prev >= 0 { maxJump = max(maxJump, abs(luma - prev)) }
+            prev = luma
+        }
+        r["maxBlockEdgeJump"] = Int(maxJump)
+
+        r["allPass"] = scaleDecoupled && exportNative
+        return r
+    }
+
+    /// Longest contiguous run of `needle` that appears as a substring of `haystack`,
+    /// compared case-insensitively and ignoring whitespace (so OCR line breaks or
+    /// spacing never mask a leaked fragment). Returns the character count of the
+    /// longest such run, 0 if none.
+    private static func longestSharedRun(of needle: String, in haystack: String) -> Int {
+        func normalize(_ s: String) -> String {
+            String(s.lowercased().unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) })
+        }
+        let n = Array(normalize(needle))
+        let hay = normalize(haystack)
+        guard !n.isEmpty, !hay.isEmpty else { return 0 }
+        var best = 0
+        for i in 0..<n.count {
+            var j = i + 1
+            while j <= n.count {
+                let sub = String(n[i..<j])
+                if hay.contains(sub) { best = max(best, sub.count); j += 1 } else { break }
+            }
+        }
+        return best
     }
 
     // MARK: - Cenário: record-smoke (gravação real de 2s, dim e card no overlay)
@@ -3585,6 +4046,38 @@ final class UITestRunner: NSObject {
         r["allPass"] = allRendered
             && (r["windowVisible"] as? Bool ?? false)
             && (expected == PreferencesTab.allCases.count)
+        return r
+    }
+
+    // MARK: - Cenário: permissions-tab (nova aba de permissões de privacidade)
+
+    /// Abre o Settings, seleciona a aba Permissions e fotografa a janela: prova que
+    /// a aba existe, que a seção monta (4 linhas de permissão com status pill) e
+    /// rende de fato. Snapshot em /tmp/krit-permissions-tab.png.
+    private static func runPermissionsTab() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "permissions-tab"]
+        let ctrl = PreferencesWindowController.shared
+        ctrl.uiTestForceShow()
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        guard let win = ctrl.uiTestWindow else {
+            r["windowFound"] = false
+            r["ok"] = false
+            return r
+        }
+        r["windowFound"] = true
+
+        let tabFound = PreferencesTab.allCases.contains(.permissions)
+        r["tabFound"] = tabFound
+
+        ctrl.uiTestSelect(.permissions)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+
+        let path = "/tmp/krit-permissions-tab.png"
+        let shotOK = Self.snapshotWindow(win, to: path)
+        r["snapshot"] = shotOK ? path : "FAILED"
+
+        ctrl.uiTestClose()
+        r["ok"] = tabFound && shotOK
         return r
     }
 
