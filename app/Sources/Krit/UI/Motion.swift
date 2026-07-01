@@ -49,6 +49,23 @@ enum Motion {
     }
 }
 
+extension NSView {
+    /// Crossfade a layer-backed view's background to `color` over a short ease,
+    /// instead of snapping. Used for button hover so the fill glides in. Honors
+    /// Reduce Motion (instant set) and no-ops cleanly when the view has no layer.
+    @MainActor
+    func crossfadeBackground(to color: NSColor, duration: TimeInterval = 0.12) {
+        guard let layer, !Motion.reduced else { self.layer?.backgroundColor = color.cgColor; return }
+        let anim = CABasicAnimation(keyPath: "backgroundColor")
+        anim.fromValue = layer.backgroundColor
+        anim.toValue = color.cgColor
+        anim.duration = duration
+        anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(anim, forKey: "hoverBackground")
+        layer.backgroundColor = color.cgColor
+    }
+}
+
 extension NSWindow {
     /// Spring-scale + fade entrance shared by the recording surfaces (preflight,
     /// controls, HUD), which each carried a byte-identical copy of this. Honors
