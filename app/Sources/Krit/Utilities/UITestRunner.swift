@@ -118,6 +118,7 @@ final class UITestRunner: NSObject {
             case "autozoom-export": report = await Self.runAutoZoomExport()
             case "video-preview": report = await Self.runVideoPreview()
             case "video-editor": report = await Self.runVideoEditor()
+            case "annotate-frame": report = await Self.runAnnotateFrame()
             case "trim-convert": report = await Self.runTrimConvert()
             case "whats-new": report = await Self.runWhatsNew()
             case "about": report = await Self.runAbout()
@@ -2176,6 +2177,50 @@ final class UITestRunner: NSObject {
         r["tallerForMultiline"] = tallerForMultiline
         r["widthNotInflated"] = widthNotInflated
         r["allPass"] = tallerForMultiline && widthNotInflated && singleLineSane
+        return r
+    }
+
+    // MARK: - Cenário: annotate-frame (o frame do vídeo cruza pro editor de print)
+
+    /// The recording flow was disconnected from the print editor. Prove the bridge:
+    /// open the video editor on a synthetic 320x240 clip, grab the frame under the
+    /// playhead, and assert the print annotation editor opens backed by that frame
+    /// at its native pixels, so arrows/blur/text now work on a recorded frame.
+    private static func runAnnotateFrame() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "annotate-frame"]
+        let srcURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("krit-af-src.mp4")
+        let made = await makeSyntheticZoomSource(to: srcURL, size: CGSize(width: 320, height: 240), frames: 60, fps: 30)
+        r["sourceMade"] = made
+        guard made else { r["allPass"] = false; return r }
+
+        VideoEditorWindowController.show(url: srcURL) { _, _ in }
+        guard let ctl = VideoEditorWindowController.uiTestShared else {
+            r["error"] = "video editor did not open"; r["allPass"] = false; return r
+        }
+        defer { ctl.window?.close() }
+        let state = ctl.uiTestState
+        for _ in 0..<40 { if state.duration > 0.1 { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
+        r["duration"] = state.duration
+
+        state.seek(to: 0.5)
+        state.annotateCurrentFrame()
+
+        var opened = false
+        for _ in 0..<40 {
+            if AnnotationWindowController.uiTestLastController != nil { opened = true; break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        r["annotationOpened"] = opened
+        guard opened, let annCtl = AnnotationWindowController.uiTestLastController else {
+            r["allPass"] = false; return r
+        }
+        defer { annCtl.window?.close() }
+        let px = annCtl.uiTestCanvas.backgroundImage?.bestCGImage
+        r["frameW"] = px?.width ?? 0
+        r["frameH"] = px?.height ?? 0
+        let frameCorrect = px?.width == 320 && px?.height == 240
+        r["frameCorrect"] = frameCorrect
+        r["allPass"] = opened && frameCorrect
         return r
     }
 
