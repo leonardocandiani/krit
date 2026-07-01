@@ -3264,12 +3264,12 @@ private final class OverlayCornerButton: NSButton {
 
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
-        layer?.backgroundColor = KritColors.pillButtonHover.cgColor
+        crossfadeBackground(to: KritColors.pillButtonHover)
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovered = false
-        layer?.backgroundColor = KritColors.pillButtonBackground.cgColor
+        crossfadeBackground(to: KritColors.pillButtonBackground)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -3332,12 +3332,12 @@ private final class OverlayPillButton: NSButton {
 
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
-        layer?.backgroundColor = KritColors.pillButtonHover.cgColor
+        crossfadeBackground(to: KritColors.pillButtonHover)
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovered = false
-        layer?.backgroundColor = KritColors.pillButtonBackground.cgColor
+        crossfadeBackground(to: KritColors.pillButtonBackground)
     }
 
     override func mouseDown(with event: NSEvent) {
