@@ -324,6 +324,18 @@ final class AnnotationWindowController: NSWindowController {
             self?.canvas.activeBlurSecure = secure
             self?.applyToSelectedBlurs { $0.secure = secure }
         }
+        toolbar.onRedactStrengthChanged = { [weak self] strength in
+            guard let self else { return }
+            // The active tool decides which redaction kind the slider drives; the
+            // canvas remembers it for new strokes, and any selected one updates now.
+            if self.canvas.activeTool == .pixelate {
+                self.canvas.activePixelateScale = strength
+                self.applyToSelectedPixelates { $0.scale = strength }
+            } else {
+                self.canvas.activeBlurRadius = strength
+                self.applyToSelectedBlurs { $0.radius = strength }
+            }
+        }
         toolbar.onStylePresetChanged = { [weak self] preset in
             guard let self else { return }
             // The preset becomes the default for new text and applies to any
@@ -918,6 +930,14 @@ final class AnnotationWindowController: NSWindowController {
         canvas.setNeedsDisplay(canvas.bounds)
     }
 
+    private func applyToSelectedPixelates(_ mutate: (PixelateAnnotation) -> Void) {
+        let pixelates = canvas.selectedObjects.compactMap { $0 as? PixelateAnnotation }
+        guard !pixelates.isEmpty else { return }
+        canvas.pushUndo()
+        pixelates.forEach(mutate)
+        canvas.setNeedsDisplay(canvas.bounds)
+    }
+
     private func applyBackgroundOptions(_ options: ScreenshotBackgroundOptions) {
         canvas.commitTextField()
 
@@ -1380,6 +1400,9 @@ final class AnnotationToolbar: NSView {
     /// Fired when the secure-blur toggle flips (blur tool only). On = new blurs
     /// are an irreversible mosaic instead of a recoverable gaussian.
     var onSecureBlurChanged: ((Bool) -> Void)?
+    /// Fired when the redaction Strength slider moves (blur/pixelate tools). The
+    /// value is the blur radius or the pixelate block size for the active tool.
+    var onRedactStrengthChanged: ((Double) -> Void)?
     /// Fired when a style preset is chosen in the text style popover (regular,
     /// bold, italic, bold+italic, backplate, outlined).
     var onStylePresetChanged: ((TextStylePreset) -> Void)?
@@ -1439,6 +1462,12 @@ final class AnnotationToolbar: NSView {
     private var contextWidthRow: NSView?
     private var contextFontRow: NSView?
     private var secureBlurButton: NSButton?
+    private var strengthLabel: NSTextField?
+    private var strengthSlider: NSSlider?
+    // Toolbar-held redaction strength per kind, so switching tools restores the
+    // last value the user set (mirrors how the secure toggle keeps its own state).
+    private var blurRadius: Double = 12
+    private var pixelateScale: Double = 10
     private var toolStripView: NSView?
     private var headerDivider: NSView?
     /// The leading canvas group (crop · background · redact). Held so buildUI can
@@ -1742,7 +1771,21 @@ final class AnnotationToolbar: NSView {
         secureBtn.isHidden = true
         secureBlurButton = secureBtn
 
-        let widthRow = NSStackView(views: [label, slider, secureBtn])
+        // Strength (blur radius / pixelate block size): swaps in for the Size
+        // slider on the blur/pixelate tools, which have no stroke width. Its range
+        // and value are set per-tool in selectTool; hidden until a redact tool.
+        let strengthCaption = NSTextField(labelWithString: "Strength")
+        strengthCaption.font = .systemFont(ofSize: 11)
+        strengthCaption.textColor = .secondaryLabelColor
+        strengthCaption.isHidden = true
+        strengthLabel = strengthCaption
+        let strength = NSSlider(value: blurRadius, minValue: 4, maxValue: 40, target: self, action: #selector(redactStrengthChanged))
+        strength.trackFillColor = KritColors.accent
+        strength.isHidden = true
+        strength.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        strengthSlider = strength
+
+        let widthRow = NSStackView(views: [label, slider, strengthCaption, strength, secureBtn])
         widthRow.orientation = .horizontal
         widthRow.alignment = .centerY
         widthRow.spacing = 8
@@ -1873,6 +1916,17 @@ final class AnnotationToolbar: NSView {
         // The secure toggle only makes sense for the blur tool; the width slider
         // is shared with the other drawing tools.
         secureBlurButton?.isHidden = (tool != .blur)
+        // Blur/pixelate have no stroke width: swap the shared Size slider for a
+        // Strength slider driving the redaction radius (blur) / block size
+        // (pixelate). The stack collapses whichever pair is hidden.
+        let isRedact = (tool == .blur || tool == .pixelate)
+        widthLabel?.isHidden = isRedact
+        widthSlider?.isHidden = isRedact
+        strengthLabel?.isHidden = !isRedact
+        strengthSlider?.isHidden = !isRedact
+        if isRedact {
+            strengthSlider?.doubleValue = (tool == .pixelate) ? pixelateScale : blurRadius
+        }
         // Properties band chip: name the tool the band is configuring.
         let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
         toolChipIcon?.image = NSImage(systemSymbolName: tool.icon, accessibilityDescription: nil)?
@@ -1968,6 +2022,12 @@ final class AnnotationToolbar: NSView {
         // thickness factor) so it can store the DE-SCALED base, which the toolbar
         // can't see from here.
         onLineWidthChanged?(CGFloat(sender.doubleValue))
+    }
+    @objc private func redactStrengthChanged(_ sender: NSSlider) {
+        // Remember the value per kind so switching blur<->pixelate restores it.
+        if selectedTool == .pixelate { pixelateScale = sender.doubleValue }
+        else { blurRadius = sender.doubleValue }
+        onRedactStrengthChanged?(sender.doubleValue)
     }
     @objc private func fontFamilyChanged(_ sender: NSPopUpButton) {
         let family = AnnotationFontFamily.allCases[max(0, sender.indexOfSelectedItem)]
