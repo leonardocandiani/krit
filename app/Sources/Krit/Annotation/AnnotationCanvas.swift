@@ -149,10 +149,10 @@ final class AnnotationCanvas: NSView {
     private var smartRedactBannerDismissWork: DispatchWorkItem?
 
     // Text editing
-    private var activeTextField: NSTextField?
+    private var activeTextView: NSTextView?
     // Floating emoji button shown above the inline editor while typing. Clicking
     // it opens the native macOS character palette, which inserts the picked emoji
-    // into the first responder (the text field) at the caret. Created with the
+    // into the first responder (the text view) at the caret. Created with the
     // editor, follows it as the field grows/moves, torn down on commit.
     private var emojiButton: NSButton?
     // Local mouse monitor alive only while the inline editor is: a click
@@ -2268,8 +2268,8 @@ final class AnnotationCanvas: NSView {
         // get its keyUp here; drop pan mode before handing focus over.
         clearSpacePan()
         let font = activeTextFont
-        let field = makeTextField(font: font, color: activeColor)
-        // Place the field so its inset-adjusted text top-left sits at `point`; the
+        let field = makeTextView(font: font, color: activeColor)
+        // Place the editor so its inset-adjusted text top-left sits at `point`; the
         // committed annotation will draw its top-left at that same point.
         pendingTextOrigin = point
         field.frame = NSRect(x: point.x - textFieldContentInset.x,
@@ -2277,7 +2277,7 @@ final class AnnotationCanvas: NSView {
                              width: 220, height: font.ascender - font.descender + 6)
         addSubview(field)
         field.becomeFirstResponder()
-        activeTextField = field
+        activeTextView = field
         installTextCommitClickMonitor()
         showEmojiButton(for: field)
     }
@@ -2291,8 +2291,8 @@ final class AnnotationCanvas: NSView {
         pendingTextOrigin = nil
         setSelection([])
 
-        let field = makeTextField(font: annotation.font, color: annotation.color)
-        field.stringValue = annotation.text
+        let field = makeTextView(font: annotation.font, color: annotation.color)
+        field.string = annotation.text
         let size = annotation.textSize
         // Offset by the same inset as a fresh entry so the editor's glyphs sit
         // exactly over the rendered annotation (WYSIWYG re-edit).
@@ -2301,29 +2301,40 @@ final class AnnotationCanvas: NSView {
                              width: max(size.width + 24, 80), height: size.height + 4)
         addSubview(field)
         field.becomeFirstResponder()
-        field.currentEditor()?.selectAll(nil)
-        activeTextField = field
+        field.selectAll(nil)
+        activeTextView = field
         installTextCommitClickMonitor()
         showEmojiButton(for: field)
         setNeedsDisplay(bounds)
     }
 
-    private func makeTextField(font: NSFont, color: NSColor) -> NSTextField {
-        let field = NSTextField(frame: .zero)
-        field.backgroundColor = .clear
-        field.isBordered = false
-        field.focusRingType = .none
+    // A borderless, transparent NSTextView (not NSTextField) so the inline editor
+    // can hold multiple lines: Return commits, Shift+Return inserts a newline.
+    // Self-sizing and unwrapped (huge container, no width tracking) so it grows
+    // with its content like the old field did; the commit/emoji/drag code treats
+    // it as a plain subview, never wrapped in an NSScrollView.
+    private func makeTextView(font: NSFont, color: NSColor) -> NSTextView {
+        let field = NSTextView(frame: .zero)
         field.isEditable = true
+        field.drawsBackground = false
+        field.backgroundColor = .clear
+        field.focusRingType = .none
+        field.textContainerInset = .zero
         field.font = font
         field.textColor = color
-        field.placeholderString = "Type here…"
+        field.isRichText = false
+        field.usesFontPanel = false
+        field.isVerticallyResizable = true
+        field.isHorizontallyResizable = true
+        field.textContainer?.widthTracksTextView = false
+        field.textContainer?.containerSize = CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         field.delegate = self
         return field
     }
 
     func commitTextField() {
-        guard let field = activeTextField else { return }
-        let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard let field = activeTextView else { return }
+        let text = field.string.trimmingCharacters(in: .whitespaces)
         // Capture and clear before we mutate state, so a re-entrant commit (the
         // field-editor end notification can fire during teardown) is a no-op.
         let origin = pendingTextOrigin
@@ -2360,7 +2371,7 @@ final class AnnotationCanvas: NSView {
             if activeTool == .text { activeTool = .select }
         }
         field.removeFromSuperview()
-        activeTextField = nil
+        activeTextView = nil
         hideEmojiButton()
         removeTextCommitClickMonitor()
         setNeedsDisplay(bounds)
@@ -2370,7 +2381,7 @@ final class AnnotationCanvas: NSView {
         removeTextCommitClickMonitor()
         textCommitClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
             guard let self else { return event }
-            guard let field = self.activeTextField else {
+            guard let field = self.activeTextView else {
                 self.removeTextCommitClickMonitor()
                 return event
             }
@@ -2410,7 +2421,7 @@ final class AnnotationCanvas: NSView {
     /// button stays out of the field's key-view loop and never takes first
     /// responder, so clicking it does not commit the text (the click monitor also
     /// treats it as in-editor chrome).
-    private func showEmojiButton(for field: NSTextField) {
+    private func showEmojiButton(for field: NSTextView) {
         hideEmojiButton()
         let button = NSButton(frame: NSRect(x: 0, y: 0, width: emojiButtonSize, height: emojiButtonSize))
         button.title = ""
@@ -2438,7 +2449,7 @@ final class AnnotationCanvas: NSView {
     /// above the field's top edge. The canvas is flipped (top-left origin), so the
     /// field's visual top is its frame minY and the button sits above it at a
     /// smaller y.
-    private func repositionEmojiButton(for field: NSTextField) {
+    private func repositionEmojiButton(for field: NSTextView) {
         guard let button = emojiButton else { return }
         let x = field.frame.midX - emojiButtonSize / 2
         let y = field.frame.minY - emojiButtonGap - emojiButtonSize
@@ -2454,9 +2465,10 @@ final class AnnotationCanvas: NSView {
     /// chosen emoji into the current first responder, which is the active text
     /// field's field editor, so the emoji lands at the caret.
     @objc private func presentEmojiPicker() {
-        // Make sure the field (its field editor) is first responder, otherwise the
-        // palette has nowhere to insert.
-        if let field = activeTextField, field.window?.firstResponder !== field.currentEditor() {
+        // Make sure the text view is first responder, otherwise the palette has
+        // nowhere to insert. The NSTextView is its own editor, so the picked emoji
+        // lands at its caret.
+        if let field = activeTextView, field.window?.firstResponder !== field {
             field.becomeFirstResponder()
         }
         NSApp.orderFrontCharacterPalette(nil)
@@ -2520,13 +2532,13 @@ final class AnnotationCanvas: NSView {
             onCropChanged?(crop)
         }
 
-        if let activeTextField {
-            activeTextField.frame.origin.x += delta.x
-            activeTextField.frame.origin.y += delta.y
+        if let activeTextView {
+            activeTextView.frame.origin.x += delta.x
+            activeTextView.frame.origin.y += delta.y
             // Keep the pending commit origin in step with the shifted editor so a
             // text typed during a background change still commits where it shows.
             pendingTextOrigin = pendingTextOrigin.map { CGPoint(x: $0.x + delta.x, y: $0.y + delta.y) }
-            repositionEmojiButton(for: activeTextField)
+            repositionEmojiButton(for: activeTextView)
         }
 
         setNeedsDisplay(bounds)
@@ -2645,7 +2657,7 @@ final class AnnotationCanvas: NSView {
         // Restrict to a bare Space (no modifiers) so Cmd+Space / system shortcuts
         // aren't swallowed.
         let bareSpace = event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
-        if event.keyCode == 49, activeTextField == nil, bareSpace {
+        if event.keyCode == 49, activeTextView == nil, bareSpace {
             if !spaceDown {
                 spaceDown = true
                 NSCursor.openHand.set()
@@ -2655,13 +2667,13 @@ final class AnnotationCanvas: NSView {
 
         // Smart Redact preview owns Enter (apply) and Esc (cancel) while staged,
         // so confirming the suggested boxes is one keystroke and bailing is Esc.
-        if !smartRedactPreviews.isEmpty, activeTextField == nil {
+        if !smartRedactPreviews.isEmpty, activeTextView == nil {
             if event.keyCode == 36 || event.keyCode == 76 { applySmartRedact(); return }
             if event.keyCode == 53 { cancelSmartRedact(); return }
         }
 
         // Return/Enter commits a pending crop region (crop mode only).
-        if activeTool == .crop, activeTextField == nil,
+        if activeTool == .crop, activeTextView == nil,
            event.keyCode == 36 || event.keyCode == 76,
            let crop = cropRect, crop.width >= 1, crop.height >= 1 {
             onCropCommit?()
@@ -2669,7 +2681,7 @@ final class AnnotationCanvas: NSView {
         }
 
         // Canvas zoom (B5): ⌘+ / ⌘- / ⌘0 (fit). Checked before ⌘Z below.
-        if event.modifierFlags.contains(.command), activeTextField == nil {
+        if event.modifierFlags.contains(.command), activeTextView == nil {
             switch event.charactersIgnoringModifiers {
             case "=", "+": zoomIn(); return
             case "-":      zoomOut(); return
@@ -2740,7 +2752,7 @@ final class AnnotationCanvas: NSView {
         }
         // Canvas zoom shortcuts: Cmd+plus / Cmd+minus step, Cmd+0 fits. The "="
         // key doubles as "+" so the unshifted keystroke works like every editor.
-        if event.modifierFlags.contains(.command), activeTextField == nil {
+        if event.modifierFlags.contains(.command), activeTextView == nil {
             switch event.charactersIgnoringModifiers {
             case "+", "=":
                 zoomIn(); onUserZoom?(); return
@@ -2753,7 +2765,7 @@ final class AnnotationCanvas: NSView {
         }
 
         // Single-key tool shortcuts (only when no text field is active and no command key)
-        if activeTextField == nil && !event.modifierFlags.contains(.command) {
+        if activeTextView == nil && !event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers?.lowercased() {
             case "v": activeTool = .select; return
             case "a": activeTool = .arrow; return
@@ -3207,16 +3219,37 @@ final class AnnotationCanvas: NSView {
     }
 }
 
-// MARK: - NSTextFieldDelegate
+// MARK: - NSTextViewDelegate
 
-extension AnnotationCanvas: NSTextFieldDelegate {
-    func controlTextDidEndEditing(_ obj: Notification) { commitTextField() }
+extension AnnotationCanvas: NSTextViewDelegate {
+    func textDidEndEditing(_ notification: Notification) { commitTextField() }
 
-    // Grow the in-place editor with its content so typing never clips.
-    func controlTextDidChange(_ obj: Notification) {
-        guard let field = activeTextField, let font = field.font else { return }
-        let size = (field.stringValue as NSString).size(withAttributes: [.font: font])
-        field.frame.size.width = max(size.width + 24, 80)
+    // Grow the in-place editor with its content so typing never clips. Now that the
+    // editor is multiline, size BOTH axes from the multiline bounding box: width
+    // tracks the widest line, height grows with each new line.
+    func textDidChange(_ notification: Notification) {
+        guard let field = activeTextView, let font = field.font else { return }
+        let size = (field.string as NSString).boundingRect(
+            with: CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font]
+        ).size
+        field.frame.size.width = max(ceil(size.width) + 24, 80)
+        // Floor at one line so deleting all text never collapses the editor to nothing.
+        field.frame.size.height = max(ceil(size.height), ceil(font.ascender - font.descender)) + 4
         repositionEmojiButton(for: field)
+    }
+
+    // Return commits (like the old single-line field); Shift+Return inserts a real
+    // newline so the annotation can span multiple lines.
+    func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
+                return false
+            }
+            commitTextField()
+            return true
+        }
+        return false
     }
 }

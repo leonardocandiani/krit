@@ -83,6 +83,7 @@ final class UITestRunner: NSObject {
             case "redact-adversarial": report = await Self.runRedactAdversarial()
             case "redact-sharpness": report = await Self.runRedactSharpness()
             case "uniform-grab-guard": report = Self.runUniformGrabGuard()
+            case "text-multiline": report = Self.runTextMultiline()
             case "glass-renders": report = await Self.runGlassRenders()
             case "default-template": report = await Self.runDefaultTemplateSuite()
             case "editor-fit-large": report = await Self.runEditorFitLargeSuite()
@@ -2150,6 +2151,31 @@ final class UITestRunner: NSObject {
         r["whiteRejected"] = whiteRejected
         r["variedAccepted"] = variedAccepted
         r["allPass"] = blackRejected && whiteRejected && variedAccepted
+        return r
+    }
+
+    // MARK: - Cenário: text-multiline (texto com quebra de linha dimensiona certo)
+
+    /// Multiline text input is only useful if a committed annotation with a newline
+    /// measures as two lines, not one long line. Prove textSize now grows the
+    /// height for a `\n` (the boundingRect fix) instead of the old single-line
+    /// `size(withAttributes:)` that would keep the height flat and blow up the width.
+    private static func runTextMultiline() -> [String: Any] {
+        var r: [String: Any] = ["scenario": "text-multiline"]
+        let one = TextAnnotation(origin: .zero); one.text = "Hello"
+        let two = TextAnnotation(origin: .zero); two.text = "Hello\nWorld"
+        let h1 = one.textSize.height, h2 = two.textSize.height
+        let w1 = one.textSize.width, w2 = two.textSize.width
+        r["singleHeight"] = Int(h1); r["doubleHeight"] = Int(h2)
+        r["singleWidth"] = Int(w1); r["doubleWidth"] = Int(w2)
+        // Two lines are clearly taller (near 2x) and NOT much wider than one line,
+        // which is exactly what the old single-line measurement got backwards.
+        let tallerForMultiline = h2 > h1 * 1.6
+        let widthNotInflated = w2 <= w1 * 1.4
+        let singleLineSane = h1 > 0 && w1 > 0
+        r["tallerForMultiline"] = tallerForMultiline
+        r["widthNotInflated"] = widthNotInflated
+        r["allPass"] = tallerForMultiline && widthNotInflated && singleLineSane
         return r
     }
 
