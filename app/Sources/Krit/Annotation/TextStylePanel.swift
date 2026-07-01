@@ -95,8 +95,10 @@ final class TextStyleSwatchButton: NSButton {
         let radius: CGFloat = 8
 
         // Card background, lighter when active so the selection reads at a glance.
+        // Coral tint (not the system accent) so the active fill matches the coral
+        // border below, keeping one accent per surface (F2.4 policy).
         let card = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-        (isActive ? NSColor.controlAccentColor.withAlphaComponent(0.16)
+        (isActive ? KritColors.accent.withAlphaComponent(0.16)
                   : NSColor.quaternaryLabelColor.withAlphaComponent(0.35)).setFill()
         card.fill()
 

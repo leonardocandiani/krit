@@ -60,6 +60,11 @@ final class AnnotationCanvas: NSView {
     // When on, new blur strokes are created as secure blur (irreversible mosaic)
     // instead of a recoverable gaussian. Toggled from the blur tool's context row.
     var activeBlurSecure: Bool = false
+    // Redaction strength for new blur/pixelate strokes, driven by the Strength
+    // slider (blur radius / pixelate block size). Seeded with the model defaults
+    // so an untouched slider reproduces exactly today's look.
+    var activeBlurRadius: Double = 12
+    var activePixelateScale: Double = 10
 
     /// Per-tool line-width memory (item 4): only tools the user has touched with
     /// the slider get an entry; everything else derives its default from
@@ -2089,9 +2094,11 @@ final class AnnotationCanvas: NSView {
         case .blur:
             let b = BlurAnnotation(rect: CGRect(origin: point, size: .zero))
             b.secure = activeBlurSecure
+            b.radius = activeBlurRadius
             return b
         case .pixelate:
             let p = PixelateAnnotation(rect: CGRect(origin: point, size: .zero))
+            p.scale = activePixelateScale
             return p
         default: return nil
         }
