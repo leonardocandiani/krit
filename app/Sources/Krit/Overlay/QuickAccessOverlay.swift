@@ -997,6 +997,11 @@ private final class QuickAccessWindow: NSWindow {
         QuickAccessWindow.uiTestConveyorSiblingsMoved = 0
         dismissTimer?.invalidate()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
+        // Freeze the SIBLINGS' auto-dismiss too: their countdowns kept running
+        // through a gesture, so a card could animate itself away mid-drag of its
+        // neighbor ("the card disappeared while I was dragging another one").
+        // cardDragEnd's defer resumes everyone once the gesture settles.
+        conveyorSiblings.forEach { $0.card.pauseDismissForSiblingGesture() }
     }
 
     func cardDragUpdate() {
@@ -1142,7 +1147,13 @@ private final class QuickAccessWindow: NSWindow {
     }
 
     func cardDragEnd() {
-        defer { cardDragStartMouse = nil; cardDragStartOrigin = nil; conveyorSiblings = [] }
+        defer {
+            // Gesture settled on ANY path (snap-back, delete, park, sub-threshold
+            // press): resume the siblings frozen by cardDragBegin. Parked cards
+            // no-op (restartDismissTimer guards), hovered ones stay paused.
+            conveyorSiblings.forEach { $0.card.resumeDismissIfNeeded() }
+            cardDragStartMouse = nil; cardDragStartOrigin = nil; conveyorSiblings = []
+        }
         // The card followed the cursor through the whole drag, so by release the
         // cursor has wandered off the card's resting slot while mouseInsideOverlay /
         // isHovered still read the grab-time "inside" state. Any path that LEAVES
@@ -1626,6 +1637,14 @@ private final class QuickAccessWindow: NSWindow {
     private func resumeDismissIfNeeded() {
         guard !isHovered else { return }
         restartDismissTimer()
+    }
+
+    /// A sibling started a gesture: hold this card's auto-dismiss (and its coral
+    /// countdown) until the gesture settles, so no card vanishes mid-drag of its
+    /// neighbor. Mirrors the hover pause.
+    private func pauseDismissForSiblingGesture() {
+        dismissTimer?.invalidate()
+        timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
     }
 
     private func animateTimeoutProgress(duration: TimeInterval) {
@@ -3579,9 +3598,28 @@ extension QuickAccessOverlay {
             "maxDrop": Double(QuickAccessWindow.uiTestConveyorMaxDrop),
         ]
     }
+
+    /// F3.3 gesture-freeze probes: arm every card's auto-dismiss countdown (what
+    /// hover-exit normally does), read each card's timer state, and drive a
+    /// begin/end gesture on the newest card via the direct hook (synthetic mouse
+    /// fights a live cursor, see uiTestConveyorStep).
+    @MainActor static func uiTestArmDismissTimers() {
+        QuickAccessWindow.openWindows.forEach { $0.uiTestArmDismissTimer() }
+    }
+    @MainActor static func uiTestDismissTimersActive() -> [Bool] {
+        QuickAccessWindow.openWindows.map { $0.uiTestDismissTimerActive }
+    }
+    @MainActor static func uiTestGestureBegin() {
+        QuickAccessWindow.openWindows.last?.cardDragBegin()
+    }
+    @MainActor static func uiTestGestureEnd() {
+        QuickAccessWindow.openWindows.last?.cardDragEnd()
+    }
 }
 
 private extension QuickAccessWindow {
+    var uiTestDismissTimerActive: Bool { dismissTimer?.isValid == true }
+    func uiTestArmDismissTimer() { restartDismissTimer() }
     static var uiTestOpenWindows: [NSWindow] { openWindows }
     static func uiTestStackOrigins(on screen: NSScreen?) -> [[String: Double]] {
         orderedStack(on: screen).map { ["x": Double($0.frame.origin.x), "y": Double($0.frame.origin.y)] }
