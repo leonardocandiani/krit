@@ -22,7 +22,10 @@ final class ScrollingCaptureController: NSObject {
     private var isFinishing = false
     private var captureTimer: Timer?
     private var statusWindow: ScrollingStatusWindow?
-    private var hiddenDesktopIconsByCapture = false
+    /// Icons are excluded from each frame's SCK grab (Finder-exclusion filter),
+    /// not hidden on screen: the old wallpaper cover window flipped an aerial
+    /// dark desktop to its light poster for the whole scroll.
+    private var excludeDesktopIcons = false
     private var pendingStopHistoryManager: HistoryManager?
     /// Single reusable capture engine, never allocate per-frame
     private let captureEngine = CaptureEngine()
@@ -33,16 +36,12 @@ final class ScrollingCaptureController: NSObject {
         captureTimer?.invalidate()
     }
 
-    func start(historyManager: HistoryManager, hiddenDesktopIconsByCapture: Bool = false) async {
-        self.hiddenDesktopIconsByCapture = hiddenDesktopIconsByCapture
+    func start(historyManager: HistoryManager, excludeDesktopIcons: Bool = false) async {
+        self.excludeDesktopIcons = excludeDesktopIcons
         selectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
             self.selectionWindow = nil
-            guard let rect else {
-                DesktopIconsManager.showAfterCapture(ifHiddenByCapture: self.hiddenDesktopIconsByCapture)
-                self.hiddenDesktopIconsByCapture = false
-                return
-            }
+            guard let rect else { return }
             self.captureRect = rect
             self.captureScreen = screen
             self.beginScrollingPhase(historyManager: historyManager)
@@ -82,7 +81,7 @@ final class ScrollingCaptureController: NSObject {
         }
         isCapturingFrame = true
         Task {
-            if let img = await captureEngine.captureRectToImage(rect, on: screen) {
+            if let img = await captureEngine.captureRectToImage(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons) {
                 self.frames.append(img)
                 self.statusWindow?.updateCount(self.frames.count)
             }
@@ -115,13 +114,8 @@ final class ScrollingCaptureController: NSObject {
         selectionWindow = nil
         statusWindow?.orderOut(nil)
         statusWindow = nil
-        let shouldRestoreDesktopIcons = hiddenDesktopIconsByCapture
-        hiddenDesktopIconsByCapture = false
 
-        guard !frames.isEmpty else {
-            DesktopIconsManager.showAfterCapture(ifHiddenByCapture: shouldRestoreDesktopIcons)
-            return
-        }
+        guard !frames.isEmpty else { return }
         // Keep isActive true across the off-main stitch so a new scrolling capture
         // can't start and race a second stitch/overlay.
         isFinishing = true
@@ -149,7 +143,6 @@ final class ScrollingCaptureController: NSObject {
                 if Settings.afterCaptureShowOverlay {
                     QuickAccessOverlay.show(image: stitched, historyItem: item, historyManager: historyManager, screen: self.captureScreen)
                 }
-                DesktopIconsManager.showAfterCapture(ifHiddenByCapture: shouldRestoreDesktopIcons)
             }
         }
     }
