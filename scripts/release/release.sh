@@ -265,8 +265,13 @@ fi
 # ---------------------------------------------------------------------------
 
 # The tag must point at a commit that already carries the version bump, the
-# appcast entry and the cask digest; shipped apps read appcast.xml from main,
-# so main gets pushed before the release is published.
+# appcast entry and the cask digest. Pushing the tag uploads that commit, so
+# the GitHub release can be published from it before main moves. Order
+# matters: shipped apps read appcast.xml from main the moment it lands, so
+# main is pushed LAST, only after the release (and its DMG) is downloadable.
+# Publishing the appcast first opens a window where the updater announces the
+# version but the download 404s (the release is still a draft while assets
+# upload), and every in-app update attempted in that window fails.
 info "Committing release metadata"
 git add "$INFO_PLIST" "$REPO_ROOT/appcast.xml" "$CASK_FILE" "$WHATSNEW_FILE" "$CHANGELOG_FILE"
 git commit -m "chore: release $TAG
@@ -281,11 +286,13 @@ info "Creating git tag $TAG"
 git tag -a "$TAG" -m "KRIT $TAG"
 
 info "Publishing GitHub release $TAG with $DMG_NAME"
-git push origin HEAD
 git push origin "$TAG"
 gh release create "$TAG" "$DMG_PATH" "$SHA_FILE" \
     --title "KRIT $TAG" \
     --notes-file "$NOTES_TMP"
+
+info "Publishing appcast (in-app updates go live)"
+git push origin HEAD
 
 ok "Released $TAG"
 printf '\n'
