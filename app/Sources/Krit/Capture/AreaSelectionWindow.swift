@@ -22,6 +22,11 @@ final class AreaSelectionWindow: NSObject {
     private let completion: Completion
     private var overlays: [SelectionOverlayWindow] = []
     private var activeOverlay: SelectionOverlayWindow?
+    /// The frozen crop latched by `finish()` right before `tearDown()` empties
+    /// `overlays`. The completion fires 0.08s AFTER teardown, so reading the crop
+    /// lazily from the overlays there always came back nil and the engine fell to
+    /// the live re-grab, the fast path was dead. One-shot: consumed on first read.
+    private var pendingFrozenCrop: NSImage?
 
     init(mode: SelectionMode, completion: @escaping Completion) {
         self.mode = mode
@@ -127,6 +132,9 @@ final class AreaSelectionWindow: NSObject {
 
     private func finish(rect: CGRect, screen: NSScreen, windowID: CGWindowID? = nil) {
         NSCursor.pop()
+        // Latch the frozen crop while the overlays still exist: tearDown() empties
+        // them, and the deferred completion below is what reads the crop.
+        pendingFrozenCrop = croppedFrozenImage(globalRect: rect, on: screen)
         tearDown()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             self?.completion(rect, screen, windowID)
@@ -147,16 +155,31 @@ final class AreaSelectionWindow: NSObject {
 
     /// Crops the already-grabbed frozen frame of `screen` to `globalRect`, so the
     /// area shot is produced without a live re-grab (which would flash the screen
-    /// light at print time). nil if no overlay covers that screen or the grab was
-    /// missing, so the caller falls back to a live capture.
+    /// light at print time). While the overlays are up this crops live; after
+    /// `finish()` tore them down it serves the crop latched there (one-shot).
+    /// nil if the grab was missing, so the caller falls back to a live capture.
     func croppedFrozenImage(globalRect: CGRect, on screen: NSScreen) -> NSImage? {
-        (overlays.first { $0.coversScreen(screen) } ?? overlays.first)?
-            .croppedFrozenImage(globalRect: globalRect)
+        if !overlays.isEmpty {
+            return (overlays.first { $0.coversScreen(screen) } ?? overlays.first)?
+                .croppedFrozenImage(globalRect: globalRect)
+        }
+        let latched = pendingFrozenCrop
+        pendingFrozenCrop = nil
+        return latched
     }
 
     func uiTestPickColor(atScreen screenPoint: NSPoint) {
         let overlay = overlays.first(where: { $0.frame.contains(screenPoint) }) ?? overlays.first
         overlay?.uiTestPickColor(atScreen: screenPoint)
+    }
+
+    /// Test hook: stands one overlay up with a SYNTHETIC frozen frame instead of
+    /// the SCK grab in prepareAndShow, so the frozen-crop fast path (latch in
+    /// finish, one-shot read after teardown) can be exercised headless and
+    /// deterministically. The overlay is never shown on screen.
+    func uiTestPrepareSynthetic(frozen: CGImage, on screen: NSScreen) {
+        let overlay = SelectionOverlayWindow(screen: screen, mode: mode, frozenImage: frozen)
+        overlays = [overlay]
     }
 
     /// Read-only: is every overlay genuinely on screen? A non-activating panel
@@ -211,6 +234,7 @@ final class AreaSelectionWindow: NSObject {
 
     func cancel() {
         NSCursor.pop()
+        pendingFrozenCrop = nil
         tearDown()
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         completion(nil, screen, nil)
