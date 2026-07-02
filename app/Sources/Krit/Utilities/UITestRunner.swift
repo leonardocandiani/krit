@@ -99,6 +99,7 @@ final class UITestRunner: NSObject {
             case "redact-sharpness": report = await Self.runRedactSharpness()
             case "uniform-grab-guard": report = Self.runUniformGrabGuard()
             case "frozen-fast-path": report = await Self.runFrozenFastPath()
+            case "overlay-gesture-freeze": report = await Self.runOverlayGestureFreeze()
             case "text-multiline": report = Self.runTextMultiline()
             case "glass-renders": report = await Self.runGlassRenders()
             case "default-template": report = await Self.runDefaultTemplateSuite()
@@ -2168,6 +2169,75 @@ final class UITestRunner: NSObject {
         r["whiteRejected"] = whiteRejected
         r["variedAccepted"] = variedAccepted
         r["allPass"] = blackRejected && whiteRejected && variedAccepted
+        return r
+    }
+
+    // MARK: - Cenário: overlay-gesture-freeze (F3.3: irmão não some no meio do gesto)
+
+    /// Locks the F3.3 mechanic: with two cards up and their auto-dismiss
+    /// countdowns armed, a gesture on one must FREEZE the sibling's countdown
+    /// (before this, the sibling could animate itself away mid-drag) and the
+    /// gesture settling must resume it. Drives the gesture via the direct hook,
+    /// no synthetic mouse.
+    private static func runOverlayGestureFreeze() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "overlay-gesture-freeze"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+        let savedTimeout = Settings.overlayTimeout
+        Settings.overlayTimeout = 30
+        defer { Settings.overlayTimeout = savedTimeout }
+
+        func makeCard(_ i: Int, _ color: NSColor) {
+            let img = NSImage(size: NSSize(width: 300, height: 200))
+            img.lockFocus(); color.setFill(); NSRect(x: 0, y: 0, width: 300, height: 200).fill(); img.unlockFocus()
+            let p = "/tmp/krit-gfreeze-\(i).png"
+            if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: p))
+            }
+            let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: p, thumbnailPath: p, captureRect: nil)
+            QuickAccessOverlay.show(image: img, historyItem: item,
+                                    historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        }
+        let before = QuickAccessOverlay.uiTestWindows.count
+        makeCard(0, .systemRed);  try? await Task.sleep(nanoseconds: 500_000_000)
+        makeCard(1, .systemBlue); try? await Task.sleep(nanoseconds: 900_000_000)
+        let count = QuickAccessOverlay.uiTestWindows.count - before
+        r["cardCount"] = count
+        func cleanup() async {
+            for _ in 0..<max(count, 0) {
+                QuickAccessOverlay.uiTestCloseNewest()
+                try? await Task.sleep(nanoseconds: 120_000_000)
+            }
+        }
+        guard count >= 2 else {
+            r["error"] = "cards did not appear (\(count))"; r["allPass"] = false
+            await cleanup(); return r
+        }
+
+        QuickAccessOverlay.uiTestArmDismissTimers()
+        let armed = QuickAccessOverlay.uiTestDismissTimersActive()
+        r["armed"] = armed
+        QuickAccessOverlay.uiTestGestureBegin()
+        let during = QuickAccessOverlay.uiTestDismissTimersActive()
+        r["duringGesture"] = during
+        QuickAccessOverlay.uiTestGestureEnd()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let after = QuickAccessOverlay.uiTestDismissTimersActive()
+        r["afterGesture"] = after
+        await cleanup()
+
+        // Index 0 is the sibling (creation order; the newest card takes the gesture).
+        // Resume is asserted on the sibling: the dragged card's own resume rides the
+        // hover gate, which follows the REAL cursor and would flake under a live mouse.
+        let allArmed = armed.count >= 2 && armed.allSatisfy { $0 }
+        let allFrozen = during.count >= 2 && during.allSatisfy { !$0 }
+        let siblingResumed = after.first == true
+        r["allArmed"] = allArmed
+        r["allFrozenDuringGesture"] = allFrozen
+        r["siblingResumed"] = siblingResumed
+        r["allPass"] = allArmed && allFrozen && siblingResumed
         return r
     }
 
