@@ -69,21 +69,6 @@ final class CaptureEngine {
         areaSelectionWindow != nil || allInOneController != nil || recordingControlsWindow != nil || recordingScreenChooserWindow != nil || recordingWindowChooserWindow != nil
     }
 
-    private func hideDesktopIconsForCaptureIfNeeded() async -> Bool {
-        guard Settings.hideDesktopIconsWhileCapturing else { return false }
-        let hiddenByCapture = await DesktopIconsManager.hideForCapture()
-        if hiddenByCapture {
-            // One or two frames for the WindowServer to composite the covers;
-            // the old 350ms settle existed for the Finder restart, now gone.
-            try? await Task.sleep(nanoseconds: 80_000_000)
-        }
-        return hiddenByCapture
-    }
-
-    private func restoreDesktopIconsIfNeeded(_ hiddenByCapture: Bool) {
-        Task { @MainActor in DesktopIconsManager.showAfterCapture(ifHiddenByCapture: hiddenByCapture) }
-    }
-
     // Cached SCShareableContent. `SCShareableContent.excludingDesktopWindows`
     // enumerates every on-screen window and routinely costs 30-100 ms. For
     // area/fullscreen/previous capture modes we only need the display list, and
@@ -271,7 +256,8 @@ final class CaptureEngine {
             showRecordingControls(rect: rect, on: screen, target: .area)
         case .ocr:
             Settings.allInOneRect = rect
-            Task { await runOCR(on: rect, screen: screen) }
+            Task { await runOCR(on: rect, screen: screen,
+                                excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing) }
         case .window:
             Task { await startWindowCapture(historyManager: historyManager) }
         case .fullscreen:
@@ -322,15 +308,17 @@ final class CaptureEngine {
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return }
         historyManager.prepareForCapture()
-        let hiddenByCapture = await hideDesktopIconsForCaptureIfNeeded()
-        defer { restoreDesktopIconsIfNeeded(hiddenByCapture) }
         // Capture the display under the cursor so the global hotkey targets the
         // screen the user is looking at on a multi-monitor setup (NSScreen.main is
         // the menu-bar/key-window screen, not necessarily where the cursor is).
+        // Icons are excluded from the SCK grab itself (the Finder-exclusion
+        // filter, same as area/window capture): nothing is painted over the real
+        // desktop, so an aerial dark wallpaper never flips to its light poster
+        // mid-print the way the old wallpaper cover window made it.
         let mouse = NSEvent.mouseLocation
         let screen = screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main ?? screens[0]
         let rect = screen.frame
-        await captureRect(rect, on: screen, historyManager: historyManager)
+        await captureRect(rect, on: screen, historyManager: historyManager, excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
     }
 
     // MARK: - Screen Recording
@@ -625,9 +613,7 @@ final class CaptureEngine {
         guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(rect) }) ?? NSScreen.main else {
             await startAreaCapture(historyManager: historyManager); return
         }
-        let hiddenByCapture = await hideDesktopIconsForCaptureIfNeeded()
-        defer { restoreDesktopIconsIfNeeded(hiddenByCapture) }
-        await captureRect(rect, on: screen, historyManager: historyManager)
+        await captureRect(rect, on: screen, historyManager: historyManager, excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
     }
 
     // MARK: - Snap and Paste
@@ -798,7 +784,8 @@ final class CaptureEngine {
         }
         guard scrollingCapture?.isActive != true else { return }
         scrollingCapture = ScrollingCaptureController()
-        await scrollingCapture?.start(historyManager: historyManager, hiddenDesktopIconsByCapture: await hideDesktopIconsForCaptureIfNeeded())
+        await scrollingCapture?.start(historyManager: historyManager,
+                                      excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
     }
 
     // MARK: - OCR Capture
@@ -808,17 +795,13 @@ final class CaptureEngine {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
         guard areaSelectionWindow == nil else { return }
-        let hiddenByCapture = await hideDesktopIconsForCaptureIfNeeded()
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
             self.areaSelectionWindow = nil
-            guard let rect else {
-                self.restoreDesktopIconsIfNeeded(hiddenByCapture)
-                return
-            }
+            guard let rect else { return }
             Task {
-                await self.runOCR(on: rect, screen: screen)
-                self.restoreDesktopIconsIfNeeded(hiddenByCapture)
+                await self.runOCR(on: rect, screen: screen,
+                                  excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
             }
         }
         await areaSelectionWindow?.prepareAndShow(engine: self)
@@ -826,8 +809,8 @@ final class CaptureEngine {
 
     /// Grabs `rect`, recognizes its text, and copies it to the clipboard. Shared
     /// by the area OCR path and the All-in-One OCR option, which already has a rect.
-    func runOCR(on rect: CGRect, screen: NSScreen) async {
-        guard let image = await captureRectToImage(rect, on: screen) else { return }
+    func runOCR(on rect: CGRect, screen: NSScreen, excludeDesktopIcons: Bool = false) async {
+        guard let image = await captureRectToImage(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons) else { return }
         let text = await OCREngine.recognizeText(in: image)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -841,19 +824,15 @@ final class CaptureEngine {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
         guard areaSelectionWindow == nil else { return }
-        let hiddenByCapture = await hideDesktopIconsForCaptureIfNeeded()
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
             self.areaSelectionWindow = nil
-            guard let rect else {
-                self.restoreDesktopIconsIfNeeded(hiddenByCapture)
-                return
-            }
+            guard let rect else { return }
             Task {
-                guard let image = await self.captureRectToImage(rect, on: screen) else {
-                    self.restoreDesktopIconsIfNeeded(hiddenByCapture)
-                    return
-                }
+                guard let image = await self.captureRectToImage(
+                    rect, on: screen,
+                    excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing
+                ) else { return }
                 let results = await QRCodeEngine.detect(in: image)
                 await MainActor.run {
                     if results.isEmpty {
@@ -862,7 +841,6 @@ final class CaptureEngine {
                         QRCodeResultWindow.show(results: results)
                     }
                 }
-                self.restoreDesktopIconsIfNeeded(hiddenByCapture)
             }
         }
         await areaSelectionWindow?.prepareAndShow(engine: self)
