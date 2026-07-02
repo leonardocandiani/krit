@@ -120,6 +120,60 @@ private struct OverlayMetrics {
     }
 }
 
+/// One shared set of the four hover/key/scroll monitors for every open quick-access
+/// card. The old model installed these per card, so N cards put 4N monitors on the run
+/// loop, each re-deriving ownership on every event. This installs the four once with
+/// the first card (installIfNeeded) and removes them with the last (removeIfIdle), then
+/// walks the open cards per event calling the same per-card logic. Behavior is
+/// unchanged; the run loop carries four monitors instead of 4N.
+@MainActor
+private final class OverlayInteractionCoordinator {
+    private var keyMonitor: Any?
+    private var globalMouseMonitor: Any?
+    private var localMouseMonitor: Any?
+    private var scrollMonitor: Any?
+
+    func installIfNeeded() {
+        guard keyMonitor == nil, !QuickAccessWindow.openWindows.isEmpty else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // First consumer stops the walk, mirroring how the old per-card monitor
+            // chain worked (a monitor returning nil hid the event from the rest).
+            // Without the break, the rare stale-z-order ownership fallback could let
+            // two cards both claim the key and double-handle it.
+            for card in QuickAccessWindow.openWindows {
+                if card.coordinatorHandleKey(event) { return nil }
+            }
+            return event
+        }
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { _ in
+            for card in QuickAccessWindow.openWindows { card.coordinatorHandleGlobalMouse() }
+        }
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { event in
+            for card in QuickAccessWindow.openWindows { card.coordinatorHandleLocalMouse() }
+            return event
+        }
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            // Same chain semantics as the key monitor: the card whose swipe fired
+            // consumes the scroll and the walk stops there.
+            for card in QuickAccessWindow.openWindows {
+                if card.coordinatorHandleScroll(event) { return nil }
+            }
+            return event
+        }
+    }
+
+    func removeIfIdle() {
+        guard QuickAccessWindow.openWindows.isEmpty else { return }
+        for monitor in [keyMonitor, globalMouseMonitor, localMouseMonitor, scrollMonitor] {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        }
+        keyMonitor = nil
+        globalMouseMonitor = nil
+        localMouseMonitor = nil
+        scrollMonitor = nil
+    }
+}
+
 @MainActor
 private final class QuickAccessWindow: NSWindow {
 
@@ -283,10 +337,11 @@ private final class QuickAccessWindow: NSWindow {
     }
 
     private var dismissTimer: Timer?
-    private var keyMonitor: Any?
-    private var globalMouseMonitor: Any?
-    private var localMouseMonitor: Any?
-    private var scrollMonitor: Any?
+    /// The hover/key/scroll monitors are shared across all open cards by this single
+    /// coordinator, not installed per card: with N cards the old model put 4N monitors
+    /// on the run loop, each re-deriving ownership per event. Installed with the first
+    /// card, removed with the last (see installIfNeeded / removeIfIdle).
+    fileprivate static let interactionCoordinator = OverlayInteractionCoordinator()
     /// Screenshot cards carry both; video cards carry neither (a recording never
     /// enters the screenshot history). `videoPayload` is the discriminator: nil for
     /// a screenshot card, set for a video card.
@@ -430,7 +485,6 @@ private final class QuickAccessWindow: NSWindow {
 
         buildContent()
         positionOverlay()
-        installEventMonitors()
     }
 
     /// Video-card init: same window plumbing as the screenshot card, but the
@@ -467,7 +521,6 @@ private final class QuickAccessWindow: NSWindow {
 
         buildContent()
         positionOverlay()
-        installEventMonitors()
     }
 
     override var canBecomeKey: Bool { true }
@@ -486,79 +539,75 @@ private final class QuickAccessWindow: NSWindow {
 
     // MARK: - Event Monitors (bypass view hierarchy entirely)
 
-    private func installEventMonitors() {
-        // Keyboard: reached because the card is key while hovered (see grabKey()).
-        // Consumes the event (returns nil) so it isn't double-handled.
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, !self.isClosing else { return event }
-            QuickAccessWindow.uiTestKeySeen += 1
-            // O5': while zoomed the card owns the keyboard regardless of where the
-            // cursor sits, so Space/Esc always collapse it (the hover gate would
-            // otherwise drop the key the moment the mouse left the preview).
-            // Gate on a FRESH cursor read (cursorOwnsThisCard reads NSEvent.mouseLocation
-            // + z-order live), never the cached `mouseInsideOverlay` flag: after a few
-            // Space toggles that flag could latch stale and silently swallow the key,
-            // the "open Space a few times and it stops working" the owner hit.
-            guard self.isPreviewZoomed || self.cursorOwnsThisCard() else {
-                QuickAccessWindow.uiTestKeyGateDrop += 1
-                return event
-            }
-            return self.handleKey(event) ? nil : event
+    // The coordinator (one shared set of four monitors) walks the open cards per
+    // event and calls these. The per-event logic is byte-for-byte what each card's
+    // own monitor used to run, so behavior is unchanged, only the monitor count drops
+    // from 4N to 4. Each returns whether it consumed the event.
+
+    /// Keyboard: reached because the card is key while hovered (see grabKey()).
+    /// Returns true when this card handled the key (so the monitor consumes it).
+    fileprivate func coordinatorHandleKey(_ event: NSEvent) -> Bool {
+        guard !isClosing else { return false }
+        QuickAccessWindow.uiTestKeySeen += 1
+        // O5': while zoomed the card owns the keyboard regardless of where the
+        // cursor sits, so Space/Esc always collapse it (the hover gate would
+        // otherwise drop the key the moment the mouse left the preview).
+        // Gate on a FRESH cursor read (cursorOwnsThisCard reads NSEvent.mouseLocation
+        // + z-order live), never the cached `mouseInsideOverlay` flag: after a few
+        // Space toggles that flag could latch stale and silently swallow the key,
+        // the "open Space a few times and it stops working" the owner hit.
+        guard isPreviewZoomed || cursorOwnsThisCard() else {
+            QuickAccessWindow.uiTestKeyGateDrop += 1
+            return false
         }
+        return handleKey(event)
+    }
 
-        // Global mouse: detects hover crossings even while another app is active
-        // (needs no permission, unlike a global key monitor). Hover-enter borrows
-        // the keyboard; hover-exit returns it.
-        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] _ in
-            guard let self, !self.isClosing else { return }
-            let inside = self.frame.contains(NSEvent.mouseLocation)
-            guard inside != self.mouseInsideOverlay else { return }
-            self.mouseInsideOverlay = inside
-            DispatchQueue.main.async { self.updateHoverFocus(inside) }
-        }
+    /// Global mouse: detects hover crossings even while another app is active
+    /// (needs no permission, unlike a global key monitor). Hover-enter borrows
+    /// the keyboard; hover-exit returns it.
+    fileprivate func coordinatorHandleGlobalMouse() {
+        guard !isClosing else { return }
+        let inside = frame.contains(NSEvent.mouseLocation)
+        guard inside != mouseInsideOverlay else { return }
+        mouseInsideOverlay = inside
+        DispatchQueue.main.async { [weak self] in self?.updateHoverFocus(inside) }
+    }
 
-        // Local mouse: same hover tracking while the app IS active (global monitor
-        // doesn't fire for events already delivered to this process).
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] event in
-            guard let self, !self.isClosing else { return event }
-            let inside = self.frame.contains(NSEvent.mouseLocation)
-            if inside != self.mouseInsideOverlay {
-                self.mouseInsideOverlay = inside
-                self.updateHoverFocus(inside)
-            }
-            return event
-        }
-
-        // Swipe-to-dismiss: trackpad swipe toward nearest screen edge closes overlay
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-            guard let self, !self.isClosing else { return event }
-            // A swipe is one continuous trackpad gesture: reset the accumulator at
-            // its boundaries so leftovers from a short, sub-threshold flick never
-            // carry into the next gesture. Without this the running total could sit
-            // just under 60 and make the next scroll fire (or feel) wrong.
-            if event.phase.contains(.began) || event.phase.contains(.ended)
-                || event.momentumPhase.contains(.ended) {
-                self.swipeAccumX = 0
-            }
-            guard self.cursorOwnsThisCard() else { return event }
-
-            self.swipeAccumX += event.scrollingDeltaX
-            let threshold: CGFloat = 60
-            if abs(self.swipeAccumX) > threshold {
-                let direction = self.swipeAccumX > 0 ? CGFloat(1) : CGFloat(-1)
-                self.swipeAccumX = 0
-                self.swipeDismiss(direction: direction)
-                return nil
-            }
-            return event
+    /// Local mouse: same hover tracking while the app IS active (global monitor
+    /// doesn't fire for events already delivered to this process).
+    fileprivate func coordinatorHandleLocalMouse() {
+        guard !isClosing else { return }
+        let inside = frame.contains(NSEvent.mouseLocation)
+        if inside != mouseInsideOverlay {
+            mouseInsideOverlay = inside
+            updateHoverFocus(inside)
         }
     }
 
-    private func removeEventMonitors() {
-        if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
-        if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
-        if let m = localMouseMonitor { NSEvent.removeMonitor(m); localMouseMonitor = nil }
-        if let m = scrollMonitor { NSEvent.removeMonitor(m); scrollMonitor = nil }
+    /// Swipe-to-dismiss: trackpad swipe toward nearest screen edge closes overlay.
+    /// Returns true when the swipe fired (so the monitor consumes the scroll).
+    fileprivate func coordinatorHandleScroll(_ event: NSEvent) -> Bool {
+        guard !isClosing else { return false }
+        // A swipe is one continuous trackpad gesture: reset the accumulator at
+        // its boundaries so leftovers from a short, sub-threshold flick never
+        // carry into the next gesture. Without this the running total could sit
+        // just under 60 and make the next scroll fire (or feel) wrong.
+        if event.phase.contains(.began) || event.phase.contains(.ended)
+            || event.momentumPhase.contains(.ended) {
+            swipeAccumX = 0
+        }
+        guard cursorOwnsThisCard() else { return false }
+
+        swipeAccumX += event.scrollingDeltaX
+        let threshold: CGFloat = 60
+        if abs(swipeAccumX) > threshold {
+            let direction = swipeAccumX > 0 ? CGFloat(1) : CGFloat(-1)
+            swipeAccumX = 0
+            swipeDismiss(direction: direction)
+            return true
+        }
+        return false
     }
 
     /// Hover changed: update the hover visuals/timer and borrow or return the
@@ -2561,7 +2610,6 @@ private final class QuickAccessWindow: NSWindow {
         spaceHintWindow?.orderOut(nil)
         spaceHintWindow = nil
         removeZoomOutsideClickMonitor()
-        removeEventMonitors()
         parkedHandle?.orderOut(nil)  // don't leak the O1 handle on close/quit
         parkedHandle = nil
         orderOut(nil)
@@ -2571,6 +2619,9 @@ private final class QuickAccessWindow: NSWindow {
         // B4: the active-monitor follow monitor exists only while cards are open;
         // tear it down with the last card so it never leaks.
         QuickAccessWindow.removeFollowMonitorIfIdle()
+        // The shared interaction monitors follow the same lifecycle: gone with the
+        // last card so they never leak.
+        QuickAccessWindow.interactionCoordinator.removeIfIdle()
         // Restore background-only policy so app doesn't appear in Cmd-Tab
         // (skip when transitioning to another window like editor or pin)
         if QuickAccessWindow.openWindows.isEmpty && !skipPolicyReset {
@@ -2921,6 +2972,8 @@ private final class QuickAccessWindow: NSWindow {
         // monitor B starts a fresh column instead of offsetting from monitor A.
         let hadSiblings = !QuickAccessWindow.orderedStack(on: overlayScreen).isEmpty
         QuickAccessWindow.openWindows.append(self)
+        // First card installs the four shared monitors; a no-op for every card after.
+        QuickAccessWindow.interactionCoordinator.installIfNeeded()
         if hadSiblings {
             // This card was placed by positionOverlay at the lone-card slot; reflow
             // settles it and pushes the older cards up to their new slots.
