@@ -23,6 +23,11 @@ final class UITestRunner: NSObject {
 
     static let notificationName = Notification.Name("com.krit.test.ui")
     private static let log = Logger(subsystem: "com.krit.app", category: "uitest")
+    /// Held for the app's whole test lifetime: App Nap defers dispatch timers and
+    /// distributed-notification delivery for a background accessory app, which
+    /// strands the battery mid-run (observer armed, delivery dead). A
+    /// user-initiated activity keeps the harness responsive.
+    private var testActivity: NSObjectProtocol?
 
     override init() {
         super.init()
@@ -32,12 +37,22 @@ final class UITestRunner: NSObject {
         // (DistributedNotification não autentica o remetente). A bateria de testes
         // lança o binário direto com KRIT_UI_TEST=1 no ambiente.
         guard ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" else { return }
+        testActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated], reason: "KRIT UI test harness"
+        )
         DistributedNotificationCenter.default().addObserver(
             self,
             selector: #selector(handle(_:)),
             name: Self.notificationName,
             object: nil
         )
+        // Fallback transport: distributed-notification delivery can silently die
+        // in a session (distnoted throttling of a background accessory app), which
+        // strands the whole battery. "scenario|/tmp/out.json" in the environment
+        // runs the exact same handler once at launch, no external post needed.
+        if let boot = ProcessInfo.processInfo.environment["KRIT_UI_SCENARIO"] {
+            handle(Notification(name: Self.notificationName, object: boot))
+        }
     }
 
     @objc private func handle(_ note: Notification) {
@@ -83,6 +98,7 @@ final class UITestRunner: NSObject {
             case "redact-adversarial": report = await Self.runRedactAdversarial()
             case "redact-sharpness": report = await Self.runRedactSharpness()
             case "uniform-grab-guard": report = Self.runUniformGrabGuard()
+            case "frozen-fast-path": report = await Self.runFrozenFastPath()
             case "text-multiline": report = Self.runTextMultiline()
             case "glass-renders": report = await Self.runGlassRenders()
             case "default-template": report = await Self.runDefaultTemplateSuite()
@@ -2152,6 +2168,74 @@ final class UITestRunner: NSObject {
         r["whiteRejected"] = whiteRejected
         r["variedAccepted"] = variedAccepted
         r["allPass"] = blackRejected && whiteRejected && variedAccepted
+        return r
+    }
+
+    // MARK: - Cenário: frozen-fast-path (F9.1: o crop congelado sobrevive ao teardown)
+
+    /// Locks the F1.1 regression: `finish()` tears the overlays down and the
+    /// completion fires 0.08s later, so a lazy read of `croppedFrozenImage` there
+    /// used to return nil and the engine silently fell back to the live re-grab
+    /// (the print-time flash). The fix latches the crop in `finish()`; this gate
+    /// proves the latched crop survives teardown, matches the synthetic frozen
+    /// pixels, and is served exactly once. Fully synthetic, no SCK grab.
+    private static func runFrozenFastPath() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "frozen-fast-path"]
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no screen"; r["allPass"] = false; return r
+        }
+        // Synthetic frozen frame: solid orange at 1x screen size (points == pixels,
+        // so the overlay's crop math runs with imgScale 1).
+        let w = Int(screen.frame.width), h = Int(screen.frame.height)
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: w * 4, bitsPerPixel: 32
+        ), let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            r["error"] = "bitmap alloc failed"; r["allPass"] = false; return r
+        }
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = ctx
+        NSColor(red: 1, green: 0.4, blue: 0, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: w, height: h).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let frozen = rep.cgImage else {
+            r["error"] = "cgImage failed"; r["allPass"] = false; return r
+        }
+
+        var receivedRect: CGRect?
+        let controller = AreaSelectionWindow(mode: .area) { rect, _, _ in receivedRect = rect }
+        controller.uiTestPrepareSynthetic(frozen: frozen, on: screen)
+        r["preHasFrozen"] = controller.uiTestHasFrozenFrame
+
+        let sel = CGRect(x: screen.frame.minX + 60, y: screen.frame.minY + 90, width: 200, height: 120)
+        controller.simulateSelection(rect: sel, on: screen)
+        // The engine's completion runs +0.08s after teardown; read like it does.
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        let shot = controller.croppedFrozenImage(globalRect: sel, on: screen)
+        r["fastPathNonNil"] = shot != nil
+        r["completionFired"] = receivedRect == sel
+        // One-shot: a second read must come back empty, never a stale serve.
+        r["stashConsumedOnce"] = controller.croppedFrozenImage(globalRect: sel, on: screen) == nil
+        var pixelMatches = false
+        var sizeMatches = false
+        if let shot, let cg = shot.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            sizeMatches = abs(CGFloat(cg.width) - sel.width) <= 2 && abs(CGFloat(cg.height) - sel.height) <= 2
+            let probe = NSBitmapImageRep(cgImage: cg)
+            if let c = probe.colorAt(x: cg.width / 2, y: cg.height / 2) {
+                pixelMatches = abs(c.redComponent - 1) < 0.05
+                    && abs(c.greenComponent - 0.4) < 0.05
+                    && abs(c.blueComponent - 0) < 0.05
+            }
+            r["shotSize"] = "\(cg.width)x\(cg.height)"
+        }
+        r["pixelMatches"] = pixelMatches
+        r["sizeMatches"] = sizeMatches
+        r["allPass"] = (r["preHasFrozen"] as? Bool ?? false)
+            && shot != nil
+            && receivedRect == sel
+            && (r["stashConsumedOnce"] as? Bool ?? false)
+            && pixelMatches && sizeMatches
         return r
     }
 
