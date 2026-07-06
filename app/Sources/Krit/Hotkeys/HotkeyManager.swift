@@ -17,76 +17,103 @@ final class HotkeyManager {
     // be re-called later (when presets change) without re-threading them through.
     private weak var captureEngine: CaptureEngine?
     private weak var historyManager: HistoryManager?
+    // Every capture/record/tool handler drops the presentation zoom before it
+    // runs: capture frames the real screen, and the selection chrome sits
+    // above the magnifier, so mixing the two makes the shot ambiguous.
+    private weak var presentationZoom: PresentationZoomController?
 
     // Preset shortcut names we've installed a handler for, so re-registration
     // installs exactly one handler per new preset and clears bindings for deleted
     // ones. KeyboardShortcuts.onKeyDown appends, so we never re-add for the same name.
     private var installedPresetNames: Set<String> = []
 
-    func register(captureEngine: CaptureEngine, historyManager: HistoryManager, onToggleHistory: @escaping () -> Void) {
+    func register(captureEngine: CaptureEngine, historyManager: HistoryManager, presentationZoom: PresentationZoomController, onToggleHistory: @escaping () -> Void) {
         guard !didInstall else { return }
         didInstall = true
         self.captureEngine = captureEngine
         self.historyManager = historyManager
+        self.presentationZoom = presentationZoom
 
-        KeyboardShortcuts.onKeyDown(for: .captureArea) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .captureArea) { [weak captureEngine, weak historyManager, weak presentationZoom] in
             guard let e = captureEngine, let h = historyManager else { return }
+            presentationZoom?.exitForCapture()
             AreaSelectionDiag.mark("hotkeyFired")
             Task { await e.startAreaCapture(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyDown(for: .captureWindow) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .captureWindow) { [weak captureEngine, weak historyManager, weak presentationZoom] in
             guard let e = captureEngine, let h = historyManager else { return }
+            presentationZoom?.exitForCapture()
             Task { await e.startWindowCapture(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyDown(for: .captureFullscreen) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .captureFullscreen) { [weak captureEngine, weak historyManager, weak presentationZoom] in
             guard let e = captureEngine, let h = historyManager else { return }
+            presentationZoom?.exitForCapture()
             Task { await e.captureFullscreen(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyDown(for: .capturePreviousArea) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .capturePreviousArea) { [weak captureEngine, weak historyManager, weak presentationZoom] in
             guard let e = captureEngine, let h = historyManager else { return }
+            presentationZoom?.exitForCapture()
             Task { await e.capturePreviousArea(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyDown(for: .allInOne) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .allInOne) { [weak captureEngine, weak historyManager, weak presentationZoom] in
             guard let e = captureEngine, let h = historyManager else { return }
+            presentationZoom?.exitForCapture()
             Task { await e.startAllInOne(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyDown(for: .snapAndPaste) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .snapAndPaste) { [weak captureEngine, weak historyManager, weak presentationZoom] in
             guard let e = captureEngine, let h = historyManager else { return }
+            presentationZoom?.exitForCapture()
             Task { await e.startSnapAndPaste(historyManager: h) }
         }
 
         // Record screen is a toggle, like CleanShot: while a recording is live the
         // shortcut stops it; otherwise it opens area recording (the primary case).
-        KeyboardShortcuts.onKeyDown(for: .recordScreen) { [weak captureEngine] in
+        KeyboardShortcuts.onKeyDown(for: .recordScreen) { [weak captureEngine, weak presentationZoom] in
             guard let e = captureEngine else { return }
             if e.recordingActive {
                 e.stopRecording()
             } else {
+                presentationZoom?.exitForCapture()
                 Task { await e.startAreaRecording() }
             }
         }
 
-        KeyboardShortcuts.onKeyDown(for: .ocrCapture) { [weak captureEngine] in
+        KeyboardShortcuts.onKeyDown(for: .ocrCapture) { [weak captureEngine, weak presentationZoom] in
             guard let e = captureEngine else { return }
+            presentationZoom?.exitForCapture()
             Task { await e.startOCRCapture() }
         }
 
-        KeyboardShortcuts.onKeyDown(for: .scrollingCapture) { [weak captureEngine, weak historyManager] in
+        KeyboardShortcuts.onKeyDown(for: .scrollingCapture) { [weak captureEngine, weak historyManager, weak presentationZoom] in
             guard let e = captureEngine, let h = historyManager else { return }
+            presentationZoom?.exitForCapture()
             Task { await e.startScrollingCapture(historyManager: h) }
         }
 
-        KeyboardShortcuts.onKeyDown(for: .pickColor) { [weak captureEngine] in
+        KeyboardShortcuts.onKeyDown(for: .pickColor) { [weak captureEngine, weak presentationZoom] in
             guard let e = captureEngine else { return }
+            presentationZoom?.exitForCapture()
             Task { await e.startColorPick() }
         }
 
         KeyboardShortcuts.onKeyDown(for: .captureHistory) { onToggleHistory() }
+
+        // Presentation zoom: toggle engages/dismisses; in/out step the level
+        // and are inert while the zoom is off (they never conjure it).
+        KeyboardShortcuts.onKeyDown(for: .presentationZoom) { [weak presentationZoom] in
+            presentationZoom?.toggle()
+        }
+        KeyboardShortcuts.onKeyDown(for: .presentationZoomIn) { [weak presentationZoom] in
+            presentationZoom?.zoomIn()
+        }
+        KeyboardShortcuts.onKeyDown(for: .presentationZoomOut) { [weak presentationZoom] in
+            presentationZoom?.zoomOut()
+        }
 
         registerPresets()
     }
@@ -118,6 +145,7 @@ final class HotkeyManager {
                       let engine = self.captureEngine,
                       let history = self.historyManager,
                       let live = PresetStore.preset(id: presetID) else { return }
+                self.presentationZoom?.exitForCapture()
                 Task { await engine.runPreset(live, historyManager: history) }
             }
         }

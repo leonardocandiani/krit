@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var captureTrigger: CaptureTrigger!
     private var automationPort: AutomationPort?
     private var uiTestRunner: UITestRunner?
+    private var presentationZoom: PresentationZoomController!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Pin the chosen appearance (System / Light / Dark) before any window opens.
@@ -21,6 +22,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         captureEngine = CaptureEngine()
         hotkeyManager = HotkeyManager()
         historyManager = HistoryManager()
+        presentationZoom = PresentationZoomController()
+        // Scripted captures (krit:// URL commands, automation port) funnel
+        // straight into the engine, bypassing the hotkey/menu layer that
+        // normally drops the presentation zoom first; hook them here so a
+        // programmatic grab never includes the magnifier overlay.
+        captureEngine.willCaptureScreenHook = { [weak self] in
+            self?.presentationZoom.exitForCapture()
+        }
         captureTrigger = CaptureTrigger(engine: captureEngine)
         uiTestRunner = UITestRunner()
         let port = AutomationPort(service: AutomationService(engine: captureEngine))
@@ -193,6 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         hotkeyManager.register(
             captureEngine: captureEngine,
             historyManager: historyManager,
+            presentationZoom: presentationZoom,
             onToggleHistory: { [weak self] in
                 guard let self else { return }
                 HistoryPanelController.shared.toggle(historyManager: self.historyManager)
@@ -293,6 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         menu.addItem(header: "Tools")
         menu.addItem(title: "Capture Text (OCR)",   key: "o",  action: #selector(captureText), icon: "text.viewfinder")
         menu.addItem(title: "Pick Color",           key: "",  action: #selector(pickColor), icon: "eyedropper")
+        menu.addItem(title: "Presentation Zoom",    key: "8",  action: #selector(togglePresentationZoom), icon: "plus.magnifyingglass")
         menu.addItem(title: "Scan QR Code",         key: "",  action: #selector(scanQRCode), icon: "qrcode.viewfinder")
         menu.addItem(title: "Open History",         key: "",  action: #selector(openHistory), icon: "clock.arrow.circlepath")
         menu.addItem(title: "Show Editor",          key: "",  action: #selector(showEditor), icon: "pencil.and.outline")
@@ -329,21 +340,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     // MARK: - Actions
 
-    @objc func allInOne()            { Task { await captureEngine.startAllInOne(historyManager: historyManager) } }
-    @objc func captureArea()         { Task { await captureEngine.startAreaCapture(historyManager: historyManager) } }
-    @objc func captureWindow()       { Task { await captureEngine.startWindowCapture(historyManager: historyManager) } }
-    @objc func captureFullscreen()   { Task { await captureEngine.captureFullscreen(historyManager: historyManager) } }
-    @objc func capturePrevious()     { Task { await captureEngine.capturePreviousArea(historyManager: historyManager) } }
-    @objc func snapAndPaste()        { Task { await captureEngine.startSnapAndPaste(historyManager: historyManager) } }
-    @objc func captureScrolling()    { Task { await captureEngine.startScrollingCapture(historyManager: historyManager) } }
-    @objc func recordArea()          { Task { await captureEngine.startAreaRecording() } }
-    @objc func recordWindow()        { Task { await captureEngine.startWindowRecording() } }
-    @objc func recordFullscreen()    { Task { await captureEngine.startFullscreenRecording() } }
+    @objc func allInOne()            { presentationZoom.exitForCapture(); Task { await captureEngine.startAllInOne(historyManager: historyManager) } }
+    @objc func captureArea()         { presentationZoom.exitForCapture(); Task { await captureEngine.startAreaCapture(historyManager: historyManager) } }
+    @objc func captureWindow()       { presentationZoom.exitForCapture(); Task { await captureEngine.startWindowCapture(historyManager: historyManager) } }
+    @objc func captureFullscreen()   { presentationZoom.exitForCapture(); Task { await captureEngine.captureFullscreen(historyManager: historyManager) } }
+    @objc func capturePrevious()     { presentationZoom.exitForCapture(); Task { await captureEngine.capturePreviousArea(historyManager: historyManager) } }
+    @objc func snapAndPaste()        { presentationZoom.exitForCapture(); Task { await captureEngine.startSnapAndPaste(historyManager: historyManager) } }
+    @objc func captureScrolling()    { presentationZoom.exitForCapture(); Task { await captureEngine.startScrollingCapture(historyManager: historyManager) } }
+    @objc func recordArea()          { presentationZoom.exitForCapture(); Task { await captureEngine.startAreaRecording() } }
+    @objc func recordWindow()        { presentationZoom.exitForCapture(); Task { await captureEngine.startWindowRecording() } }
+    @objc func recordFullscreen()    { presentationZoom.exitForCapture(); Task { await captureEngine.startFullscreenRecording() } }
     @objc func stopRecording()       { captureEngine.stopRecording() }
     @objc func reopenLastRecording() { captureEngine.reopenLastRecording() }
-    @objc func captureText()         { Task { await captureEngine.startOCRCapture() } }
-    @objc func pickColor()           { Task { await captureEngine.startColorPick() } }
-    @objc func scanQRCode()          { Task { await captureEngine.startQRCodeCapture() } }
+    @objc func captureText()         { presentationZoom.exitForCapture(); Task { await captureEngine.startOCRCapture() } }
+    @objc func pickColor()           { presentationZoom.exitForCapture(); Task { await captureEngine.startColorPick() } }
+    @objc func scanQRCode()          { presentationZoom.exitForCapture(); Task { await captureEngine.startQRCodeCapture() } }
+    @objc func togglePresentationZoom() { presentationZoom.toggle() }
     @objc func showEditor()          { AnnotationWindowController.bringOpenEditorsToFront() }
     @objc func annotateLastScreenshot() {
         guard let last = historyManager.items.first else { return }

@@ -387,6 +387,43 @@ enum Settings {
         get { defaults.bool(forKey: "aiCloudEnabled") }
         set { defaults.set(newValue, forKey: "aiCloudEnabled") }
     }
+
+    // MARK: - Presentation zoom
+
+    /// Magnification the presentation zoom engages at, remembered from the
+    /// last session (the zoom-in/out shortcuts update it). Clamped to the
+    /// range those shortcuts can reach; 2x when unset.
+    static var presentationZoomLevel: Double {
+        get {
+            let raw = defaults.double(forKey: "presentationZoomLevel")
+            guard raw > 0 else { return 2.0 }
+            return min(max(raw, PresentationZoomController.minLevel), PresentationZoomController.maxLevel)
+        }
+        set {
+            let clamped = min(max(newValue, PresentationZoomController.minLevel), PresentationZoomController.maxLevel)
+            defaults.set(clamped, forKey: "presentationZoomLevel")
+        }
+    }
+
+    /// Position of the Preferences smoothing slider, 0 (snappy) … 1 (long
+    /// glide). The zoom controller maps it exponentially to the spring's
+    /// response time and reads it every tick, so dragging the slider steers a
+    /// live zoom in real time. Midpoint when unset.
+    static var presentationZoomSmoothness: Double {
+        get {
+            guard defaults.object(forKey: "presentationZoomSmoothness") != nil else { return 0.5 }
+            return min(max(defaults.double(forKey: "presentationZoomSmoothness"), 0), 1)
+        }
+        set { defaults.set(min(max(newValue, 0), 1), forKey: "presentationZoomSmoothness") }
+    }
+
+    /// How the presentation zoom settles (spring damping): Precise stops
+    /// dead, Natural eases with a whisper of overshoot, Bouncy visibly
+    /// springs. Natural when unset.
+    static var presentationZoomFeel: PresentationZoomFeel {
+        get { PresentationZoomFeel(rawValue: defaults.string(forKey: "presentationZoomFeel") ?? "") ?? .natural }
+        set { defaults.set(newValue.rawValue, forKey: "presentationZoomFeel") }
+    }
 }
 
 
