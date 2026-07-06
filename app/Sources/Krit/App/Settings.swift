@@ -404,6 +404,26 @@ enum Settings {
             defaults.set(clamped, forKey: "presentationZoomLevel")
         }
     }
+
+    /// Position of the Preferences smoothing slider, 0 (snappy) … 1 (long
+    /// glide). The zoom controller maps it exponentially to the spring's
+    /// response time and reads it every tick, so dragging the slider steers a
+    /// live zoom in real time. Midpoint when unset.
+    static var presentationZoomSmoothness: Double {
+        get {
+            guard defaults.object(forKey: "presentationZoomSmoothness") != nil else { return 0.5 }
+            return min(max(defaults.double(forKey: "presentationZoomSmoothness"), 0), 1)
+        }
+        set { defaults.set(min(max(newValue, 0), 1), forKey: "presentationZoomSmoothness") }
+    }
+
+    /// How the presentation zoom settles (spring damping): Precise stops
+    /// dead, Natural eases with a whisper of overshoot, Bouncy visibly
+    /// springs. Natural when unset.
+    static var presentationZoomFeel: PresentationZoomFeel {
+        get { PresentationZoomFeel(rawValue: defaults.string(forKey: "presentationZoomFeel") ?? "") ?? .natural }
+        set { defaults.set(newValue.rawValue, forKey: "presentationZoomFeel") }
+    }
 }
 
 

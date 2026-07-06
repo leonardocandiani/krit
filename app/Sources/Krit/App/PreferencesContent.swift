@@ -80,6 +80,9 @@ private struct GeneralForm: View {
     @State private var copyToClipboard = Settings.afterCaptureCopyToClipboard
     @State private var saveAutomatically = Settings.afterCaptureSaveAutomatically
     @State private var magnifierOnControl = Settings.magnifierRequiresControl
+    @State private var zoomFeel = Settings.presentationZoomFeel
+    @State private var zoomSmoothness = Settings.presentationZoomSmoothness
+    @State private var zoomLevel = Settings.presentationZoomLevel
     @State private var aiCloudEnabled = Settings.aiCloudEnabled
     @State private var claudeFound = false
     @State private var appearance = Settings.appearanceMode
@@ -175,6 +178,57 @@ private struct GeneralForm: View {
                 Text("Keeps the crosshair light; hold ⌃ for the zoom loupe and guide lines.")
             }
             .onChange(of: magnifierOnControl) { Settings.magnifierRequiresControl = $0 }
+        }
+
+        Section("Presentation zoom") {
+            Picker(selection: $zoomFeel) {
+                ForEach(PresentationZoomFeel.allCases) { feel in
+                    Text(feel.label).tag(feel)
+                }
+            } label: {
+                rowLabel("Feel", "wand.and.stars", .cyan)
+                Text("How the zoom settles: Precise stops dead, Natural eases in, Bouncy adds a springy overshoot.")
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: zoomFeel) { Settings.presentationZoomFeel = $0 }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    SettingIcon(symbol: "water.waves", color: .cyan)
+                    Text("Smoothing")
+                    Spacer()
+                    Text(String(format: "%.2f s", PresentationZoomController.responseTime(forSmoothness: zoomSmoothness)))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Slider(value: $zoomSmoothness, in: 0...1) {
+                    EmptyView()
+                } minimumValueLabel: {
+                    Text("Snappy").font(.caption).foregroundStyle(.secondary)
+                } maximumValueLabel: {
+                    Text("Glide").font(.caption).foregroundStyle(.secondary)
+                }
+                .onChange(of: zoomSmoothness) { Settings.presentationZoomSmoothness = $0 }
+                Text("How long each move takes. Applies live — adjust it while a zoom is running to feel the difference.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    SettingIcon(symbol: "plus.magnifyingglass", color: .cyan)
+                    Text("Zoom level")
+                    Spacer()
+                    Text(String(format: "%g×", zoomLevel))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Slider(value: $zoomLevel, in: PresentationZoomController.minLevel...PresentationZoomController.maxLevel, step: 0.25)
+                    .onChange(of: zoomLevel) { Settings.presentationZoomLevel = $0 }
+                Text("The magnification the shortcut engages. The zoom in/out shortcuts step it and remember where you left it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
 
         Section("AI") {

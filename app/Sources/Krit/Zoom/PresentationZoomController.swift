@@ -4,6 +4,31 @@ import CoreVideo
 import QuartzCore
 import ScreenCaptureKit
 
+/// How the presentation zoom settles into its target. All three feels run on
+/// the same second-order spring; only the damping ratio changes.
+enum PresentationZoomFeel: String, CaseIterable, Identifiable {
+    case precise, natural, bouncy
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .precise: return "Precise"
+        case .natural: return "Natural"
+        case .bouncy:  return "Bouncy"
+        }
+    }
+
+    /// Damping ratio ζ: 1 is critically damped (stops dead on target), lower
+    /// values overshoot and settle back — the springy look.
+    var dampingRatio: Double {
+        switch self {
+        case .precise: return 1.0
+        case .natural: return 0.85
+        case .bouncy:  return 0.62
+        }
+    }
+}
+
 /// Live presentation zoom: magnifies the whole screen in real time around the
 /// cursor, ZoomIt-style, so presenters can lean into a detail without touching
 /// the app they are demoing. Toggled by a global shortcut; while active the
@@ -23,11 +48,20 @@ import ScreenCaptureKit
 /// under the cursor keeps working because the zoom is anchored at the cursor
 /// (the point under the pointer maps to itself, like the system zoom).
 ///
-/// The "smooth" part: magnification and pan never jump. A 120 Hz tick drives
-/// both toward their targets with critically-damped exponential smoothing, so
-/// engaging, panning by moving the mouse, stepping the level and disengaging
-/// all glide. Toggling off animates back to 1x and only then removes the
-/// overlay, so the exit lands exactly on the real screen.
+/// The "smooth" part: magnification and pan ride second-order damped springs
+/// (x″ = −ω²(x − target) − 2ζω·x′), advanced by a 120 Hz tick. Unlike
+/// first-order exponential smoothing, spring velocity is CONTINUOUS across
+/// target changes, so re-aiming mid-glide bends the motion instead of kinking
+/// it. The user tunes the motion in Preferences: a smoothness slider sets the
+/// spring's response time (how long a move takes) and a feel picker sets the
+/// damping (Precise stops dead, Natural eases with a whisper of overshoot,
+/// Bouncy visibly springs). Both are read every tick, so dragging the slider
+/// while zoomed adjusts the motion live. The pan spring and the glide-out are
+/// always critically damped: an oscillating pan reads as wobble, and an exit
+/// undershooting below 1x would flash the desktop's black edges. With Reduce
+/// Motion enabled the zoom snaps with no scale animation at all; only the
+/// short cursor-follow glide remains (raw pointer jitter would be more
+/// motion, not less).
 ///
 /// Zoom math, in the window's top-left coordinate space: at magnification m
 /// anchored on focus F, a screen point Q shows source content O + Q/m with
@@ -45,13 +79,20 @@ final class PresentationZoomController {
     static let maxLevel: Double = 6.0
     /// Multiplicative step per zoom-in/out shortcut press.
     private static let levelStep: Double = 1.25
-    /// Exponential smoothing rates (1/s). Zoom eases a touch slower than pan
-    /// so level changes feel weighty while cursor-follow stays responsive.
-    private static let zoomRate: Double = 8.0
-    private static let panRate: Double = 12.0
     /// Smoothing tick. 120 Hz so the glide stays fluid on ProMotion displays;
     /// on 60 Hz panels the extra ticks are coalesced by the compositor.
     private static let tickInterval: TimeInterval = 1.0 / 120.0
+    /// The cursor-follow pan always answers a touch faster than the zoom, so
+    /// tracking feels attached to the hand while level changes stay weighty.
+    private static let panResponseFactor: Double = 0.6
+
+    /// Smoothness slider position (0…1) → spring response time in seconds.
+    /// Exponential, so the slider feels even across its travel:
+    /// 0 → 0.10 s (snappy), 0.5 → ≈0.28 s, 1 → 0.80 s (long glide).
+    /// Preferences shows the resulting time next to the slider.
+    static func responseTime(forSmoothness s: Double) -> Double {
+        0.10 * pow(8.0, min(max(s, 0), 1))
+    }
 
     // MARK: - State
 
@@ -74,9 +115,9 @@ final class PresentationZoomController {
 
     private var tickTimer: Timer?
     private var lastTick: CFTimeInterval = 0
-    private var currentZoom: Double = 1.0
-    private var targetZoom: Double = 2.0
-    private var currentFocus: CGPoint = .zero
+    private var zoomSpring = SpringValue(value: 1.0)
+    private var focusXSpring = SpringValue(value: 0)
+    private var focusYSpring = SpringValue(value: 0)
 
     init() {
         // Displays changing resolution/arrangement invalidates the stream, the
@@ -108,24 +149,23 @@ final class PresentationZoomController {
             hardTeardown()
         case .active:
             state = .windingDown
-            targetZoom = 1.0
         case .windingDown:
             state = .active
-            targetZoom = Settings.presentationZoomLevel
         }
     }
 
     /// Steps magnification while active. Ignored when idle so the (optional)
-    /// bindings never conjure the overlay by themselves.
+    /// bindings never conjure the overlay by themselves. Writes straight to
+    /// Settings: the tick reads the level every pass (that's also what makes
+    /// the Preferences level slider adjust a live zoom), and the value is
+    /// remembered so the next activation engages where the presenter last
+    /// liked it.
     func zoomIn()  { step(by: Self.levelStep) }
     func zoomOut() { step(by: 1.0 / Self.levelStep) }
 
     private func step(by factor: Double) {
         guard case .active = state else { return }
-        targetZoom = min(max(targetZoom * factor, Self.minLevel), Self.maxLevel)
-        // Remember the level so the next activation engages where the
-        // presenter last liked it.
-        Settings.presentationZoomLevel = targetZoom
+        Settings.presentationZoomLevel = Settings.presentationZoomLevel * factor
     }
 
     /// Drops the zoom instantly when a KRIT capture or recording begins: the
@@ -250,9 +290,10 @@ final class PresentationZoomController {
         if awaitingFirstFrame {
             awaitingFirstFrame = false
             state = .active
-            currentZoom = 1.0
-            targetZoom = Settings.presentationZoomLevel
-            currentFocus = localFocus(for: NSEvent.mouseLocation)
+            zoomSpring.snap(to: 1.0)
+            let focus = localFocus(for: NSEvent.mouseLocation)
+            focusXSpring.snap(to: focus.x)
+            focusYSpring.snap(to: focus.y)
             lastTick = CACurrentMediaTime()
             startTicking()
         }
@@ -334,14 +375,47 @@ final class PresentationZoomController {
         let dt = min(max(now - lastTick, 0), 1.0 / 30.0)
         lastTick = now
 
-        let kZoom = 1 - exp(-dt * Self.zoomRate)
-        let kPan = 1 - exp(-dt * Self.panRate)
-        currentZoom += (targetZoom - currentZoom) * kZoom
-        let focus = localFocus(for: NSEvent.mouseLocation)
-        currentFocus.x += (focus.x - currentFocus.x) * kPan
-        currentFocus.y += (focus.y - currentFocus.y) * kPan
+        // Motion parameters are read EVERY tick so the Preferences slider,
+        // feel picker and level slider all steer a live zoom in real time,
+        // and the zoom in/out shortcuts only have to write Settings.
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let zoomResponse = Self.responseTime(forSmoothness: Settings.presentationZoomSmoothness)
+        // Only the engaged zoom gets the chosen feel. The glide-out is always
+        // critically damped (undershooting below 1x would flash the black
+        // letterbox), and so is the pan (an overshooting pan reads as wobble,
+        // not smoothness).
+        var zoomDamping: Double = 1.0
+        if case .active = state, !reduceMotion {
+            zoomDamping = Settings.presentationZoomFeel.dampingRatio
+        }
+        let zoomTarget: Double = { if case .active = state { return Settings.presentationZoomLevel } else { return 1.0 } }()
+        // A springy step DOWN toward the floor can undershoot below 1x; the
+        // render clamp would hold flat at 1x and pop back up — a stutter, not
+        // a bounce. When the predicted first undershoot crosses 1x, damp that
+        // one move critically instead. Undershoot fraction of an underdamped
+        // spring's first swing: e^(−ζπ/√(1−ζ²)).
+        if zoomDamping < 1.0, zoomSpring.value > zoomTarget {
+            let fraction = exp(-zoomDamping * Double.pi / (1 - zoomDamping * zoomDamping).squareRoot())
+            if zoomTarget - (zoomSpring.value - zoomTarget) * fraction < 1.0 {
+                zoomDamping = 1.0
+            }
+        }
 
-        if case .windingDown = state, currentZoom < 1.015 {
+        if reduceMotion {
+            // Reduce Motion means no scale animation at all: the zoom lands
+            // (and exits) instantly. The pan below keeps a short critical
+            // glide — that's tracking, and raw cursor jitter would read as
+            // MORE motion, not less.
+            zoomSpring.snap(to: zoomTarget)
+        } else {
+            zoomSpring.advance(toward: zoomTarget, dt: dt, response: zoomResponse, dampingRatio: zoomDamping)
+        }
+        let panResponse = (reduceMotion ? 0.10 : zoomResponse) * Self.panResponseFactor
+        let focus = localFocus(for: NSEvent.mouseLocation)
+        focusXSpring.advance(toward: focus.x, dt: dt, response: panResponse, dampingRatio: 1.0)
+        focusYSpring.advance(toward: focus.y, dt: dt, response: panResponse, dampingRatio: 1.0)
+
+        if case .windingDown = state, zoomSpring.isSettled(at: 1.0, tolerance: 0.01) {
             hardTeardown()
             return
         }
@@ -350,12 +424,15 @@ final class PresentationZoomController {
 
     private func applyTransform() {
         guard let layer = contentLayer else { return }
-        let m = CGFloat(currentZoom)
+        // Render clamp at 1x: a springy feel may momentarily dip the physics
+        // below 1 (bounce), and drawing m < 1 would expose black borders.
+        let m = CGFloat(max(zoomSpring.value, 1.0))
         let size = screenFrame.size
         // Source origin so the focus maps to itself, clamped to the screen.
+        let focus = CGPoint(x: focusXSpring.value, y: focusYSpring.value)
         var origin = CGPoint(
-            x: currentFocus.x * (1 - 1 / m),
-            y: currentFocus.y * (1 - 1 / m)
+            x: focus.x * (1 - 1 / m),
+            y: focus.y * (1 - 1 / m)
         )
         origin.x = min(max(origin.x, 0), max(size.width - size.width / m, 0))
         origin.y = min(max(origin.y, 0), max(size.height - size.height / m, 0))
@@ -404,7 +481,7 @@ final class PresentationZoomController {
         window = nil
         contentLayer = nil
         currentFrame = nil
-        currentZoom = 1.0
+        zoomSpring.snap(to: 1.0)
     }
 
     // MARK: - Helpers
@@ -423,6 +500,48 @@ final class PresentationZoomController {
     /// Frames are delivered off-main and hopped over; a serial queue keeps
     /// ordering.
     private static let frameQueue = DispatchQueue(label: "krit.presentation-zoom.frames")
+}
+
+// MARK: - Spring physics
+
+/// One animated scalar on a damped spring: x″ = −ω²(x − target) − 2ζω·x′,
+/// with ω = 2π / response. Compared to first-order exponential smoothing,
+/// velocity carries across target changes (mid-glide re-aims bend instead of
+/// kink) and ζ < 1 yields the deliberate overshoot of the springier feels.
+/// Integrated with semi-implicit Euler in capped substeps: at the fastest
+/// response the slider allows (0.10 s → ω ≈ 63/s) a 1/240 s substep keeps
+/// ω·h ≈ 0.26, far inside the method's stability region, so the spring can
+/// never blow up no matter how the wall clock hiccups.
+private struct SpringValue {
+    var value: Double
+    var velocity: Double = 0
+
+    private static let maxSubstep: Double = 1.0 / 240.0
+
+    mutating func advance(toward target: Double, dt: Double, response: Double, dampingRatio: Double) {
+        let omega = 2 * Double.pi / max(response, 0.05)
+        let zeta = min(max(dampingRatio, 0.1), 1.5)
+        var remaining = dt
+        while remaining > 0 {
+            let h = min(remaining, Self.maxSubstep)
+            remaining -= h
+            let accel = -omega * omega * (value - target) - 2 * zeta * omega * velocity
+            velocity += accel * h
+            value += velocity * h
+        }
+    }
+
+    mutating func snap(to target: Double) {
+        value = target
+        velocity = 0
+    }
+
+    /// Settled when displacement AND velocity are negligible — checking the
+    /// position alone would end a bouncy glide at its first zero crossing,
+    /// mid-oscillation.
+    func isSettled(at target: Double, tolerance: Double) -> Bool {
+        abs(value - target) < tolerance && abs(velocity) < tolerance * 10
+    }
 }
 
 // MARK: - Stream plumbing
