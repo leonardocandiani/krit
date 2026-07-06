@@ -543,6 +543,12 @@ private struct ShortcutsForm: View {
             shortcutRow("Pick color", "eyedropper", .mint, .pickColor)
         }
 
+        Section("Presentation zoom") {
+            shortcutRow("Toggle presentation zoom", "plus.magnifyingglass", .cyan, .presentationZoom)
+            shortcutRow("Zoom in", "plus.magnifyingglass", .cyan, .presentationZoomIn)
+            shortcutRow("Zoom out", "minus.magnifyingglass", .cyan, .presentationZoomOut)
+        }
+
         Section {
             HStack(spacing: 10) {
                 SettingIcon(symbol: "arrow.uturn.backward", color: .gray)

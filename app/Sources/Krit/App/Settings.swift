@@ -387,6 +387,23 @@ enum Settings {
         get { defaults.bool(forKey: "aiCloudEnabled") }
         set { defaults.set(newValue, forKey: "aiCloudEnabled") }
     }
+
+    // MARK: - Presentation zoom
+
+    /// Magnification the presentation zoom engages at, remembered from the
+    /// last session (the zoom-in/out shortcuts update it). Clamped to the
+    /// range those shortcuts can reach; 2x when unset.
+    static var presentationZoomLevel: Double {
+        get {
+            let raw = defaults.double(forKey: "presentationZoomLevel")
+            guard raw > 0 else { return 2.0 }
+            return min(max(raw, PresentationZoomController.minLevel), PresentationZoomController.maxLevel)
+        }
+        set {
+            let clamped = min(max(newValue, PresentationZoomController.minLevel), PresentationZoomController.maxLevel)
+            defaults.set(clamped, forKey: "presentationZoomLevel")
+        }
+    }
 }
 
 

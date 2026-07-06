@@ -19,6 +19,15 @@ extension KeyboardShortcuts.Name {
     // system or app shortcut out of the box. Bind it in Preferences > Shortcuts.
     static let pickColor           = Self("pickColor")
 
+    /// Live presentation zoom toggle. ⌘⇧8 sits next to the capture family and
+    /// is free of system collisions out of the box.
+    static let presentationZoom    = Self("presentationZoom",    default: .init(.eight, modifiers: [.command, .shift]))
+    // No defaults: stepping the level mid-presentation is opt-in, like the
+    // eyedropper. The toggle alone is fully usable (it engages at the
+    // remembered level).
+    static let presentationZoomIn  = Self("presentationZoomIn")
+    static let presentationZoomOut = Self("presentationZoomOut")
+
     /// Every rebindable shortcut, in Preferences display order. Used to build the
     /// recorder rows and to reset them all at once. Per-preset shortcuts are
     /// dynamic (see `snapPreset(id:)`) and intentionally excluded here.
@@ -26,6 +35,7 @@ extension KeyboardShortcuts.Name {
         .captureArea, .captureWindow, .captureFullscreen, .capturePreviousArea,
         .allInOne, .snapAndPaste, .recordScreen,
         .ocrCapture, .scrollingCapture, .pickColor, .captureHistory,
+        .presentationZoom, .presentationZoomIn, .presentationZoomOut,
     ]
 
     /// Dynamic, per-preset global shortcut. The name encodes the preset id so the

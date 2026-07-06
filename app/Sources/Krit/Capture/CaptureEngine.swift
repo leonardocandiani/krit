@@ -24,6 +24,14 @@ final class CaptureEngine {
     /// so callers can surface the permission alert instead of failing silently.
     private(set) var lastCaptureFailureWasPermission = false
 
+    /// Runs just before any screen grab or recording start that funnels
+    /// straight into the engine (headless krit:// commands, automation port).
+    /// Interactive entry points already drop the presentation zoom at the
+    /// hotkey/menu layer; this hook covers the scripted paths, so a
+    /// programmatic capture never includes the magnifier overlay. Wired by
+    /// AppDelegate; a repeat call while the zoom is off is a no-op.
+    var willCaptureScreenHook: (() -> Void)?
+
     // Remembers the last selected area for "Capture Previous Area"
     private(set) var lastCaptureRect: CGRect?
 
@@ -561,6 +569,7 @@ final class CaptureEngine {
     /// GUI test hook: starts a rect recording through the production engine,
     /// skipping the preflight panel (the harness has no one to click Record).
     func uiTestStartRecording(rect: CGRect, on screen: NSScreen) async {
+        willCaptureScreenHook?()
         await recordingEngine.startRecording(rect: rect, on: screen)
     }
 
@@ -1137,6 +1146,7 @@ final class CaptureEngine {
     /// so the native grab is always the sharpest possible and any upscale would
     /// only soften it.
     func captureRectToImage(_ rect: CGRect, on screen: NSScreen, excludeDesktopIcons: Bool = false) async -> NSImage? {
+        willCaptureScreenHook?()
         if #available(macOS 14.0, *) {
             return await captureRectSCK(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons)
         } else {
