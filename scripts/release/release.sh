@@ -232,8 +232,14 @@ printf '%s  %s\n' "$DMG_SHA" "$DMG_NAME" > "$SHA_FILE"
 # lives in the login keychain (created once with generate_keys). Shipped apps
 # verify the signature against SUPublicEDKey in Info.plist, so a release
 # without a valid signature would be ignored by the updater.
-SIGN_UPDATE="$(find "$APP_DIR/.build/artifacts" /tmp/krit-app-build/artifacts -maxdepth 5 -name "sign_update" -type f -not -path "*old_dsa*" 2>/dev/null | head -1)"
+# Search every place SPM may have put the Sparkle artifact bundle: the explicit
+# build path used by build-app.sh, a legacy in-repo .build, and the user-level
+# SPM artifact cache. No -maxdepth: the artifactbundle layout nests deeper than
+# 5 levels in newer SPM/Sparkle versions, which made the old bounded find miss
+# it and abort the release after the DMG was already packaged.
+SIGN_UPDATE="$(find /tmp/krit-app-build/artifacts "$APP_DIR/.build/artifacts" "$HOME/Library/Caches/org.swift.swiftpm/artifacts" -name "sign_update" -type f -not -path "*old_dsa*" 2>/dev/null | head -1)"
 [ -n "$SIGN_UPDATE" ] || fail "Sparkle sign_update not found. Run a swift build in app/ first."
+info "Using sign_update: $SIGN_UPDATE"
 chmod +x "$SIGN_UPDATE" 2>/dev/null || true
 
 info "Signing DMG for Sparkle (EdDSA)"
