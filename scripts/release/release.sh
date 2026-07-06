@@ -95,6 +95,37 @@ if ! gh auth status >/dev/null 2>&1; then
     fail "gh is not authenticated. Run: gh auth login"
 fi
 
+# Everything below fails in seconds instead of after the full build. Each check
+# maps to a real release that died mid-flight: a clone without origin, a wrong
+# committer identity, a keychain without the Sparkle key, a stale local main.
+ORIGIN_URL="$(cd "$REPO_ROOT" && git remote get-url origin 2>/dev/null || true)"
+if [ -z "$ORIGIN_URL" ]; then
+    fail "No 'origin' remote. Run: git remote add origin https://github.com/leonardocandiani/krit.git"
+fi
+case "$ORIGIN_URL" in
+    *leonardocandiani/krit*) ;;
+    *) fail "origin points to $ORIGIN_URL; releases are cut from leonardocandiani/krit." ;;
+esac
+
+MAINTAINER_EMAIL="llima.leo.lima@gmail.com"
+GIT_EMAIL="$(cd "$REPO_ROOT" && git config user.email || true)"
+if [ "$GIT_EMAIL" != "$MAINTAINER_EMAIL" ]; then
+    fail "git user.email is '${GIT_EMAIL:-unset}'; the release commit must be authored as $MAINTAINER_EMAIL. Run: git config user.email $MAINTAINER_EMAIL"
+fi
+
+# The EdDSA private key must be in the login keychain BEFORE we spend minutes
+# building; without it the DMG cannot be signed and the updater ignores the release.
+if ! security find-generic-password -l "Private key for signing Sparkle updates" >/dev/null 2>&1; then
+    fail "Sparkle EdDSA key not found in the login keychain (generate_keys creates it). Releases must be cut on the maintainer's machine."
+fi
+
+# Tagging a stale main would ship a release without the latest merged PRs.
+(cd "$REPO_ROOT" && git fetch origin main --quiet)
+BEHIND="$(cd "$REPO_ROOT" && git rev-list --count HEAD..origin/main)"
+if [ "$BEHIND" != "0" ]; then
+    fail "Local branch is $BEHIND commit(s) behind origin/main. Sync first (git pull origin main)."
+fi
+
 # Working tree must be clean so the tag points at a known, reviewable commit.
 cd "$REPO_ROOT"
 if [ -n "$(git status --porcelain)" ]; then
@@ -237,8 +268,17 @@ printf '%s  %s\n' "$DMG_SHA" "$DMG_NAME" > "$SHA_FILE"
 # SPM artifact cache. No -maxdepth: the artifactbundle layout nests deeper than
 # 5 levels in newer SPM/Sparkle versions, which made the old bounded find miss
 # it and abort the release after the DMG was already packaged.
-SIGN_UPDATE="$(find /tmp/krit-app-build/artifacts "$APP_DIR/.build/artifacts" "$HOME/Library/Caches/org.swift.swiftpm/artifacts" -name "sign_update" -type f -not -path "*old_dsa*" 2>/dev/null | head -1)"
-[ -n "$SIGN_UPDATE" ] || fail "Sparkle sign_update not found. Run a swift build in app/ first."
+# Only search directories that exist: under set -e + pipefail, find exits
+# non-zero when ANY listed path is missing, which killed the whole release
+# with no message even though the binary had been found in another path.
+SIGN_SEARCH_DIRS=""
+for d in /tmp/krit-app-build/artifacts "$APP_DIR/.build/artifacts" "$HOME/Library/Caches/org.swift.swiftpm/artifacts"; do
+    [ -d "$d" ] && SIGN_SEARCH_DIRS="$SIGN_SEARCH_DIRS $d"
+done
+[ -n "$SIGN_SEARCH_DIRS" ] || fail "No Sparkle artifact directory exists. Run a swift build in app/ first."
+# shellcheck disable=SC2086  # word splitting of the dir list is intended
+SIGN_UPDATE="$(find $SIGN_SEARCH_DIRS -name "sign_update" -type f -not -path "*old_dsa*" 2>/dev/null | head -1 || true)"
+[ -n "$SIGN_UPDATE" ] || fail "Sparkle sign_update not found under:$SIGN_SEARCH_DIRS. Run a swift build in app/ first."
 info "Using sign_update: $SIGN_UPDATE"
 chmod +x "$SIGN_UPDATE" 2>/dev/null || true
 
