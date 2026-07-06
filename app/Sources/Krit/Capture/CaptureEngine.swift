@@ -1165,9 +1165,15 @@ final class CaptureEngine {
         guard excludeDesktopIcons else {
             return SCContentFilter(display: display, excludingWindows: [])
         }
-        let ownPID = ProcessInfo.processInfo.processIdentifier
+        // Exclude ONLY Finder (the desktop-icon layer). KRIT's own app must NOT
+        // be excluded: real windows (Preferences, editor, history) are content
+        // the user screenshots too, and excluding the whole app made them vanish
+        // from every capture whenever hide-desktop-icons was on. Capture chrome
+        // (flash, HUD, overlay cards, selection UI) stays out of grabs through
+        // sharingType .none on each window, same as in the default no-exclusion
+        // path, so this filter needs no app-level carve-out for ourselves.
         let excludedApps = content.applications.filter {
-            $0.bundleIdentifier == "com.apple.finder" || $0.processID == ownPID
+            $0.bundleIdentifier == "com.apple.finder"
         }
         guard !excludedApps.isEmpty else {
             return SCContentFilter(display: display, excludingWindows: [])

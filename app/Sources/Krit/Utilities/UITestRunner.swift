@@ -99,6 +99,7 @@ final class UITestRunner: NSObject {
             case "redact-sharpness": report = await Self.runRedactSharpness()
             case "uniform-grab-guard": report = Self.runUniformGrabGuard()
             case "frozen-fast-path": report = await Self.runFrozenFastPath()
+            case "own-window-capture": report = await Self.runOwnWindowCapture()
             case "overlay-gesture-freeze": report = await Self.runOverlayGestureFreeze()
             case "text-multiline": report = Self.runTextMultiline()
             case "glass-renders": report = await Self.runGlassRenders()
@@ -2249,6 +2250,62 @@ final class UITestRunner: NSObject {
     /// (the print-time flash). The fix latches the crop in `finish()`; this gate
     /// proves the latched crop survives teardown, matches the synthetic frozen
     /// pixels, and is served exactly once. Fully synthetic, no SCK grab.
+    // MARK: - Cenário: own-window-capture (janelas do KRIT aparecem na captura)
+
+    /// Regression gate for the vanishing-Preferences bug: with "hide desktop
+    /// icons while capturing" ON, the display filter excluded KRIT's own
+    /// application, so every KRIT window (Preferences included) silently
+    /// disappeared from grabs and from the frozen selection backdrop. Stand a
+    /// plain KRIT-owned window (default sharingType, exactly the class that
+    /// used to vanish), grab its region through the REAL icons-hidden filter
+    /// path and require the window's pixels in the result.
+    private static func runOwnWindowCapture() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "own-window-capture"]
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no screen"; r["allPass"] = false; return r
+        }
+        let saved = Settings.hideDesktopIconsWhileCapturing
+        Settings.hideDesktopIconsWhileCapturing = true
+        defer { Settings.hideDesktopIconsWhileCapturing = saved }
+
+        // Magenta: absent from any sane desktop, so a match can only be our window.
+        let frame = NSRect(x: screen.frame.midX - 110, y: screen.frame.midY - 70,
+                           width: 220, height: 140)
+        let win = NSWindow(contentRect: frame, styleMask: [.borderless],
+                           backing: .buffered, defer: false)
+        // Above anything the user has open, so a stray foreground window
+        // cannot occlude the probe region and flake the pixel check.
+        win.level = .screenSaver
+        win.isOpaque = true
+        win.backgroundColor = NSColor(red: 1, green: 0, blue: 1, alpha: 1)
+        win.ignoresMouseEvents = true
+        win.isReleasedWhenClosed = false
+        win.orderFrontRegardless()
+        try? await Task.sleep(nanoseconds: 600_000_000)
+
+        let engine = CaptureEngine()
+        let shot = await engine.captureRectToImage(frame, on: screen, excludeDesktopIcons: true)
+        win.orderOut(nil)
+
+        r["grabNonNil"] = shot != nil
+        var windowVisible = false
+        if let shot, let cg = shot.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            let probe = NSBitmapImageRep(cgImage: cg)
+            if let c = probe.colorAt(x: cg.width / 2, y: cg.height / 2) {
+                // Wide-gamut displays shift the grabbed values (measured
+                // r0.92 g0.20 b0.97 for pure magenta on P3), so the gate
+                // tolerates the colorimetric drift; nothing on a real
+                // desktop lands anywhere near this corner of the cube.
+                windowVisible = c.redComponent > 0.75 && c.greenComponent < 0.35 && c.blueComponent > 0.75
+                r["centerPixel"] = String(format: "r%.2f g%.2f b%.2f",
+                                          c.redComponent, c.greenComponent, c.blueComponent)
+            }
+        }
+        r["windowVisible"] = windowVisible
+        r["allPass"] = (shot != nil) && windowVisible
+        return r
+    }
+
     private static func runFrozenFastPath() async -> [String: Any] {
         var r: [String: Any] = ["scenario": "frozen-fast-path"]
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {
