@@ -2292,7 +2292,11 @@ final class UITestRunner: NSObject {
         if let shot, let cg = shot.cgImage(forProposedRect: nil, context: nil, hints: nil) {
             let probe = NSBitmapImageRep(cgImage: cg)
             if let c = probe.colorAt(x: cg.width / 2, y: cg.height / 2) {
-                windowVisible = c.redComponent > 0.8 && c.greenComponent < 0.2 && c.blueComponent > 0.8
+                // Wide-gamut displays shift the grabbed values (measured
+                // r0.92 g0.20 b0.97 for pure magenta on P3), so the gate
+                // tolerates the colorimetric drift; nothing on a real
+                // desktop lands anywhere near this corner of the cube.
+                windowVisible = c.redComponent > 0.75 && c.greenComponent < 0.35 && c.blueComponent > 0.75
                 r["centerPixel"] = String(format: "r%.2f g%.2f b%.2f",
                                           c.redComponent, c.greenComponent, c.blueComponent)
             }
