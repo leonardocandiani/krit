@@ -390,9 +390,10 @@ enum Settings {
 
     // MARK: - Presentation zoom
 
-    /// Magnification the presentation zoom engages at, remembered from the
-    /// last session (the zoom-in/out shortcuts update it). Clamped to the
-    /// range those shortcuts can reach; 2x when unset.
+    /// Magnification the FIRST zoom-in of an armed presentation zoom session
+    /// jumps to, set by the Preferences slider (the shortcuts drive the
+    /// session's level from there without writing back). Clamped to the range
+    /// the shortcuts can reach; 2x when unset.
     static var presentationZoomLevel: Double {
         get {
             let raw = defaults.double(forKey: "presentationZoomLevel")
