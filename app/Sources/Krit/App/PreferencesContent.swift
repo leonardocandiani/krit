@@ -225,7 +225,7 @@ private struct GeneralForm: View {
                 }
                 Slider(value: $zoomLevel, in: PresentationZoomController.minLevel...PresentationZoomController.maxLevel, step: 0.25)
                     .onChange(of: zoomLevel) { Settings.presentationZoomLevel = $0 }
-                Text("Arming keeps the screen at normal size; the first zoom-in jumps straight to this level. Further presses step ×1.25, zoom out walks back to normal.")
+                Text("Arming keeps the screen at normal size; the first zoom-in jumps straight to this level. Tap to step ×1.25, hold to ramp continuously; zoom out walks back to normal.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

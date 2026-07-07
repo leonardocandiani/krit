@@ -103,16 +103,25 @@ final class HotkeyManager {
 
         KeyboardShortcuts.onKeyDown(for: .captureHistory) { onToggleHistory() }
 
-        // Presentation zoom: toggle engages/dismisses; in/out step the level
-        // and are inert while the zoom is off (they never conjure it).
+        // Presentation zoom: toggle arms/dismisses; in/out drive the level
+        // and are inert while the zoom is off (they never conjure it). Key
+        // down taps a step and opens a possible hold-ramp; key up closes it —
+        // that's what makes press-and-hold zoom continuously while a quick
+        // tap steps once.
         KeyboardShortcuts.onKeyDown(for: .presentationZoom) { [weak presentationZoom] in
             presentationZoom?.toggle()
         }
         KeyboardShortcuts.onKeyDown(for: .presentationZoomIn) { [weak presentationZoom] in
-            presentationZoom?.zoomIn()
+            presentationZoom?.beginZoomIn()
+        }
+        KeyboardShortcuts.onKeyUp(for: .presentationZoomIn) { [weak presentationZoom] in
+            presentationZoom?.endZoomHold()
         }
         KeyboardShortcuts.onKeyDown(for: .presentationZoomOut) { [weak presentationZoom] in
-            presentationZoom?.zoomOut()
+            presentationZoom?.beginZoomOut()
+        }
+        KeyboardShortcuts.onKeyUp(for: .presentationZoomOut) { [weak presentationZoom] in
+            presentationZoom?.endZoomHold()
         }
 
         registerPresets()
