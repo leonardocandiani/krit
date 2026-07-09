@@ -21,101 +21,148 @@ final class HotkeyManager {
     // runs: capture frames the real screen, and the selection chrome sits
     // above the magnifier, so mixing the two makes the shot ambiguous.
     private weak var presentationZoom: PresentationZoomController?
+    // Same reasoning as presentationZoom above: every capture/record/tool
+    // handler also steps live annotation out of interactive drawing mode
+    // first. Unlike the zoom (which tears down completely), this keeps the
+    // ink on screen — a capture taken right after drawing should still show
+    // the marks — it only releases the mouse/keyboard the drawing overlay
+    // was holding.
+    private weak var liveAnnotation: LiveAnnotationController?
 
     // Preset shortcut names we've installed a handler for, so re-registration
     // installs exactly one handler per new preset and clears bindings for deleted
     // ones. KeyboardShortcuts.onKeyDown appends, so we never re-add for the same name.
     private var installedPresetNames: Set<String> = []
 
-    func register(captureEngine: CaptureEngine, historyManager: HistoryManager, presentationZoom: PresentationZoomController, onToggleHistory: @escaping () -> Void) {
+    func register(captureEngine: CaptureEngine, historyManager: HistoryManager, presentationZoom: PresentationZoomController, liveAnnotation: LiveAnnotationController, onToggleHistory: @escaping () -> Void) {
         guard !didInstall else { return }
         didInstall = true
         self.captureEngine = captureEngine
         self.historyManager = historyManager
         self.presentationZoom = presentationZoom
+        self.liveAnnotation = liveAnnotation
 
-        KeyboardShortcuts.onKeyDown(for: .captureArea) { [weak captureEngine, weak historyManager, weak presentationZoom] in
-            guard let e = captureEngine, let h = historyManager else { return }
-            presentationZoom?.exitForCapture()
+        // Split into small installers (below), each with one job, so no
+        // single function accumulates every shortcut's branching.
+        installAreaHandlers()
+        installClipboardHandlers()
+        installSingleEngineHandlers()
+        installOverlayHandlers(onToggleHistory: onToggleHistory)
+
+        registerPresets()
+    }
+
+    /// Handlers that need both the capture engine and history manager and
+    /// land the result in the history list.
+    private func installAreaHandlers() {
+        KeyboardShortcuts.onKeyDown(for: .captureArea) { [weak self] in
+            guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
+            self.dropOverlays()
             AreaSelectionDiag.mark("hotkeyFired")
             Task { await e.startAreaCapture(historyManager: h) }
         }
-
-        KeyboardShortcuts.onKeyDown(for: .captureWindow) { [weak captureEngine, weak historyManager, weak presentationZoom] in
-            guard let e = captureEngine, let h = historyManager else { return }
-            presentationZoom?.exitForCapture()
+        KeyboardShortcuts.onKeyDown(for: .captureWindow) { [weak self] in
+            guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
+            self.dropOverlays()
             Task { await e.startWindowCapture(historyManager: h) }
         }
-
-        KeyboardShortcuts.onKeyDown(for: .captureFullscreen) { [weak captureEngine, weak historyManager, weak presentationZoom] in
-            guard let e = captureEngine, let h = historyManager else { return }
-            presentationZoom?.exitForCapture()
+        KeyboardShortcuts.onKeyDown(for: .captureFullscreen) { [weak self] in
+            guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
+            self.dropOverlays()
             Task { await e.captureFullscreen(historyManager: h) }
         }
-
-        KeyboardShortcuts.onKeyDown(for: .capturePreviousArea) { [weak captureEngine, weak historyManager, weak presentationZoom] in
-            guard let e = captureEngine, let h = historyManager else { return }
-            presentationZoom?.exitForCapture()
+        KeyboardShortcuts.onKeyDown(for: .capturePreviousArea) { [weak self] in
+            guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
+            self.dropOverlays()
             Task { await e.capturePreviousArea(historyManager: h) }
         }
+    }
 
-        KeyboardShortcuts.onKeyDown(for: .allInOne) { [weak captureEngine, weak historyManager, weak presentationZoom] in
-            guard let e = captureEngine, let h = historyManager else { return }
-            presentationZoom?.exitForCapture()
+    /// The remaining "needs engine + history" handlers — split from
+    /// `installAreaHandlers` purely to keep each installer's complexity low,
+    /// not because these are conceptually different.
+    private func installClipboardHandlers() {
+        KeyboardShortcuts.onKeyDown(for: .allInOne) { [weak self] in
+            guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
+            self.dropOverlays()
             Task { await e.startAllInOne(historyManager: h) }
         }
-
-        KeyboardShortcuts.onKeyDown(for: .snapAndPaste) { [weak captureEngine, weak historyManager, weak presentationZoom] in
-            guard let e = captureEngine, let h = historyManager else { return }
-            presentationZoom?.exitForCapture()
+        KeyboardShortcuts.onKeyDown(for: .snapAndPaste) { [weak self] in
+            guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
+            self.dropOverlays()
             Task { await e.startSnapAndPaste(historyManager: h) }
         }
+        KeyboardShortcuts.onKeyDown(for: .scrollingCapture) { [weak self] in
+            guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
+            self.dropOverlays()
+            Task { await e.startScrollingCapture(historyManager: h) }
+        }
+    }
 
-        // Record screen is a toggle, like CleanShot: while a recording is live the
-        // shortcut stops it; otherwise it opens area recording (the primary case).
-        KeyboardShortcuts.onKeyDown(for: .recordScreen) { [weak captureEngine, weak presentationZoom] in
-            guard let e = captureEngine else { return }
+    /// Handlers that only need the capture engine (no history entry).
+    private func installSingleEngineHandlers() {
+        // Record screen is a toggle, like CleanShot: while a recording is live
+        // the shortcut stops it; otherwise it opens area recording (the
+        // primary case).
+        KeyboardShortcuts.onKeyDown(for: .recordScreen) { [weak self] in
+            guard let self, let e = self.captureEngine else { return }
             if e.recordingActive {
                 e.stopRecording()
             } else {
-                presentationZoom?.exitForCapture()
+                self.dropOverlays()
                 Task { await e.startAreaRecording() }
             }
         }
-
-        KeyboardShortcuts.onKeyDown(for: .ocrCapture) { [weak captureEngine, weak presentationZoom] in
-            guard let e = captureEngine else { return }
-            presentationZoom?.exitForCapture()
+        KeyboardShortcuts.onKeyDown(for: .ocrCapture) { [weak self] in
+            guard let self, let e = self.captureEngine else { return }
+            self.dropOverlays()
             Task { await e.startOCRCapture() }
         }
-
-        KeyboardShortcuts.onKeyDown(for: .scrollingCapture) { [weak captureEngine, weak historyManager, weak presentationZoom] in
-            guard let e = captureEngine, let h = historyManager else { return }
-            presentationZoom?.exitForCapture()
-            Task { await e.startScrollingCapture(historyManager: h) }
-        }
-
-        KeyboardShortcuts.onKeyDown(for: .pickColor) { [weak captureEngine, weak presentationZoom] in
-            guard let e = captureEngine else { return }
-            presentationZoom?.exitForCapture()
+        KeyboardShortcuts.onKeyDown(for: .pickColor) { [weak self] in
+            guard let self, let e = self.captureEngine else { return }
+            self.dropOverlays()
             Task { await e.startColorPick() }
         }
+    }
 
+    /// Toggles with no capture engine involved: history panel, presentation
+    /// zoom, and live annotation.
+    private func installOverlayHandlers(onToggleHistory: @escaping () -> Void) {
         KeyboardShortcuts.onKeyDown(for: .captureHistory) { onToggleHistory() }
 
         // Presentation zoom: toggle engages/dismisses; in/out step the level
-        // and are inert while the zoom is off (they never conjure it).
-        KeyboardShortcuts.onKeyDown(for: .presentationZoom) { [weak presentationZoom] in
-            presentationZoom?.toggle()
+        // and are inert while the zoom is off (they never conjure it). No
+        // manual drop of live annotation here — PresentationZoomController's
+        // own engage path steps it out of drawing mode itself (see its
+        // `liveAnnotation` property), the same mutual-exclusion mechanism
+        // this file uses for the reverse direction.
+        KeyboardShortcuts.onKeyDown(for: .presentationZoom) { [weak self] in
+            self?.presentationZoom?.toggle()
         }
-        KeyboardShortcuts.onKeyDown(for: .presentationZoomIn) { [weak presentationZoom] in
-            presentationZoom?.zoomIn()
+        KeyboardShortcuts.onKeyDown(for: .presentationZoomIn) { [weak self] in
+            self?.presentationZoom?.zoomIn()
         }
-        KeyboardShortcuts.onKeyDown(for: .presentationZoomOut) { [weak presentationZoom] in
-            presentationZoom?.zoomOut()
+        KeyboardShortcuts.onKeyDown(for: .presentationZoomOut) { [weak self] in
+            self?.presentationZoom?.zoomOut()
         }
 
-        registerPresets()
+        // Live annotation: same off→drawing→passive→drawing cycle the
+        // toolbar's tool buttons drive. Its own engage path drops the
+        // presentation zoom (see LiveAnnotationController.engage), so no
+        // manual drop here either.
+        KeyboardShortcuts.onKeyDown(for: .liveAnnotation) { [weak self] in
+            self?.liveAnnotation?.toggleDrawMode()
+        }
+    }
+
+    /// Shared prefix for every capture/record/tool handler above: drop the
+    /// presentation zoom (a live magnified frame makes the shot ambiguous) and
+    /// step live annotation out of interactive drawing mode (it releases the
+    /// mouse/keyboard the drawing overlay was holding, but leaves the drawn
+    /// ink on screen — capturing right after drawing should still show it).
+    private func dropOverlays() {
+        presentationZoom?.exitForCapture()
+        liveAnnotation?.exitDrawModeKeepingAnnotations()
     }
 
     /// (Re)wires the dynamic per-preset shortcuts. Re-callable: AppDelegate wires
@@ -145,7 +192,7 @@ final class HotkeyManager {
                       let engine = self.captureEngine,
                       let history = self.historyManager,
                       let live = PresetStore.preset(id: presetID) else { return }
-                self.presentationZoom?.exitForCapture()
+                self.dropOverlays()
                 Task { await engine.runPreset(live, historyManager: history) }
             }
         }

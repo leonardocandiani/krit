@@ -28,6 +28,11 @@ extension KeyboardShortcuts.Name {
     static let presentationZoomIn  = Self("presentationZoomIn")
     static let presentationZoomOut = Self("presentationZoomOut")
 
+    /// Live Screen Annotation toggle. ⌘⇧D as in Draw: the digits next to the
+    /// zoom family are taken (⌘⇧8 arms, ⌘⇧9/0 zoom in/out since #25), and
+    /// ⌘⇧3/4/5/6/7/a/o/s/h/p are the capture family above.
+    static let liveAnnotation      = Self("liveAnnotation",      default: .init(.d,     modifiers: [.command, .shift]))
+
     /// Every rebindable shortcut, in Preferences display order. Used to build the
     /// recorder rows and to reset them all at once. Per-preset shortcuts are
     /// dynamic (see `snapPreset(id:)`) and intentionally excluded here.
@@ -36,6 +41,7 @@ extension KeyboardShortcuts.Name {
         .allInOne, .snapAndPaste, .recordScreen,
         .ocrCapture, .scrollingCapture, .pickColor, .captureHistory,
         .presentationZoom, .presentationZoomIn, .presentationZoomOut,
+        .liveAnnotation,
     ]
 
     /// Dynamic, per-preset global shortcut. The name encodes the preset id so the

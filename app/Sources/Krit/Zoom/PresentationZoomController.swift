@@ -119,6 +119,14 @@ final class PresentationZoomController {
     private var focusXSpring = SpringValue(value: 0)
     private var focusYSpring = SpringValue(value: 0)
 
+    /// Mirrors `LiveAnnotationController.presentationZoom`: the two features
+    /// are both full-screen `.screenSaver`-level overlays, so only one can
+    /// hold the screen at a time. Live annotation drops the zoom in its own
+    /// `engage()`; this is the reverse direction — engaging the zoom steps
+    /// annotation out of interactive drawing (keeping the ink on screen,
+    /// since a zoomed-in look at existing marks is a normal thing to want).
+    weak var liveAnnotation: LiveAnnotationController?
+
     init() {
         // Displays changing resolution/arrangement invalidates the stream, the
         // window frame and the zoom math wholesale; bail out cleanly. The
@@ -183,6 +191,7 @@ final class PresentationZoomController {
     private func start() {
         guard case .idle = state else { return }
         guard let screen = screenUnderCursor() else { return }
+        liveAnnotation?.exitDrawModeKeepingAnnotations()
         state = .starting
         generation += 1
         let gen = generation
