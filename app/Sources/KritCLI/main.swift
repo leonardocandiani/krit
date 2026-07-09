@@ -145,45 +145,52 @@ func send(_ request: [String: Any], to port: CFMessagePort, timeout: CFTimeInter
 func submitAndPoll(_ request: [String: Any], budget: TimeInterval = 30) -> Never {
     let port = connect()
     let deadline = Date().addingTimeInterval(budget)
-
-    func remaining() -> CFTimeInterval { max(0, deadline.timeIntervalSinceNow) }
-    func timeoutOut() -> Never { fail("app did not respond within \(Int(budget))s", code: "timeout") }
+    let firstTimeout = min(5, max(0, deadline.timeIntervalSinceNow))
 
     // Cap each round trip at the smaller of 5s and whatever budget is left.
-    switch send(["cmd": "submit", "request": request], to: port, timeout: min(5, remaining())) {
+    switch send(["cmd": "submit", "request": request], to: port, timeout: firstTimeout) {
     case .timedOut:
-        timeoutOut()
+        fail("app did not respond within \(Int(budget))s", code: "timeout")
     case .wireError(let message):
         fail(message, code: "port_send_failed")
     case .reply(let submitResponse):
-        if (submitResponse["ok"] as? Bool) != true {
+        guard (submitResponse["ok"] as? Bool) == true else {
             fail((submitResponse["error"] as? String) ?? "submit failed",
                  code: (submitResponse["code"] as? String) ?? "submit_failed")
         }
         guard let requestId = submitResponse["requestId"] as? String else {
             fail("submit response missing requestId", code: "bad_response")
         }
-
-        while remaining() > 0 {
-            switch send(["cmd": "poll", "requestId": requestId], to: port, timeout: min(5, remaining())) {
-            case .timedOut:
-                // A slow round trip is not fatal while budget remains; loop and retry.
-                continue
-            case .wireError(let message):
-                fail(message, code: "port_send_failed")
-            case .reply(let pollResponse):
-                if (pollResponse["ok"] as? Bool) != true {
-                    fail((pollResponse["error"] as? String) ?? "command failed",
-                         code: (pollResponse["code"] as? String) ?? "command_failed")
-                }
-                if (pollResponse["done"] as? Bool) == true {
-                    succeed((pollResponse["result"] as? [String: Any]) ?? [:])
-                }
-            }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        timeoutOut()
+        pollUntilDone(requestId: requestId, port: port, deadline: deadline, budget: budget)
     }
+}
+
+/// Polls (200ms interval) until the command completes or `deadline` passes.
+/// Split out of `submitAndPoll` because submit and poll are two distinct phases
+/// of the round trip (one request/reply vs. a retry loop), each with its own
+/// timeout handling.
+func pollUntilDone(requestId: String, port: CFMessagePort, deadline: Date, budget: TimeInterval) -> Never {
+    func remaining() -> CFTimeInterval { max(0, deadline.timeIntervalSinceNow) }
+
+    while remaining() > 0 {
+        switch send(["cmd": "poll", "requestId": requestId], to: port, timeout: min(5, remaining())) {
+        case .timedOut:
+            // A slow round trip is not fatal while budget remains; loop and retry.
+            continue
+        case .wireError(let message):
+            fail(message, code: "port_send_failed")
+        case .reply(let pollResponse):
+            if (pollResponse["ok"] as? Bool) != true {
+                fail((pollResponse["error"] as? String) ?? "command failed",
+                     code: (pollResponse["code"] as? String) ?? "command_failed")
+            }
+            if (pollResponse["done"] as? Bool) == true {
+                succeed((pollResponse["result"] as? [String: Any]) ?? [:])
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+    fail("app did not respond within \(Int(budget))s", code: "timeout")
 }
 
 // MARK: - Subcommands
@@ -260,7 +267,35 @@ func runInspect(_ args: Args) -> Never {
     submitAndPoll(request, budget: 10)
 }
 
-let usage = "usage: krit <capture|annotate|inspect|mcp> [options]"
+// MARK: - ui-snapshot / ui-click / live-annotation / ui-audit
+//
+// These run entirely in-process inside the app (real NSWindow/NSView object graph,
+// no AXUIElement round-trips), so they need no macOS Accessibility permission and
+// are effectively instant: a tight 5s budget is generous.
+
+func runUISnapshot(_ args: Args) -> Never {
+    submitAndPoll(["cmd": "ui_snapshot"], budget: 5)
+}
+
+func runUIClick(_ args: Args) -> Never {
+    guard let id = args.value("id") else {
+        fail("ui-click needs --id <accessibilityIdentifier>", code: "bad_args")
+    }
+    submitAndPoll(["cmd": "ui_click", "id": id], budget: 5)
+}
+
+func runLiveAnnotation(_ args: Args) -> Never {
+    guard let action = args.value("action"), ["toggle", "esc", "state", "seed-ink"].contains(action) else {
+        fail("live-annotation needs --action toggle|esc|state|seed-ink", code: "bad_args")
+    }
+    submitAndPoll(["cmd": "live_annotation", "action": action], budget: 5)
+}
+
+func runUIAudit(_ args: Args) -> Never {
+    submitAndPoll(["cmd": "ui_audit"], budget: 5)
+}
+
+let usage = "usage: krit <capture|annotate|inspect|ui-snapshot|ui-click|live-annotation|ui-audit|mcp> [options]"
 
 // MARK: - Entry
 
@@ -277,6 +312,10 @@ if subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
             "capture --region x,y,w,h [--out path] | --fullscreen [--display N] [--out path]",
             "annotate --in a.png --out b.png --spec '<json>' | --spec-file spec.json",
             "inspect --frontmost | --window <id> | --rect x,y,w,h [--max-depth N] [--screenshot] [--pretty]",
+            "ui-snapshot",
+            "ui-click --id <accessibilityIdentifier>",
+            "live-annotation --action toggle|esc|state|seed-ink",
+            "ui-audit",
             "mcp",
         ],
     ])
@@ -292,6 +331,14 @@ case "annotate":
     runAnnotate(rest)
 case "inspect":
     runInspect(rest)
+case "ui-snapshot":
+    runUISnapshot(rest)
+case "ui-click":
+    runUIClick(rest)
+case "live-annotation":
+    runLiveAnnotation(rest)
+case "ui-audit":
+    runUIAudit(rest)
 case "mcp":
     // Stdio MCP server: reads JSON-RPC over stdin, writes responses on stdout.
     // Runs until EOF; uses its own output path (never the one-shot emit/exit helpers).

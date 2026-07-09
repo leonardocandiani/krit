@@ -12,9 +12,13 @@ final class AutomationService {
     private static let log = Logger(subsystem: "com.krit.app", category: "automation")
 
     private let engine: CaptureEngine
+    /// Weak: the service must never keep the live-annotation feature alive on its
+    /// own, it only reads/drives it when the app has one wired up.
+    private weak var liveAnnotation: LiveAnnotationController?
 
-    init(engine: CaptureEngine) {
+    init(engine: CaptureEngine, liveAnnotation: LiveAnnotationController?) {
         self.engine = engine
+        self.liveAnnotation = liveAnnotation
     }
 
     /// Runs one command and returns its result payload (the object that goes under
@@ -22,13 +26,21 @@ final class AutomationService {
     func execute(_ command: AutomationCommand) async throws -> [String: Any] {
         switch command {
         case .captureRegion(let x, let y, let w, let h, let display):
-            return try await captureRegion(x: x, y: y, w: w, h: h, display: display, explicitOut: nil)
+            return try await captureRegion(rect: CGRect(x: x, y: y, width: w, height: h), display: display, explicitOut: nil)
         case .captureFullscreen(let display):
             return try await captureFullscreen(display: display, explicitOut: nil)
         case .annotate(let input, let output, let spec):
             return try annotate(input: input, output: output, spec: spec)
         case .inspect(let target, let options):
             return try await inspect(target: target, options: options)
+        case .uiSnapshot:
+            return uiSnapshot()
+        case .uiClick(let id):
+            return try uiClick(id: id)
+        case .liveAnnotation(let action):
+            return try runLiveAnnotationAction(action)
+        case .uiAudit:
+            return uiAudit()
         }
     }
 
@@ -37,25 +49,66 @@ final class AutomationService {
     func execute(_ command: AutomationCommand, explicitOutputPath: String?) async throws -> [String: Any] {
         switch command {
         case .captureRegion(let x, let y, let w, let h, let display):
-            return try await captureRegion(x: x, y: y, w: w, h: h, display: display, explicitOut: explicitOutputPath)
+            return try await captureRegion(rect: CGRect(x: x, y: y, width: w, height: h), display: display, explicitOut: explicitOutputPath)
         case .captureFullscreen(let display):
             return try await captureFullscreen(display: display, explicitOut: explicitOutputPath)
         case .annotate(let input, let output, let spec):
             return try annotate(input: input, output: output, spec: spec)
         case .inspect(let target, let options):
             return try await inspect(target: target, options: options)
+        case .uiSnapshot:
+            return uiSnapshot()
+        case .uiClick(let id):
+            return try uiClick(id: id)
+        case .liveAnnotation(let action):
+            return try runLiveAnnotationAction(action)
+        case .uiAudit:
+            return uiAudit()
+        }
+    }
+
+    // MARK: - UI introspection / drive (in-process, no Accessibility permission)
+
+    private func uiSnapshot() -> [String: Any] {
+        ["text": UIIntrospection.snapshot(liveAnnotation: liveAnnotation)]
+    }
+
+    private func uiClick(id: String) throws -> [String: Any] {
+        let result = try UIIntrospection.click(id: id)
+        return ["clicked": result.id, "class": result.className]
+    }
+
+    private func uiAudit() -> [String: Any] {
+        ["text": UIIntrospection.audit()]
+    }
+
+    private func runLiveAnnotationAction(_ action: LiveAnnotationAutomationAction) throws -> [String: Any] {
+        guard let liveAnnotation else { throw AutomationError.liveAnnotationUnavailable }
+        switch action {
+        case .toggle:  liveAnnotation.toggleDrawMode()
+        case .esc:     liveAnnotation.exitDrawModeKeepingAnnotations()
+        case .state:   break
+        case .seedInk: liveAnnotation.seedTestInk()
+        }
+        return ["mode": liveAnnotationModeName(liveAnnotation.mode), "objects": liveAnnotation.annotationObjectCount]
+    }
+
+    private func liveAnnotationModeName(_ mode: LiveAnnotationController.Mode) -> String {
+        switch mode {
+        case .off:     return "off"
+        case .drawing: return "drawing"
+        case .passive: return "passive"
         }
     }
 
     // MARK: - Capture
 
-    private func captureRegion(x: Double, y: Double, w: Double, h: Double, display: Int?, explicitOut: String?) async throws -> [String: Any] {
-        guard w > 0, h > 0 else {
+    private func captureRegion(rect topLeftRect: CGRect, display: Int?, explicitOut: String?) async throws -> [String: Any] {
+        guard topLeftRect.width > 0, topLeftRect.height > 0 else {
             throw AutomationError.malformedRequest("region width and height must be positive")
         }
         // Request is TOP-LEFT origin, global, in points. Pick the screen the rect
         // sits on, then convert to AppKit (bottom-left) for the capture engine.
-        let topLeftRect = CGRect(x: x, y: y, width: w, height: h)
         guard let screen = screenForTopLeftRect(topLeftRect, displayIndex: display) else {
             throw AutomationError.noDisplay
         }
@@ -106,14 +159,31 @@ final class AutomationService {
         var limits = AXInspector.Limits()
         if let maxDepth = options.maxDepth, maxDepth > 0 { limits.maxDepth = maxDepth }
 
-        // The AX traversal is synchronous and can block on slow/unresponsive targets.
-        // Running it inline on this @MainActor method would freeze the main run loop,
-        // which is exactly the loop that serves the automation port: the CLI's `poll`
-        // round trips would never get answered and the client would hang mutely.
-        // Hop off-main so the run loop stays free to reply (AX APIs are thread-safe).
-        let tree: AXInspector.Tree
+        let tree = try await resolveAXTree(target: target, limits: limits)
+        var result = tree.toDictionary()
+        result["timestamp"] = Self.iso8601Timestamp()
+
+        // Combo: for a rect target, optionally also grab the pixels so an agent gets
+        // semantics + image in one round trip. Capture failure is non-fatal here, the
+        // tree is the primary product, so we surface a hint instead of throwing.
+        if options.includeScreenshot, case .rect(let x, let y, let w, let h) = target {
+            if let shot = await captureRegionBase64(x: x, y: y, w: w, h: h) {
+                result["screenshot"] = shot
+            } else {
+                result["screenshotError"] = "capture failed (check Screen Recording permission)"
+            }
+        }
+        return result
+    }
+
+    /// The AX traversal is synchronous and can block on slow/unresponsive targets.
+    /// Running it inline on this @MainActor method would freeze the main run loop,
+    /// which is exactly the loop that serves the automation port: the CLI's `poll`
+    /// round trips would never get answered and the client would hang mutely.
+    /// Hop off-main so the run loop stays free to reply (AX APIs are thread-safe).
+    private func resolveAXTree(target: InspectTarget, limits: AXInspector.Limits) async throws -> AXInspector.Tree {
         do {
-            tree = try await Task.detached(priority: .userInitiated) {
+            return try await Task.detached(priority: .userInitiated) {
                 switch target {
                 case .frontmost:
                     return try AXInspector.inspectFrontmost(limits: limits)
@@ -129,21 +199,6 @@ final class AutomationService {
             case .noTarget:    throw AutomationError.inspectFailed(error.message)
             }
         }
-
-        var result = tree.toDictionary()
-        result["timestamp"] = Self.iso8601Timestamp()
-
-        // Combo: for a rect target, optionally also grab the pixels so an agent gets
-        // semantics + image in one round trip. Capture failure is non-fatal here, the
-        // tree is the primary product, so we surface a hint instead of throwing.
-        if options.includeScreenshot, case .rect(let x, let y, let w, let h) = target {
-            if let shot = await captureRegionBase64(x: x, y: y, w: w, h: h) {
-                result["screenshot"] = shot
-            } else {
-                result["screenshotError"] = "capture failed (check Screen Recording permission)"
-            }
-        }
-        return result
     }
 
     /// Captures a top-left global rect and returns a base64 PNG plus its pixel size,

@@ -23,14 +23,30 @@ enum AutomationCommand {
     case captureFullscreen(display: Int?)
     case annotate(input: String, output: String, spec: [AnnotationSpec])
     case inspect(InspectTarget, options: InspectOptions)
+    case uiSnapshot
+    case uiClick(id: String)
+    case liveAnnotation(action: LiveAnnotationAutomationAction)
+    case uiAudit
 
     /// Where, if specified, the result PNG should be written.
     var outputPath: String? {
         switch self {
-        case .captureRegion, .captureFullscreen, .inspect: return nil
+        case .captureRegion, .captureFullscreen, .inspect,
+             .uiSnapshot, .uiClick, .liveAnnotation, .uiAudit: return nil
         case .annotate(_, let output, _):                  return output
         }
     }
+}
+
+/// `live_annotation` command actions: `toggle`/`esc` mirror the hotkey and Esc-key
+/// entry points on `LiveAnnotationController`, `state` is a read-only probe.
+enum LiveAnnotationAutomationAction: String {
+    case toggle
+    case esc
+    case state
+    /// Test/automation hook: appends one deterministic freehand stroke so
+    /// headless flows can exercise ink-dependent states without mouse input.
+    case seedInk = "seed-ink"
 }
 
 // MARK: - Inspect (AX X-Ray)
@@ -82,6 +98,8 @@ enum AutomationError: Error {
     case render(String)
     case accessibilityDenied(String)
     case inspectFailed(String)
+    case uiTargetNotFound(String)
+    case liveAnnotationUnavailable
 
     var code: String {
         switch self {
@@ -93,6 +111,8 @@ enum AutomationError: Error {
         case .render:               return "render_error"
         case .accessibilityDenied:  return "accessibility_denied"
         case .inspectFailed:        return "inspect_failed"
+        case .uiTargetNotFound:     return "ui_target_not_found"
+        case .liveAnnotationUnavailable: return "live_annotation_unavailable"
         }
     }
 
@@ -106,6 +126,8 @@ enum AutomationError: Error {
         case .render(let s):           return "render failed: \(s)"
         case .accessibilityDenied(let s): return s
         case .inspectFailed(let s):    return "inspect failed: \(s)"
+        case .uiTargetNotFound(let s): return s
+        case .liveAnnotationUnavailable: return "live annotation controller is not available"
         }
     }
 }
@@ -133,15 +155,7 @@ enum AutomationJSON {
             return .captureFullscreen(display: intField(object, "display"))
 
         case "annotate":
-            guard let input = object["input"] as? String else {
-                throw AutomationError.malformedRequest("annotate: missing 'input'")
-            }
-            guard let output = object["output"] as? String else {
-                throw AutomationError.malformedRequest("annotate: missing 'output'")
-            }
-            let rawSpec = object["spec"] as? [[String: Any]] ?? []
-            let spec = try rawSpec.map { try parseSpec($0) }
-            return .annotate(input: input, output: output, spec: spec)
+            return try parseAnnotate(object)
 
         case "inspect":
             let target = try parseInspectTarget(object)
@@ -151,9 +165,48 @@ enum AutomationJSON {
             )
             return .inspect(target, options: options)
 
+        case "ui_snapshot":
+            return .uiSnapshot
+
+        case "ui_click":
+            return try parseUIClick(object)
+
+        case "live_annotation":
+            return try parseLiveAnnotation(object)
+
+        case "ui_audit":
+            return .uiAudit
+
         default:
             throw AutomationError.unknownCommand(cmd)
         }
+    }
+
+    private static func parseAnnotate(_ object: [String: Any]) throws -> AutomationCommand {
+        guard let input = object["input"] as? String else {
+            throw AutomationError.malformedRequest("annotate: missing 'input'")
+        }
+        guard let output = object["output"] as? String else {
+            throw AutomationError.malformedRequest("annotate: missing 'output'")
+        }
+        let rawSpec = object["spec"] as? [[String: Any]] ?? []
+        let spec = try rawSpec.map { try parseSpec($0) }
+        return .annotate(input: input, output: output, spec: spec)
+    }
+
+    private static func parseUIClick(_ object: [String: Any]) throws -> AutomationCommand {
+        guard let id = object["id"] as? String, !id.isEmpty else {
+            throw AutomationError.malformedRequest("ui_click: missing 'id'")
+        }
+        return .uiClick(id: id)
+    }
+
+    private static func parseLiveAnnotation(_ object: [String: Any]) throws -> AutomationCommand {
+        guard let rawAction = object["action"] as? String,
+              let action = LiveAnnotationAutomationAction(rawValue: rawAction) else {
+            throw AutomationError.malformedRequest("live_annotation: 'action' must be one of toggle|esc|state")
+        }
+        return .liveAnnotation(action: action)
     }
 
     /// Target precedence: explicit rect, then windowId, then frontmost. A rect needs
@@ -186,65 +239,94 @@ enum AutomationJSON {
         }
         let color = (object["color"] as? String).flatMap { NSColor(hex: $0) }
         let width = (object["width"] as? NSNumber).map { CGFloat(truncating: $0) }
+        let kind = try parseKind(type, object)
+        return AnnotationSpec(kind: kind, color: color, width: width)
+    }
 
-        func point(_ key: String) throws -> CGPoint {
-            guard let arr = object[key] as? [Any], arr.count == 2,
-                  let px = (arr[0] as? NSNumber)?.doubleValue,
-                  let py = (arr[1] as? NSNumber)?.doubleValue else {
-                throw AutomationError.malformedRequest("\(type): '\(key)' must be [x,y]")
-            }
-            return CGPoint(x: px, y: py)
-        }
-        func rect(_ key: String) throws -> CGRect {
-            guard let arr = object[key] as? [Any], arr.count == 4,
-                  let rx = (arr[0] as? NSNumber)?.doubleValue,
-                  let ry = (arr[1] as? NSNumber)?.doubleValue,
-                  let rw = (arr[2] as? NSNumber)?.doubleValue,
-                  let rh = (arr[3] as? NSNumber)?.doubleValue else {
-                throw AutomationError.malformedRequest("\(type): '\(key)' must be [x,y,w,h]")
-            }
-            return CGRect(x: rx, y: ry, width: rw, height: rh)
-        }
-
-        let kind: AnnotationSpec.Kind
+    /// Dispatches by field family: two-point kinds, rect kinds, then the two
+    /// one-off shapes (text carries a string, step carries a number) that don't
+    /// share a shape with anything else.
+    private static func parseKind(_ type: String, _ object: [String: Any]) throws -> AnnotationSpec.Kind {
+        if let kind = try parsePointKind(type, object) { return kind }
+        if let kind = try parseRectKind(type, object) { return kind }
         switch type {
-        case "arrow":
-            let curve: CGPoint? = {
-                guard let arr = object["curve"] as? [Any], arr.count == 2,
-                      let cx = (arr[0] as? NSNumber)?.doubleValue,
-                      let cy = (arr[1] as? NSNumber)?.doubleValue else { return nil }
-                return CGPoint(x: cx, y: cy)
-            }()
-            kind = .arrow(from: try point("from"), to: try point("to"), curve: curve)
-        case "box":
-            kind = .box(rect: try rect("rect"), fill: (object["fill"] as? Bool) ?? false)
-        case "ellipse":
-            kind = .ellipse(rect: try rect("rect"))
-        case "line":
-            kind = .line(from: try point("from"), to: try point("to"))
         case "text":
             guard let text = object["text"] as? String else {
                 throw AutomationError.malformedRequest("text: missing 'text'")
             }
             let size = (object["size"] as? NSNumber).map { CGFloat(truncating: $0) }
-            kind = .text(at: try point("at"), text: text, size: size)
+            return .text(at: try point(object, "at", type: type), text: text, size: size)
         case "step":
             guard let number = (object["number"] as? NSNumber)?.intValue else {
                 throw AutomationError.malformedRequest("step: missing 'number'")
             }
-            kind = .step(at: try point("at"), number: number)
-        case "highlight":
-            kind = .highlight(from: try point("from"), to: try point("to"))
-        case "blur":
-            let radius = (object["radius"] as? NSNumber)?.doubleValue ?? 12
-            kind = .blur(rect: try rect("rect"), radius: radius)
-        case "pixelate":
-            let scale = (object["scale"] as? NSNumber)?.doubleValue ?? 10
-            kind = .pixelate(rect: try rect("rect"), scale: scale)
+            return .step(at: try point(object, "at", type: type), number: number)
         default:
             throw AutomationError.malformedRequest("unknown spec type: \(type)")
         }
-        return AnnotationSpec(kind: kind, color: color, width: width)
+    }
+
+    /// Kinds built from one or two points. Returns nil (not an error) when `type`
+    /// isn't one of these, so the caller can fall through to the next family.
+    private static func parsePointKind(_ type: String, _ object: [String: Any]) throws -> AnnotationSpec.Kind? {
+        switch type {
+        case "arrow":
+            let curve = parseOptionalPoint(object, "curve")
+            return .arrow(from: try point(object, "from", type: type), to: try point(object, "to", type: type), curve: curve)
+        case "line":
+            return .line(from: try point(object, "from", type: type), to: try point(object, "to", type: type))
+        case "highlight":
+            return .highlight(from: try point(object, "from", type: type), to: try point(object, "to", type: type))
+        default:
+            return nil
+        }
+    }
+
+    /// Kinds built from a rect, with an optional extra numeric knob. Returns nil
+    /// when `type` isn't one of these.
+    private static func parseRectKind(_ type: String, _ object: [String: Any]) throws -> AnnotationSpec.Kind? {
+        switch type {
+        case "box":
+            return .box(rect: try rect(object, "rect", type: type), fill: (object["fill"] as? Bool) ?? false)
+        case "ellipse":
+            return .ellipse(rect: try rect(object, "rect", type: type))
+        case "blur":
+            let radius = (object["radius"] as? NSNumber)?.doubleValue ?? 12
+            return .blur(rect: try rect(object, "rect", type: type), radius: radius)
+        case "pixelate":
+            let scale = (object["scale"] as? NSNumber)?.doubleValue ?? 10
+            return .pixelate(rect: try rect(object, "rect", type: type), scale: scale)
+        default:
+            return nil
+        }
+    }
+
+    private static func point(_ object: [String: Any], _ key: String, type: String) throws -> CGPoint {
+        guard let arr = object[key] as? [Any], arr.count == 2,
+              let px = (arr[0] as? NSNumber)?.doubleValue,
+              let py = (arr[1] as? NSNumber)?.doubleValue else {
+            throw AutomationError.malformedRequest("\(type): '\(key)' must be [x,y]")
+        }
+        return CGPoint(x: px, y: py)
+    }
+
+    private static func rect(_ object: [String: Any], _ key: String, type: String) throws -> CGRect {
+        guard let arr = object[key] as? [Any], arr.count == 4,
+              let rx = (arr[0] as? NSNumber)?.doubleValue,
+              let ry = (arr[1] as? NSNumber)?.doubleValue,
+              let rw = (arr[2] as? NSNumber)?.doubleValue,
+              let rh = (arr[3] as? NSNumber)?.doubleValue else {
+            throw AutomationError.malformedRequest("\(type): '\(key)' must be [x,y,w,h]")
+        }
+        return CGRect(x: rx, y: ry, width: rw, height: rh)
+    }
+
+    /// `curve` is optional and absent/malformed simply means "no curve" (no error).
+    private static func parseOptionalPoint(_ object: [String: Any], _ key: String) -> CGPoint? {
+        guard let arr = object[key] as? [Any], arr.count == 2,
+              let cx = (arr[0] as? NSNumber)?.doubleValue,
+              let cy = (arr[1] as? NSNumber)?.doubleValue else { return nil }
+        return CGPoint(x: cx, y: cy)
     }
 
     private static func doubleField(_ object: [String: Any], _ key: String) throws -> Double {
