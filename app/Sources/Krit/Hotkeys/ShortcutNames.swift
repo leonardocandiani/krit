@@ -19,14 +19,16 @@ extension KeyboardShortcuts.Name {
     // system or app shortcut out of the box. Bind it in Preferences > Shortcuts.
     static let pickColor           = Self("pickColor")
 
-    /// Live presentation zoom toggle. ⌘⇧8 sits next to the capture family and
-    /// is free of system collisions out of the box.
+    /// Arms/disarms presentation zoom. Arming leaves the screen at 1x — the
+    /// in/out shortcuts below do the actual zooming, so they ship with
+    /// defaults too (an armed mode nobody can zoom is useless). The trio sits
+    /// on the contiguous ⌘⇧8/9/0 row: arm, zoom in, zoom out. Deliberately
+    /// NOT ⌘⇧= for zoom-in: on a US layout that is the physical ⌘+ every app
+    /// maps to "Zoom In", and a global hotkey would steal it system-wide even
+    /// while the mode is idle.
     static let presentationZoom    = Self("presentationZoom",    default: .init(.eight, modifiers: [.command, .shift]))
-    // No defaults: stepping the level mid-presentation is opt-in, like the
-    // eyedropper. The toggle alone is fully usable (it engages at the
-    // remembered level).
-    static let presentationZoomIn  = Self("presentationZoomIn")
-    static let presentationZoomOut = Self("presentationZoomOut")
+    static let presentationZoomIn  = Self("presentationZoomIn",  default: .init(.nine,  modifiers: [.command, .shift]))
+    static let presentationZoomOut = Self("presentationZoomOut", default: .init(.zero,  modifiers: [.command, .shift]))
 
     /// Live Screen Annotation toggle. ⌘⇧D as in Draw: the digits next to the
     /// zoom family are taken (⌘⇧8 arms, ⌘⇧9/0 zoom in/out since #25), and

@@ -1,6 +1,7 @@
 import AppKit
 import CoreMedia
 import CoreVideo
+import KeyboardShortcuts
 import QuartzCore
 import ScreenCaptureKit
 
@@ -31,8 +32,14 @@ enum PresentationZoomFeel: String, CaseIterable, Identifiable {
 
 /// Live presentation zoom: magnifies the whole screen in real time around the
 /// cursor, ZoomIt-style, so presenters can lean into a detail without touching
-/// the app they are demoing. Toggled by a global shortcut; while active the
-/// zoom-in/out shortcuts step the magnification.
+/// the app they are demoing. The global shortcut ARMS the mode without
+/// changing anything on screen: the overlay sits at exactly 1x (a live,
+/// pixel-identical pass-through) until the zoom-in shortcut is pressed. The
+/// first press jumps to the preferred level from Preferences, further presses
+/// step ×1.25, and zoom-out walks back down to 1x while staying armed, so a
+/// presenter can dive in and out repeatedly. HOLDING either zoom key ramps
+/// the level continuously (a tap steps, a hold glides) until the key is
+/// released. Toggling again glides out and removes the overlay.
 ///
 /// How it works: a borderless window covers the screen and shows a LIVE
 /// ScreenCaptureKit stream of that same screen, scaled around the cursor. The
@@ -82,6 +89,19 @@ final class PresentationZoomController {
     /// Smoothing tick. 120 Hz so the glide stays fluid on ProMotion displays;
     /// on 60 Hz panels the extra ticks are coalesced by the compositor.
     private static let tickInterval: TimeInterval = 1.0 / 120.0
+    /// Holding a zoom key past this long turns the press into a continuous
+    /// ramp; releasing earlier leaves it a discrete tap-step. Sits above the
+    /// system's key-repeat delay floor so a quick tap never ramps.
+    private static let holdRampThreshold: TimeInterval = 0.30
+    /// Multiplicative level change per second while a zoom key is held. 1.8×
+    /// per second reads as a deliberate, controllable glide (the spring adds
+    /// its own easing on top).
+    private static let holdRampFactorPerSecond: Double = 1.8
+    /// Safety cap on a single ramp. Carbon's hot-key RELEASED event can be
+    /// lost (modifier released before the key, Cmd-Tab mid-hold), which would
+    /// leave the ramp running to 6x on its own; 4 s comfortably covers the
+    /// full 1x→6x sweep (~3 s at 1.8×/s) and then stops a ghost hold.
+    private static let holdRampMaxDuration: TimeInterval = 4.0
     /// The cursor-follow pan always answers a touch faster than the zoom, so
     /// tracking feels attached to the hand while level changes stay weighty.
     private static let panResponseFactor: Double = 0.6
@@ -118,6 +138,16 @@ final class PresentationZoomController {
     private var zoomSpring = SpringValue(value: 1.0)
     private var focusXSpring = SpringValue(value: 0)
     private var focusYSpring = SpringValue(value: 0)
+    /// The magnification this armed session is aiming at. Arms at 1.0 (screen
+    /// unchanged); the zoom shortcuts drive it. Not persisted — the preferred
+    /// level in Settings is where the FIRST zoom-in jumps, set by the
+    /// Preferences slider.
+    private var sessionLevel: Double = 1.0
+    /// +1 while zoom-in is held, −1 for zoom-out, 0 when neither. Set on key
+    /// down, cleared on key up; past `holdRampThreshold` the tick ramps
+    /// `sessionLevel` continuously in this direction.
+    private var holdDirection: Double = 0
+    private var holdBeganAt: CFTimeInterval = 0
 
     /// Mirrors `LiveAnnotationController.presentationZoom`: the two features
     /// are both full-screen `.screenSaver`-level overlays, so only one can
@@ -162,18 +192,46 @@ final class PresentationZoomController {
         }
     }
 
-    /// Steps magnification while active. Ignored when idle so the (optional)
-    /// bindings never conjure the overlay by themselves. Writes straight to
-    /// Settings: the tick reads the level every pass (that's also what makes
-    /// the Preferences level slider adjust a live zoom), and the value is
-    /// remembered so the next activation engages where the presenter last
-    /// liked it.
-    func zoomIn()  { step(by: Self.levelStep) }
-    func zoomOut() { step(by: 1.0 / Self.levelStep) }
-
-    private func step(by factor: Double) {
+    /// Zoom shortcuts drive the armed session's level; they are inert while
+    /// the mode is off, so they never conjure the overlay by themselves.
+    /// A TAP steps discretely; a HOLD ramps continuously until key-up (the
+    /// tick applies the ramp past `holdRampThreshold`). Key-down lands here;
+    /// key-up in `endZoomHold()`. The same-direction guard is defensive
+    /// idempotency: Carbon fires hot-key-pressed once per physical press (no
+    /// auto-repeat), but if a duplicate delivery ever happened it would pile
+    /// a discrete step on top of a live ramp, so it is swallowed.
+    func beginZoomIn() {
         guard case .active = state else { return }
-        Settings.presentationZoomLevel = Settings.presentationZoomLevel * factor
+        guard holdDirection != 1 else { return }
+        // From the armed 1x, the first zoom-in jumps straight to the
+        // preferred level (the Preferences slider) — one keypress and the
+        // presenter is at their favorite magnification; further taps ×1.25.
+        if sessionLevel < Self.minLevel {
+            sessionLevel = Settings.presentationZoomLevel
+        } else {
+            sessionLevel = min(sessionLevel * Self.levelStep, Self.maxLevel)
+        }
+        holdDirection = 1
+        holdBeganAt = CACurrentMediaTime()
+    }
+
+    /// Steps back down; below the minimum magnified level a tap lands on
+    /// exactly 1x — screen back to normal, mode still armed for the next dive.
+    func beginZoomOut() {
+        guard case .active = state else { return }
+        guard holdDirection != -1 else { return }
+        let next = sessionLevel / Self.levelStep
+        sessionLevel = next < Self.minLevel ? 1.0 : next
+        holdDirection = -1
+        holdBeganAt = CACurrentMediaTime()
+    }
+
+    /// Key-up for either zoom key: stops a running ramp. Always safe to call.
+    /// The hold is one scalar shared by both keys ON PURPOSE: chording in+out
+    /// is last-press-wins and first-release-stops, which errs on the side of
+    /// halting motion — a presenter never wants a ramp they aren't driving.
+    func endZoomHold() {
+        holdDirection = 0
     }
 
     /// Drops the zoom instantly when a KRIT capture or recording begins: the
@@ -299,12 +357,20 @@ final class PresentationZoomController {
         if awaitingFirstFrame {
             awaitingFirstFrame = false
             state = .active
+            sessionLevel = 1.0
             zoomSpring.snap(to: 1.0)
             let focus = localFocus(for: NSEvent.mouseLocation)
             focusXSpring.snap(to: focus.x)
             focusYSpring.snap(to: focus.y)
             lastTick = CACurrentMediaTime()
             startTicking()
+            // Arming leaves the screen pixel-identical, so confirm it worked
+            // and point at the key that actually zooms.
+            if let shortcut = KeyboardShortcuts.getShortcut(for: .presentationZoomIn) {
+                ToastWindow.show(message: "Presentation zoom on — press \(shortcut) to zoom in", icon: "plus.magnifyingglass")
+            } else {
+                ToastWindow.show(message: "Presentation zoom on — bind Zoom in under Preferences ▸ Shortcuts", icon: "plus.magnifyingglass")
+            }
         }
         currentFrame = pixelBuffer
         guard let layer = contentLayer else { return }
@@ -384,9 +450,9 @@ final class PresentationZoomController {
         let dt = min(max(now - lastTick, 0), 1.0 / 30.0)
         lastTick = now
 
-        // Motion parameters are read EVERY tick so the Preferences slider,
-        // feel picker and level slider all steer a live zoom in real time,
-        // and the zoom in/out shortcuts only have to write Settings.
+        // Motion parameters are read EVERY tick so the Preferences smoothing
+        // slider and feel picker steer a live zoom in real time; the zoom
+        // target is the armed session's level, driven by the shortcuts.
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let zoomResponse = Self.responseTime(forSmoothness: Settings.presentationZoomSmoothness)
         // Only the engaged zoom gets the chosen feel. The glide-out is always
@@ -397,7 +463,21 @@ final class PresentationZoomController {
         if case .active = state, !reduceMotion {
             zoomDamping = Settings.presentationZoomFeel.dampingRatio
         }
-        let zoomTarget: Double = { if case .active = state { return Settings.presentationZoomLevel } else { return 1.0 } }()
+        // A zoom key held past the threshold ramps the level continuously —
+        // multiplicative so it feels even at every magnification — and the
+        // spring below turns the ramp into the actual on-screen glide. The
+        // ramp floor is exactly 1x, so holding zoom-out settles the screen
+        // back to normal while staying armed.
+        if holdDirection != 0, now - holdBeganAt > Self.holdRampThreshold + Self.holdRampMaxDuration {
+            // Ghost hold: the release event never arrived (lost Carbon
+            // key-up). Stop the ramp rather than let it run unattended.
+            holdDirection = 0
+        }
+        if case .active = state, holdDirection != 0, now - holdBeganAt > Self.holdRampThreshold {
+            let factor = pow(Self.holdRampFactorPerSecond, dt * holdDirection)
+            sessionLevel = min(max(sessionLevel * factor, 1.0), Self.maxLevel)
+        }
+        let zoomTarget: Double = { if case .active = state { return sessionLevel } else { return 1.0 } }()
         // A springy step DOWN toward the floor can undershoot below 1x; the
         // render clamp would hold flat at 1x and pop back up — a stutter, not
         // a bounce. When the predicted first undershoot crosses 1x, damp that
@@ -490,6 +570,8 @@ final class PresentationZoomController {
         window = nil
         contentLayer = nil
         currentFrame = nil
+        sessionLevel = 1.0
+        holdDirection = 0
         zoomSpring.snap(to: 1.0)
     }
 

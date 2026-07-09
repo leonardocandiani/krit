@@ -130,20 +130,28 @@ final class HotkeyManager {
     private func installOverlayHandlers(onToggleHistory: @escaping () -> Void) {
         KeyboardShortcuts.onKeyDown(for: .captureHistory) { onToggleHistory() }
 
-        // Presentation zoom: toggle engages/dismisses; in/out step the level
-        // and are inert while the zoom is off (they never conjure it). No
-        // manual drop of live annotation here — PresentationZoomController's
-        // own engage path steps it out of drawing mode itself (see its
-        // `liveAnnotation` property), the same mutual-exclusion mechanism
-        // this file uses for the reverse direction.
+        // Presentation zoom: toggle arms/dismisses; in/out drive the level
+        // and are inert while the zoom is off (they never conjure it). Key
+        // down taps a step and opens a possible hold-ramp; key up closes it —
+        // that's what makes press-and-hold zoom continuously while a quick
+        // tap steps once. No manual drop of live annotation here:
+        // PresentationZoomController's own engage path steps it out of
+        // drawing mode itself (see its `liveAnnotation` property), the same
+        // mutual-exclusion mechanism this file uses for the reverse direction.
         KeyboardShortcuts.onKeyDown(for: .presentationZoom) { [weak self] in
             self?.presentationZoom?.toggle()
         }
         KeyboardShortcuts.onKeyDown(for: .presentationZoomIn) { [weak self] in
-            self?.presentationZoom?.zoomIn()
+            self?.presentationZoom?.beginZoomIn()
+        }
+        KeyboardShortcuts.onKeyUp(for: .presentationZoomIn) { [weak self] in
+            self?.presentationZoom?.endZoomHold()
         }
         KeyboardShortcuts.onKeyDown(for: .presentationZoomOut) { [weak self] in
-            self?.presentationZoom?.zoomOut()
+            self?.presentationZoom?.beginZoomOut()
+        }
+        KeyboardShortcuts.onKeyUp(for: .presentationZoomOut) { [weak self] in
+            self?.presentationZoom?.endZoomHold()
         }
 
         // Live annotation: same off→drawing→passive→drawing cycle the
