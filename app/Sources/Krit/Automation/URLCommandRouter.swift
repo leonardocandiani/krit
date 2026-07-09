@@ -54,6 +54,15 @@ enum URLCommandRouter {
     static func handle(_ url: URL, appDelegate: AppDelegate) -> Bool {
         guard url.scheme?.lowercased() == scheme else { return false }
 
+        // The scheme drives the same privacy-sensitive capture/record engine any
+        // web page or app could reach with `open krit://…`, so it stays behind the
+        // same opt-in as the automation port. Refused (but claimed) when off, so a
+        // malformed automation URL still never falls through to the file-open path.
+        guard AutomationGate.isEnabled else {
+            log.error("krit:// received but automation is disabled; enable it in Preferences ▸ General to allow URL commands")
+            return true
+        }
+
         let verb = (url.host ?? "").lowercased()
         // First non-empty path component is the action; the rest is reserved.
         let action = url.pathComponents.first(where: { $0 != "/" })?.lowercased() ?? ""

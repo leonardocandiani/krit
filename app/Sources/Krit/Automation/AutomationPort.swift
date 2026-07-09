@@ -2,6 +2,31 @@ import Foundation
 import AppKit
 import os
 
+/// Single source of truth for whether KRIT's scriptable surface is live. Both the
+/// CFMessagePort automation server and the `krit://` URL scheme consult this, so
+/// there is exactly one place that decides "is automation allowed right now".
+///
+/// A default install answers `false`: the port never binds and `krit://` URLs are
+/// refused, so no local process can drive capture / AX / file writes through KRIT.
+/// The user opts in with `Settings.automationEnabled`; the UI-test harness opts in
+/// with `KRIT_UI_TEST=1` (which already gates the rest of the test IPC), so tests
+/// keep working without flipping a persisted user pref.
+enum AutomationGate {
+    static var isEnabled: Bool {
+        decide(
+            envTestMode: ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1",
+            prefEnabled: Settings.automationEnabled
+        )
+    }
+
+    /// Pure decision, split out so the security-critical rule can be tested against
+    /// explicit inputs (the live `isEnabled` always reads true under the test
+    /// harness, which sets `KRIT_UI_TEST`, so the OFF path is untestable through it).
+    static func decide(envTestMode: Bool, prefEnabled: Bool) -> Bool {
+        envTestMode || prefEnabled
+    }
+}
+
 /// Hosts the local CFMessagePort ("com.krit.app.automation") and bridges its
 /// synchronous C callback to the async `AutomationService`.
 ///
@@ -32,6 +57,11 @@ final class AutomationPort {
         case failed(code: String, message: String)
     }
     private var jobs: [String: Pending] = [:]
+    /// Insertion order for `jobs`, so a client that submits and never polls can't
+    /// grow the table without bound. Results are normally freed on poll; this caps
+    /// the abandoned ones by evicting the oldest once the table is full.
+    private var jobOrder: [String] = []
+    private static let maxRetainedJobs = 256
 
     init(service: AutomationService) {
         self.service = service
@@ -130,21 +160,36 @@ final class AutomationPort {
 
         let explicitOut = requestObject["path"] as? String
         let requestId = UUID().uuidString
-        jobs[requestId] = .running
+        recordJob(requestId, .running)
 
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Only overwrite a job still known to the table: if it was evicted by
+            // the cap while running, don't resurrect a stale entry.
+            let outcome: Pending
             do {
                 let result = try await self.service.execute(command, explicitOutputPath: explicitOut)
-                self.jobs[requestId] = .done(result)
+                outcome = .done(result)
             } catch let error as AutomationError {
-                self.jobs[requestId] = .failed(code: error.code, message: error.message)
+                outcome = .failed(code: error.code, message: error.message)
             } catch {
-                self.jobs[requestId] = .failed(code: "internal_error", message: error.localizedDescription)
+                outcome = .failed(code: "internal_error", message: error.localizedDescription)
             }
+            if self.jobs[requestId] != nil { self.jobs[requestId] = outcome }
         }
 
         return Self.encode(["ok": true, "requestId": requestId])
+    }
+
+    /// Inserts a job and enforces the retention cap by evicting the oldest entries
+    /// (FIFO) once the table is full, so an unpolled client can't leak memory.
+    private func recordJob(_ id: String, _ state: Pending) {
+        jobs[id] = state
+        jobOrder.append(id)
+        while jobOrder.count > Self.maxRetainedJobs {
+            let evicted = jobOrder.removeFirst()
+            jobs[evicted] = nil
+        }
     }
 
     private func handlePoll(_ object: [String: Any]) -> Data {

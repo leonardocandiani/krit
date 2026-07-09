@@ -47,8 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         captureTrigger = CaptureTrigger(engine: captureEngine)
         uiTestRunner = UITestRunner()
-        let port = AutomationPort(service: AutomationService(engine: captureEngine, liveAnnotation: liveAnnotation))
-        if port.start() { automationPort = port }
+        refreshAutomationPort()
         setupStatusItem()
         registerHotkeys()
         // Arms Sparkle's scheduled background update checks (the shared instance
@@ -87,6 +86,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
             WhatsNewWindowController.showIfNeeded()
         }
+    }
+
+    /// Brings the automation port up or down to match the current gate
+    /// (`Settings.automationEnabled` or the test env). Called at launch and again
+    /// whenever the Preferences toggle flips, so enabling automation takes effect
+    /// without a relaunch and disabling it tears the port down immediately.
+    func refreshAutomationPort() {
+        guard AutomationGate.isEnabled else {
+            automationPort?.stop()
+            automationPort = nil
+            return
+        }
+        guard automationPort == nil else { return }
+        let port = AutomationPort(service: AutomationService(engine: captureEngine, liveAnnotation: liveAnnotation))
+        if port.start() { automationPort = port }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

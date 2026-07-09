@@ -204,7 +204,7 @@ enum AutomationJSON {
     private static func parseLiveAnnotation(_ object: [String: Any]) throws -> AutomationCommand {
         guard let rawAction = object["action"] as? String,
               let action = LiveAnnotationAutomationAction(rawValue: rawAction) else {
-            throw AutomationError.malformedRequest("live_annotation: 'action' must be one of toggle|esc|state")
+            throw AutomationError.malformedRequest("live_annotation: 'action' must be one of toggle|esc|state|seed-ink")
         }
         return .liveAnnotation(action: action)
     }

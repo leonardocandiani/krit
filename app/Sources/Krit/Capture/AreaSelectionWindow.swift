@@ -27,6 +27,13 @@ final class AreaSelectionWindow: NSObject {
     /// lazily from the overlays there always came back nil and the engine fell to
     /// the live re-grab, the fast path was dead. One-shot: consumed on first read.
     private var pendingFrozenCrop: NSImage?
+    /// The app that was frontmost before `prepareAndShow` activated KRIT to raise
+    /// the overlay. On cancel we hand activation straight back to it: leaving KRIT
+    /// "active but .prohibited" (what `tearDown` does with nothing left on screen)
+    /// made macOS throttle KRIT's NEXT activation, so re-pressing the capture
+    /// hotkey right after Esc felt laggy and the overlay barely held focus. Nil
+    /// when KRIT itself was already frontmost, so we never steal focus back to it.
+    private weak var appToRestoreOnCancel: NSRunningApplication?
 
     init(mode: SelectionMode, completion: @escaping Completion) {
         self.mode = mode
@@ -90,6 +97,10 @@ final class AreaSelectionWindow: NSObject {
         // selection's duration: `.regular` shows one, `.accessory` does not.
         // Default to `.accessory` (no Dock flash, like every other KRIT window);
         // the showDockIconDuringCapture setting opts back into `.regular`.
+        // Remember who to hand activation back to on cancel (see the property
+        // note). Snapshot BEFORE activating KRIT, and only when it wasn't already us.
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        appToRestoreOnCancel = frontmost?.processIdentifier == ProcessInfo.processInfo.processIdentifier ? nil : frontmost
         NSApp.setActivationPolicy(Settings.showDockIconDuringCapture ? .regular : .accessory)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -236,6 +247,13 @@ final class AreaSelectionWindow: NSObject {
         NSCursor.pop()
         pendingFrozenCrop = nil
         tearDown()
+        // Hand activation back to the app the overlay stole it from, rather than
+        // letting KRIT sit "active but .prohibited" (which throttles its next
+        // activation, the source of the post-Esc hotkey lag). Reactivating the
+        // prior app relinquishes activation cleanly (memory: never leave a zombie
+        // active state). No-op when KRIT was already frontmost.
+        appToRestoreOnCancel?.activate()
+        appToRestoreOnCancel = nil
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         completion(nil, screen, nil)
     }

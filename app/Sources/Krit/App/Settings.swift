@@ -13,6 +13,22 @@ enum Settings {
         return ("~/Desktop" as NSString).expandingTildeInPath
     }
 
+    // MARK: - Automation
+
+    /// Master opt-in for the local automation surface: the CFMessagePort server
+    /// (`com.krit.app.automation`, driven by the bundled `krit` CLI / MCP) and the
+    /// `krit://` URL scheme. OFF by default. Both inherit KRIT's Screen Recording
+    /// and Accessibility grants, so any local process could otherwise capture the
+    /// screen, walk the AX tree, or write files through KRIT without the user ever
+    /// asking for automation. Gating both behind this flag means a default install
+    /// exposes no scriptable capture surface at all; a user who wants the CLI turns
+    /// it on deliberately in Preferences. The UI-test harness opens the same gate
+    /// through the `KRIT_UI_TEST` env var (see `AutomationGate`).
+    static var automationEnabled: Bool {
+        get { defaults.bool(forKey: "automationEnabled") }
+        set { defaults.set(newValue, forKey: "automationEnabled") }
+    }
+
     // MARK: - First Launch
 
     static var hasLaunchedBefore: Bool {
