@@ -52,6 +52,19 @@ info() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# zsh's gitstatusd (running in a parallel interactive shell on this repo) leaves
+# an orphaned .git/index.lock on the external volume, which aborts a git write
+# mid-release. Clear a STALE lock — only when no real git write is in flight — so
+# the release doesn't die after the DMG is already built and signed.
+clear_stale_index_lock() {
+    local lock="$REPO_ROOT/.git/index.lock"
+    [ -e "$lock" ] || return 0
+    if pgrep -f 'git (commit|merge|rebase|add|tag)' >/dev/null 2>&1; then
+        fail "A real git process is writing the index; refusing to clear $lock. Retry once it finishes."
+    fi
+    rm -f "$lock"
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -319,7 +332,9 @@ fi
 # version but the download 404s (the release is still a draft while assets
 # upload), and every in-app update attempted in that window fails.
 info "Committing release metadata"
+clear_stale_index_lock
 git add "$INFO_PLIST" "$REPO_ROOT/appcast.xml" "$CASK_FILE" "$WHATSNEW_FILE" "$CHANGELOG_FILE"
+clear_stale_index_lock
 git commit -m "chore: release $TAG
 
 - bump CFBundleShortVersionString to $VERSION
@@ -329,13 +344,36 @@ git commit -m "chore: release $TAG
 Autor: Leonardo Candiani"
 
 info "Creating git tag $TAG"
+clear_stale_index_lock
 git tag -a "$TAG" -m "KRIT $TAG"
 
 info "Publishing GitHub release $TAG with $DMG_NAME"
 git push origin "$TAG"
-gh release create "$TAG" "$DMG_PATH" "$SHA_FILE" \
+# Create the release with notes + the small checksum first, then upload the DMG
+# with retries. A slow/flaky link times a single multi-asset `gh release create`
+# out mid-upload (a 40 MB+ DMG), leaving a draft with no installer; splitting the
+# upload lets it resume without re-running the whole release.
+gh release create "$TAG" "$SHA_FILE" \
+    --draft \
     --title "KRIT $TAG" \
     --notes-file "$NOTES_TMP"
+info "Uploading $DMG_NAME (retrying on a flaky link)"
+dmg_uploaded=false
+for attempt in 1 2 3 4 5; do
+    if gh release upload "$TAG" "$DMG_PATH" --clobber \
+        && gh release view "$TAG" --json assets --jq '[.assets[].name]' | grep -q "$DMG_NAME\""; then
+        dmg_uploaded=true
+        break
+    fi
+    info "  upload attempt $attempt did not complete; retrying"
+    sleep 5
+done
+[ "$dmg_uploaded" = true ] || fail "DMG upload failed after retries. Finish with: gh release upload $TAG $DMG_PATH --clobber && gh release edit $TAG --draft=false && git push origin HEAD"
+
+# Only now, with the DMG downloadable, publish the release and move main. This
+# ordering is what keeps the updater from ever announcing a version whose
+# download 404s.
+gh release edit "$TAG" --draft=false
 
 info "Publishing appcast (in-app updates go live)"
 git push origin HEAD
