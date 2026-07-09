@@ -159,7 +159,12 @@ enum UIIntrospection {
     }
 
     private static func findView(withId id: String, seenIds: inout [String]) -> NSView? {
-        for window in NSApp.windows {
+        // Only visible windows: a passive live-annotation toolbar is orderOut'd but
+        // its window object stays alive, and pressing its hidden trash/close/camera
+        // controls fires real side effects the user can't see. `isVisible` is false
+        // for an ordered-out window, so it drops out of both the search and the
+        // available-ids list, matching what a user could actually click.
+        for window in NSApp.windows where window.isVisible {
             guard let content = window.contentView else { continue }
             if let match = searchView(content, targetId: id, seenIds: &seenIds) { return match }
         }

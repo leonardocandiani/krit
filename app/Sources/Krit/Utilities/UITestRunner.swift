@@ -100,6 +100,7 @@ final class UITestRunner: NSObject {
             case "uniform-grab-guard": report = Self.runUniformGrabGuard()
             case "frozen-fast-path": report = await Self.runFrozenFastPath()
             case "own-window-capture": report = await Self.runOwnWindowCapture()
+            case "automation-gate": report = Self.runAutomationGate()
             case "overlay-gesture-freeze": report = await Self.runOverlayGestureFreeze()
             case "text-multiline": report = Self.runTextMultiline()
             case "glass-renders": report = await Self.runGlassRenders()
@@ -2259,6 +2260,30 @@ final class UITestRunner: NSObject {
     /// plain KRIT-owned window (default sharingType, exactly the class that
     /// used to vanish), grab its region through the REAL icons-hidden filter
     /// path and require the window's pixels in the result.
+    // MARK: - Cenário: automation-gate (a superfície scriptável é opt-in)
+
+    /// Guards the default-off posture of the whole scriptable surface. The live
+    /// `AutomationGate.isEnabled` reads true here (the harness sets KRIT_UI_TEST),
+    /// so the OFF path is proven against the pure decision function instead: no
+    /// env, no pref → refused. Also asserts the shipped default (pref off) and that
+    /// the env override alone opens the gate (so tests keep driving automation).
+    private static func runAutomationGate() -> [String: Any] {
+        var r: [String: Any] = ["scenario": "automation-gate"]
+        let offOff = AutomationGate.decide(envTestMode: false, prefEnabled: false)
+        let envOnly = AutomationGate.decide(envTestMode: true, prefEnabled: false)
+        let prefOnly = AutomationGate.decide(envTestMode: false, prefEnabled: true)
+        r["refusedWhenBothOff"] = (offOff == false)
+        r["envOverrideOpens"] = (envOnly == true)
+        r["prefOpens"] = (prefOnly == true)
+        // Fresh install must ship with automation OFF. Read the raw default so a
+        // pref the running user may have flipped doesn't mask a bad default.
+        let defaultsOff = UserDefaults.standard.object(forKey: "automationEnabled") == nil
+            || UserDefaults.standard.bool(forKey: "automationEnabled") == false
+        r["defaultOff"] = defaultsOff
+        r["allPass"] = (offOff == false) && (envOnly == true) && (prefOnly == true)
+        return r
+    }
+
     private static func runOwnWindowCapture() async -> [String: Any] {
         var r: [String: Any] = ["scenario": "own-window-capture"]
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {

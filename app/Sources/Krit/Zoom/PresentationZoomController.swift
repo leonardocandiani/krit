@@ -148,6 +148,11 @@ final class PresentationZoomController {
     /// `sessionLevel` continuously in this direction.
     private var holdDirection: Double = 0
     private var holdBeganAt: CFTimeInterval = 0
+    /// A zoom-in pressed during `.starting` (before the first stream frame) can't
+    /// act yet — `sessionLevel` is reset to 1x when that frame lands. Remember the
+    /// intent here so the first frame glides straight to the wanted level instead
+    /// of dropping the keypress and leaving the mode armed but flat at 1x.
+    private var pendingStartLevel: Double?
 
     /// Mirrors `LiveAnnotationController.presentationZoom`: the two features
     /// are both full-screen `.screenSaver`-level overlays, so only one can
@@ -201,6 +206,12 @@ final class PresentationZoomController {
     /// auto-repeat), but if a duplicate delivery ever happened it would pile
     /// a discrete step on top of a live ramp, so it is swallowed.
     func beginZoomIn() {
+        // Pressed while the stream is still coming up: latch the intent so the
+        // first frame lands already gliding to the preferred level.
+        if case .starting = state {
+            pendingStartLevel = Settings.presentationZoomLevel
+            return
+        }
         guard case .active = state else { return }
         guard holdDirection != 1 else { return }
         // From the armed 1x, the first zoom-in jumps straight to the
@@ -357,7 +368,12 @@ final class PresentationZoomController {
         if awaitingFirstFrame {
             awaitingFirstFrame = false
             state = .active
-            sessionLevel = 1.0
+            // Honor a zoom-in pressed during startup: start the spring at 1x and
+            // set the target so the tick glides into the wanted level, instead of
+            // dropping the keypress and sitting armed-but-flat.
+            let target = pendingStartLevel ?? 1.0
+            pendingStartLevel = nil
+            sessionLevel = target
             zoomSpring.snap(to: 1.0)
             let focus = localFocus(for: NSEvent.mouseLocation)
             focusXSpring.snap(to: focus.x)
@@ -571,6 +587,7 @@ final class PresentationZoomController {
         contentLayer = nil
         currentFrame = nil
         sessionLevel = 1.0
+        pendingStartLevel = nil
         holdDirection = 0
         zoomSpring.snap(to: 1.0)
     }

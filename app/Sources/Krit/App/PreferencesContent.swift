@@ -87,6 +87,7 @@ private struct GeneralForm: View {
     @State private var aiCloudEnabled = Settings.aiCloudEnabled
     @State private var claudeFound = false
     @State private var appearance = Settings.appearanceMode
+    @State private var automationEnabled = Settings.automationEnabled
 
     var body: some View {
         Section("Appearance") {
@@ -251,6 +252,17 @@ private struct GeneralForm: View {
                 Text("Claude Code not found — install it and run claude setup-token, then reopen this window.")
                     .font(.callout)
                     .foregroundStyle(.orange)
+            }
+        }
+
+        Section("Automation") {
+            Toggle(isOn: $automationEnabled) {
+                rowLabel("Allow scripting & the krit CLI", "terminal", .teal)
+                Text("Off by default. On, KRIT runs a local command port and answers krit:// URLs so the bundled CLI, Shortcuts, and agents can drive it. This lets other apps on this Mac take screenshots and read the accessibility tree through KRIT, so leave it off unless you use the CLI.")
+            }
+            .onChange(of: automationEnabled) {
+                Settings.automationEnabled = $0
+                (NSApp.delegate as? AppDelegate)?.refreshAutomationPort()
             }
         }
         .task {
