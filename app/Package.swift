@@ -13,6 +13,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/sindresorhus/KeyboardShortcuts", from: "2.4.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
+        .package(url: "https://github.com/rampatra/TourKit.git", from: "1.0.0"),
     ],
     targets: [
         // All app code lives in this library so Xcode previews and code
@@ -22,6 +23,7 @@ let package = Package(
             dependencies: [
                 .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
                 .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "TourKit", package: "TourKit"),
             ],
             path: "Sources/Krit",
             resources: [.process("Resources")]
