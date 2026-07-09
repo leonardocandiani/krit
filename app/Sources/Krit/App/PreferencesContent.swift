@@ -83,6 +83,7 @@ private struct GeneralForm: View {
     @State private var zoomFeel = Settings.presentationZoomFeel
     @State private var zoomSmoothness = Settings.presentationZoomSmoothness
     @State private var zoomLevel = Settings.presentationZoomLevel
+    @State private var annotationKeepOnExit = Settings.liveAnnotationKeepOnExit
     @State private var aiCloudEnabled = Settings.aiCloudEnabled
     @State private var claudeFound = false
     @State private var appearance = Settings.appearanceMode
@@ -229,6 +230,14 @@ private struct GeneralForm: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+
+        Section("Screen annotation") {
+            Toggle(isOn: $annotationKeepOnExit) {
+                rowLabel("Keep drawing after closing", "scribble", .orange)
+                Text("Closing the annotation toolbar keeps your marks on screen for next time. Off clears them.")
+            }
+            .onChange(of: annotationKeepOnExit) { Settings.liveAnnotationKeepOnExit = $0 }
         }
 
         Section("AI") {
@@ -595,6 +604,7 @@ private struct ShortcutsForm: View {
             shortcutRow("Capture text (OCR)", "text.viewfinder", .pink, .ocrCapture)
             shortcutRow("Scrolling capture", "scroll", .brown, .scrollingCapture)
             shortcutRow("Pick color", "eyedropper", .mint, .pickColor)
+            shortcutRow("Annotate screen", "scribble", .orange, .liveAnnotation)
         }
 
         Section("Presentation zoom") {

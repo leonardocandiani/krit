@@ -15,24 +15,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var automationPort: AutomationPort?
     private var uiTestRunner: UITestRunner?
     private var presentationZoom: PresentationZoomController!
+    private var liveAnnotation: LiveAnnotationController!
+    private var featureTour: FeatureTourController!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        KritTrace.installPanicCapture()
         // Pin the chosen appearance (System / Light / Dark) before any window opens.
         AppearanceMode.applyCurrent()
         captureEngine = CaptureEngine()
         hotkeyManager = HotkeyManager()
         historyManager = HistoryManager()
         presentationZoom = PresentationZoomController()
+        liveAnnotation = LiveAnnotationController()
+        featureTour = FeatureTourController()
+        liveAnnotation.captureEngine = captureEngine
+        liveAnnotation.presentationZoom = presentationZoom
+        // The camera button on the annotation toolbar shoots the same
+        // fullscreen path the ⌘⇧3 hotkey and menu item use, so the annotated
+        // live screen (ink included) lands in history like any other shot.
+        liveAnnotation.onCaptureRequested = { [weak self] in self?.captureFullscreen() }
+        // Reverse direction of the mutex above: engaging the zoom steps
+        // annotation out of interactive drawing (see PresentationZoomController.start()).
+        presentationZoom.liveAnnotation = liveAnnotation
         // Scripted captures (krit:// URL commands, automation port) funnel
         // straight into the engine, bypassing the hotkey/menu layer that
         // normally drops the presentation zoom first; hook them here so a
         // programmatic grab never includes the magnifier overlay.
         captureEngine.willCaptureScreenHook = { [weak self] in
             self?.presentationZoom.exitForCapture()
+            self?.liveAnnotation.exitDrawModeKeepingAnnotations()
         }
         captureTrigger = CaptureTrigger(engine: captureEngine)
         uiTestRunner = UITestRunner()
-        let port = AutomationPort(service: AutomationService(engine: captureEngine))
+        let port = AutomationPort(service: AutomationService(engine: captureEngine, liveAnnotation: liveAnnotation))
         if port.start() { automationPort = port }
         setupStatusItem()
         registerHotkeys()
@@ -49,7 +64,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 self?.showReadyToastIfNeeded(delay: 2.2)
             }
         }
-        if !welcomeController.showIfNeeded(onClose: promptForNativeShortcuts) {
+        // Feature Tour only follows the welcome wizard on a genuine first run
+        // (the branch where showIfNeeded actually presented it and later
+        // closes); the "already launched before" branch below keeps calling
+        // promptForNativeShortcuts() alone, so normal launches and updates
+        // never see the tour (WhatsNew already covers updates).
+        let onWelcomeClose = { [weak self] in
+            promptForNativeShortcuts()
+            // Match the capture actions: drop any live overlay (presentation zoom
+            // or live-annotation draw mode, both at `.screenSaver` level) before
+            // presenting, so the tour's `.floating` window can't open behind and be
+            // input-blocked by a full-screen overlay left engaged.
+            self?.presentationZoom.exitForCapture()
+            self?.liveAnnotation.exitDrawModeKeepingAnnotations()
+            self?.featureTour.showOnFirstRunIfNeeded()
+        }
+        if !welcomeController.showIfNeeded(onClose: onWelcomeClose) {
             promptForNativeShortcuts()
         }
         // After an update, surface the release notes once (gated on a version
@@ -203,6 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             captureEngine: captureEngine,
             historyManager: historyManager,
             presentationZoom: presentationZoom,
+            liveAnnotation: liveAnnotation,
             onToggleHistory: { [weak self] in
                 guard let self else { return }
                 HistoryPanelController.shared.toggle(historyManager: self.historyManager)
@@ -280,6 +311,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let whatsNew = NSMenuItem(title: "What's New", action: #selector(showWhatsNew), keyEquivalent: "")
         whatsNew.target = self
         menu.addItem(whatsNew)
+
+        let featureTourItem = NSMenuItem(title: "Feature Tour", action: #selector(showFeatureTour), keyEquivalent: "")
+        featureTourItem.target = self
+        menu.addItem(featureTourItem)
         menu.addItem(.separator())
 
         menu.addItem(header: "Capture")
@@ -304,6 +339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         menu.addItem(title: "Capture Text (OCR)",   key: "o",  action: #selector(captureText), icon: "text.viewfinder")
         menu.addItem(title: "Pick Color",           key: "",  action: #selector(pickColor), icon: "eyedropper")
         menu.addItem(title: "Presentation Zoom",    key: "8",  action: #selector(togglePresentationZoom), icon: "plus.magnifyingglass")
+        menu.addItem(title: "Annotate Screen",      key: "d",  action: #selector(toggleLiveAnnotation), icon: "scribble")
         menu.addItem(title: "Scan QR Code",         key: "",  action: #selector(scanQRCode), icon: "qrcode.viewfinder")
         menu.addItem(title: "Open History",         key: "",  action: #selector(openHistory), icon: "clock.arrow.circlepath")
         menu.addItem(title: "Show Editor",          key: "",  action: #selector(showEditor), icon: "pencil.and.outline")
@@ -340,22 +376,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     // MARK: - Actions
 
-    @objc func allInOne()            { presentationZoom.exitForCapture(); Task { await captureEngine.startAllInOne(historyManager: historyManager) } }
-    @objc func captureArea()         { presentationZoom.exitForCapture(); Task { await captureEngine.startAreaCapture(historyManager: historyManager) } }
-    @objc func captureWindow()       { presentationZoom.exitForCapture(); Task { await captureEngine.startWindowCapture(historyManager: historyManager) } }
-    @objc func captureFullscreen()   { presentationZoom.exitForCapture(); Task { await captureEngine.captureFullscreen(historyManager: historyManager) } }
-    @objc func capturePrevious()     { presentationZoom.exitForCapture(); Task { await captureEngine.capturePreviousArea(historyManager: historyManager) } }
-    @objc func snapAndPaste()        { presentationZoom.exitForCapture(); Task { await captureEngine.startSnapAndPaste(historyManager: historyManager) } }
-    @objc func captureScrolling()    { presentationZoom.exitForCapture(); Task { await captureEngine.startScrollingCapture(historyManager: historyManager) } }
-    @objc func recordArea()          { presentationZoom.exitForCapture(); Task { await captureEngine.startAreaRecording() } }
-    @objc func recordWindow()        { presentationZoom.exitForCapture(); Task { await captureEngine.startWindowRecording() } }
-    @objc func recordFullscreen()    { presentationZoom.exitForCapture(); Task { await captureEngine.startFullscreenRecording() } }
+    @objc func allInOne()            { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startAllInOne(historyManager: historyManager) } }
+    @objc func captureArea()         { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startAreaCapture(historyManager: historyManager) } }
+    @objc func captureWindow()       { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startWindowCapture(historyManager: historyManager) } }
+    @objc func captureFullscreen()   { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.captureFullscreen(historyManager: historyManager) } }
+    @objc func capturePrevious()     { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.capturePreviousArea(historyManager: historyManager) } }
+    @objc func snapAndPaste()        { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startSnapAndPaste(historyManager: historyManager) } }
+    @objc func captureScrolling()    { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startScrollingCapture(historyManager: historyManager) } }
+    @objc func recordArea()          { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startAreaRecording() } }
+    @objc func recordWindow()        { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startWindowRecording() } }
+    @objc func recordFullscreen()    { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startFullscreenRecording() } }
     @objc func stopRecording()       { captureEngine.stopRecording() }
     @objc func reopenLastRecording() { captureEngine.reopenLastRecording() }
-    @objc func captureText()         { presentationZoom.exitForCapture(); Task { await captureEngine.startOCRCapture() } }
-    @objc func pickColor()           { presentationZoom.exitForCapture(); Task { await captureEngine.startColorPick() } }
-    @objc func scanQRCode()          { presentationZoom.exitForCapture(); Task { await captureEngine.startQRCodeCapture() } }
+    @objc func captureText()         { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startOCRCapture() } }
+    @objc func pickColor()           { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startColorPick() } }
+    @objc func scanQRCode()          { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startQRCodeCapture() } }
     @objc func togglePresentationZoom() { presentationZoom.toggle() }
+    @objc func toggleLiveAnnotation() { liveAnnotation.toggleDrawMode() }
     @objc func showEditor()          { AnnotationWindowController.bringOpenEditorsToFront() }
     @objc func annotateLastScreenshot() {
         guard let last = historyManager.items.first else { return }
@@ -367,6 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func openAbout()           { PreferencesWindowController.shared.show(tab: .about) }
     @objc func checkForUpdates()     { UpdaterManager.shared.checkForUpdates() }
     @objc func showWhatsNew()        { WhatsNewWindowController.showNow() }
+    @objc func showFeatureTour()     { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); featureTour.show() }
 
     // MARK: - Recent captures (status item menu section)
 

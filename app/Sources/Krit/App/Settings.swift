@@ -42,6 +42,14 @@ enum Settings {
         set { defaults.set(newValue, forKey: "lastWhatsNewVersion") }
     }
 
+    /// Whether the six-slide Feature Tour has already been shown once. Set on
+    /// finish or close, so it never re-appears on later launches; the menu's
+    /// "Feature Tour" item ignores this flag and always shows it on demand.
+    static var hasSeenFeatureTour: Bool {
+        get { defaults.bool(forKey: "hasSeenFeatureTour") }
+        set { defaults.set(newValue, forKey: "hasSeenFeatureTour") }
+    }
+
     // MARK: - Overlay
 
     /// Auto-dismiss timeout in seconds. -1 = never dismiss automatically.
@@ -423,6 +431,49 @@ enum Settings {
     static var presentationZoomFeel: PresentationZoomFeel {
         get { PresentationZoomFeel(rawValue: defaults.string(forKey: "presentationZoomFeel") ?? "") ?? .natural }
         set { defaults.set(newValue.rawValue, forKey: "presentationZoomFeel") }
+    }
+
+    // MARK: - Live annotation
+
+    /// Tool remembered across launches for the live annotation toolbar, the
+    /// same "resume where you left it" idea as presentationZoomLevel. Arrow
+    /// (the toolbar's own hardcoded starting tool) when unset.
+    static var liveAnnotationDefaultTool: AnnotationTool {
+        get { AnnotationTool(rawValue: defaults.string(forKey: "liveAnnotationDefaultTool") ?? "") ?? .arrow }
+        set { defaults.set(newValue.rawValue, forKey: "liveAnnotationDefaultTool") }
+    }
+
+    /// Color remembered across launches, stored as "#RRGGBB" like the color
+    /// picker's saved swatches (see `PickerColor.hexString`). `KritColors.accent`
+    /// when unset or the stored hex fails to parse.
+    static var liveAnnotationDefaultColor: NSColor {
+        get {
+            guard let hex = defaults.string(forKey: "liveAnnotationDefaultColor"),
+                  let color = NSColor(hex: hex) else { return KritColors.accent }
+            return color
+        }
+        set { defaults.set(PickerColor(newValue).hexString, forKey: "liveAnnotationDefaultColor") }
+    }
+
+    /// Line width remembered across launches, one of the toolbar's S/M/L
+    /// presets (3/6/11). 6 (Medium) when unset.
+    static var liveAnnotationDefaultWidth: Double {
+        get {
+            let v = defaults.double(forKey: "liveAnnotationDefaultWidth")
+            return v == 0 ? 6 : v
+        }
+        set { defaults.set(newValue, forKey: "liveAnnotationDefaultWidth") }
+    }
+
+    /// Whether closing the live annotation toolbar (the X button) keeps the
+    /// drawn ink for the next activation, or clears it. On by default,
+    /// matching the controller's original always-keep behavior.
+    static var liveAnnotationKeepOnExit: Bool {
+        get {
+            if defaults.object(forKey: "liveAnnotationKeepOnExit") == nil { return true }
+            return defaults.bool(forKey: "liveAnnotationKeepOnExit")
+        }
+        set { defaults.set(newValue, forKey: "liveAnnotationKeepOnExit") }
     }
 }
 
