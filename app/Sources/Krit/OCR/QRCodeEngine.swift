@@ -1,7 +1,7 @@
 import AppKit
 import Vision
 
-struct QRCodeResult: Hashable {
+struct QRCodeResult: Hashable, Sendable {
     let payload: String
 }
 
@@ -13,15 +13,10 @@ enum QRCodeEngine {
     }
 
     static func detect(in cgImage: CGImage) async -> [QRCodeResult] {
-        await withCheckedContinuation { continuation in
-            var didResume = false
+        await VisionRequestExecutor.perform {
+            var detectedCodes: [QRCodeResult] = []
             let request = VNDetectBarcodesRequest { request, error in
-                guard !didResume else { return }
-                didResume = true
-                if error != nil {
-                    continuation.resume(returning: [])
-                    return
-                }
+                guard error == nil else { return }
 
                 let observations = request.results as? [VNBarcodeObservation] ?? []
                 let results = observations
@@ -34,8 +29,7 @@ enum QRCodeEngine {
                     }
 
                 var seen = Set<String>()
-                let uniqueResults = results.filter { seen.insert($0.payload).inserted }
-                continuation.resume(returning: uniqueResults)
+                detectedCodes = results.filter { seen.insert($0.payload).inserted }
             }
             request.symbologies = [.qr]
 
@@ -43,10 +37,9 @@ enum QRCodeEngine {
             do {
                 try handler.perform([request])
             } catch {
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume(returning: [])
+                return []
             }
+            return detectedCodes
         }
     }
 }

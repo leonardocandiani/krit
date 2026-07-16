@@ -3,21 +3,19 @@ import AVFoundation
 import KeyboardShortcuts
 import ServiceManagement
 
-/// SwiftUI content for each Preferences section. The window chrome (dark window,
-/// glass sidebar, section switching) stays in AppKit; each section's body is a
-/// grouped `Form` hosted in an `NSHostingView`, so the controls are the same
-/// native components System Settings uses (Toggle, Picker, Slider, the
-/// KeyboardShortcuts.Recorder), styled with KRIT's coral tint over dark mode.
+/// SwiftUI content for each Preferences section. AppKit owns the window and
+/// native source-list navigation; the selected section is one grouped `Form`
+/// hosted in a single `NSHostingView`, with KRIT coral reserved for active state.
 
 // MARK: - Hosting bridge
 
-/// Builds the `NSView` for a section: a grouped SwiftUI `Form` inside an
-/// `NSHostingView`. The Form's own scroll background is hidden so KRIT's void
-/// content surface shows through, matching the rest of the dark chrome.
+/// Builds a fresh root whenever the category changes or the window reopens. The
+/// explicit identity prevents stale `@State` copied from Settings surviving a
+/// close/reopen cycle.
 @MainActor
 enum PreferencesContent {
 
-    static func makeView(for tab: PreferencesTab) -> NSView {
+    static func makeRootView(for tab: PreferencesTab) -> AnyView {
         let root: AnyView
         switch tab {
         case .general:   root = AnyView(GeneralForm())
@@ -31,40 +29,122 @@ enum PreferencesContent {
         case .about:     root = AnyView(AboutForm())
         }
 
-        let hosting = NSHostingView(rootView: PreferencesSection { root })
+        return AnyView(
+            PreferencesSection(tab: tab) { root }
+                .id(tab.rawValue)
+        )
+    }
+
+    static func makeView(for tab: PreferencesTab) -> NSView {
+        let hosting = NSHostingView(rootView: makeRootView(for: tab))
         hosting.autoresizingMask = [.width, .height]
         return hosting
     }
 }
 
-/// Common chrome around every section's Form: grouped style, coral tint, hidden
-/// scroll background so the dark content pane reads through, and top padding to
-/// clear the transparent titlebar.
+/// Common native shell around every section: a fixed wayfinding header and a
+/// grouped, independently scrolling form below it.
 private struct PreferencesSection<Content: View>: View {
+    let tab: PreferencesTab
     @ViewBuilder var content: Content
 
     var body: some View {
-        if #available(macOS 14.0, *) {
-            form
-                // Margem de segurança DENTRO do scroll: o fim do conteúdo respira
-                // antes da borda da janela (sem isso a última row encosta seca).
-                // Margem interna não cria faixa morta no meio do scroll, ao
-                // contrário de um padding externo.
-                .contentMargins(.bottom, 24, for: .scrollContent)
-        } else {
-            form
+        VStack(spacing: 0) {
+            PreferencesHeader(tab: tab)
+            Divider()
+            if #available(macOS 14.0, *) {
+                form
+                    // Margem de segurança DENTRO do scroll: o fim do conteúdo respira
+                    // antes da borda da janela (sem isso a última row encosta seca).
+                    // Margem interna não cria faixa morta no meio do scroll, ao
+                    // contrário de um padding externo.
+                    .contentMargins(.bottom, 24, for: .scrollContent)
+            } else {
+                form
+            }
         }
     }
 
     private var form: some View {
         Form {
             content
+            if #unavailable(macOS 14.0) {
+                Section {
+                    Color.clear
+                        .frame(height: 12)
+                        .accessibilityHidden(true)
+                }
+            }
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .tint(Color(KritColors.accent))
-        .padding(.top, 28)
+        .padding(.top, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct PreferencesHeader: View {
+    let tab: PreferencesTab
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: tab.symbol)
+                .symbolRenderingMode(.hierarchical)
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(Color(KritColors.accent))
+                .frame(width: 30, height: 30)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(tab.title)
+                    .font(.system(size: 21, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Text(tab.subtitle)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 16)
+
+            if tab == .capture { CaptureReadinessBadge() }
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 30)
+        .padding(.bottom, 14)
+    }
+}
+
+private struct CaptureReadinessBadge: View {
+    @State private var status = PermissionsManager.screenRecordingStatus
+
+    private var isReady: Bool {
+        if case .granted = status { return true }
+        return false
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(isReady ? Color.green : Color.orange)
+                .frame(width: 7, height: 7)
+            Text(isReady ? "Ready" : "Permission needed")
+                .font(.system(size: 12, weight: .medium))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(.quaternary, in: Capsule())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(isReady ? "Capture status, ready" : "Capture status, permission needed")
+        .onAppear(perform: refresh)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refresh()
+        }
+    }
+
+    private func refresh() {
+        status = PermissionsManager.screenRecordingStatus
     }
 }
 
@@ -325,14 +405,7 @@ private struct CaptureForm: View {
         }
 
         Section("Window capture") {
-            Picker(selection: $windowBackground) {
-                ForEach(WindowCaptureBackground.allCases, id: \.self) { value in
-                    Text(value.displayName).tag(value)
-                }
-            } label: {
-                rowLabel("Background", "macwindow.on.rectangle", .teal)
-                Text("Window shots open composed on the current desktop wallpaper, centered with a shadow.")
-            }
+            WindowBackgroundPicker(selection: $windowBackground)
             .onChange(of: windowBackground) { Settings.windowCaptureBackground = $0 }
         }
 
@@ -366,9 +439,123 @@ private struct CaptureForm: View {
     }
 }
 
+private struct WindowBackgroundPicker: View {
+    @Binding var selection: WindowCaptureBackground
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                SettingIcon(symbol: "macwindow.on.rectangle", color: .teal)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Background")
+                    Text("Choose how captured windows open in the editor.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                ForEach(WindowCaptureBackground.allCases, id: \.self) { option in
+                    Button {
+                        selection = option
+                    } label: {
+                        VStack(spacing: 7) {
+                            WindowBackgroundPreview(option: option)
+                                .frame(height: 68)
+                            Text(option.displayName)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .foregroundStyle(.primary)
+                        }
+                        .padding(7)
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(selection == option
+                                    ? Color(KritColors.accent).opacity(0.10)
+                                    : Color.primary.opacity(0.035))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(
+                                    selection == option
+                                        ? Color(KritColors.accent)
+                                        : Color.primary.opacity(0.10),
+                                    lineWidth: selection == option ? 2 : 1
+                                )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(option.displayName)
+                    .accessibilityValue(selection == option ? "Selected" : "Not selected")
+                    .help("Use \(option.displayName.lowercased()) for captured windows")
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct WindowBackgroundPreview: View {
+    let option: WindowCaptureBackground
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(background)
+
+            if option == .none {
+                Image(systemName: "rectangle.slash")
+                    .font(.system(size: 19, weight: .medium))
+                    .foregroundStyle(.secondary)
+            } else {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .frame(width: 68, height: 42)
+                    .overlay(alignment: .top) {
+                        HStack(spacing: 3) {
+                            Circle().fill(.red.opacity(0.85))
+                            Circle().fill(.yellow.opacity(0.85))
+                            Circle().fill(.green.opacity(0.85))
+                            Spacer()
+                        }
+                        .frame(height: 5)
+                        .padding(5)
+                    }
+                    .shadow(color: .black.opacity(0.25), radius: 4, y: 2)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var background: some ShapeStyle {
+        switch option {
+        case .systemWallpaper:
+            return AnyShapeStyle(
+                LinearGradient(
+                    colors: [Color.blue.opacity(0.85), Color.purple.opacity(0.70), Color.orange.opacity(0.72)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+        case .savedTemplate:
+            return AnyShapeStyle(
+                LinearGradient(
+                    colors: [Color.indigo.opacity(0.62), Color.black.opacity(0.72)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+        case .none:
+            return AnyShapeStyle(Color.primary.opacity(0.045))
+        }
+    }
+}
+
 // MARK: - Recording
 
 private struct RecordingForm: View {
+    @StateObject private var devices = PreferencesDeviceModel()
     @State private var quality = Settings.recordingQuality
     @State private var fps = Settings.recordingFPS
     @State private var showsCursor = Settings.recordingShowsCursor
@@ -424,7 +611,7 @@ private struct RecordingForm: View {
                 title: "Microphone",
                 symbol: "mic.circle.fill",
                 color: .pink,
-                options: PreferencesDeviceProvider.microphones,
+                options: devices.microphones,
                 selection: $micDevice
             )
             .onChange(of: micDevice) { Settings.recordingMicrophoneDeviceID = $0 }
@@ -441,7 +628,7 @@ private struct RecordingForm: View {
                 title: "Camera",
                 symbol: "camera.circle.fill",
                 color: .teal,
-                options: PreferencesDeviceProvider.cameras,
+                options: devices.cameras,
                 selection: $webcamDevice
             )
             .onChange(of: webcamDevice) { Settings.recordingWebcamDeviceID = $0 }
@@ -482,22 +669,29 @@ private struct RecordingForm: View {
             }
             .onChange(of: gifMaxDimension) { Settings.recordingGIFMaxDimension = $0 }
         }
+        .task { await devices.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
+            Task { await devices.refresh() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification)) { _ in
+            Task { await devices.refresh() }
+        }
     }
 }
 
-/// Picker over (name, uniqueID) device pairs. Shares the same value type as the
-/// AppKit popup it replaces, so the persisted ID stays compatible.
+/// Picker over stable device options. The selected unique ID remains compatible
+/// with the existing UserDefaults value used by RecordingEngine.
 private struct DevicePicker: View {
     let title: String
     var symbol: String = "circle"
     var color: Color = .gray
-    let options: [(String, String)]
+    let options: [PreferencesDeviceOption]
     @Binding var selection: String
 
     var body: some View {
         Picker(selection: $selection) {
-            ForEach(options, id: \.1) { option in
-                Text(option.0).tag(option.1)
+            ForEach(options) { option in
+                Text(option.name).tag(option.id)
             }
         } label: {
             rowLabel(title, symbol, color)
@@ -836,14 +1030,12 @@ private struct SettingIcon: View {
     let color: Color
 
     var body: some View {
-        RoundedRectangle(cornerRadius: 6, style: .continuous)
-            .fill(color.gradient)
-            .frame(width: 26, height: 26)
-            .overlay(
-                Image(systemName: symbol)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
-            )
+        Image(systemName: symbol)
+            .symbolRenderingMode(.hierarchical)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(color)
+            .frame(width: 22, height: 22)
+            .accessibilityHidden(true)
     }
 }
 
@@ -1068,37 +1260,90 @@ private struct StatusPill: View {
 
 // MARK: - Device discovery
 
-/// Audio/video input devices for the Recording pickers. Kept here so the section
-/// views stay declarative.
-@MainActor
-enum PreferencesDeviceProvider {
+struct PreferencesDeviceOption: Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
 
-    static var microphones: [(String, String)] {
+    static let systemDefault = PreferencesDeviceOption(id: "", name: "System Default")
+}
+
+struct PreferencesDeviceCatalog: Equatable, Sendable {
+    let microphones: [PreferencesDeviceOption]
+    let cameras: [PreferencesDeviceOption]
+}
+
+protocol PreferencesDeviceLoading: Sendable {
+    func load() async -> PreferencesDeviceCatalog
+}
+
+/// AVFoundation discovery can touch hardware services. Keep it off the render
+/// path and return only immutable strings across the concurrency boundary.
+struct SystemPreferencesDeviceLoader: PreferencesDeviceLoading {
+    func load() async -> PreferencesDeviceCatalog {
+        await Task.detached(priority: .utility) {
+            PreferencesDeviceCatalog(
+                microphones: Self.microphones(),
+                cameras: Self.cameras()
+            )
+        }.value
+    }
+
+    private static func microphones() -> [PreferencesDeviceOption] {
         let deviceTypes: [AVCaptureDevice.DeviceType]
         if #available(macOS 14.0, *) {
-            deviceTypes = [.microphone, .externalUnknown]
+            deviceTypes = [.microphone, .external]
         } else {
             deviceTypes = [.builtInMicrophone, .externalUnknown]
         }
         return devices(deviceTypes, mediaType: .audio)
     }
 
-    static var cameras: [(String, String)] {
-        var deviceTypes: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera, .externalUnknown]
+    private static func cameras() -> [PreferencesDeviceOption] {
+        let deviceTypes: [AVCaptureDevice.DeviceType]
         if #available(macOS 14.0, *) {
             deviceTypes = [.builtInWideAngleCamera, .external, .continuityCamera]
+        } else {
+            deviceTypes = [.builtInWideAngleCamera, .externalUnknown]
         }
         return devices(deviceTypes, mediaType: .video)
     }
 
-    private static func devices(_ types: [AVCaptureDevice.DeviceType], mediaType: AVMediaType) -> [(String, String)] {
-        var options: [(String, String)] = [("System Default", "")]
-        options += AVCaptureDevice.DiscoverySession(
-            deviceTypes: types, mediaType: mediaType, position: .unspecified
+    private static func devices(
+        _ types: [AVCaptureDevice.DeviceType],
+        mediaType: AVMediaType
+    ) -> [PreferencesDeviceOption] {
+        let discovered = AVCaptureDevice.DiscoverySession(
+            deviceTypes: types,
+            mediaType: mediaType,
+            position: .unspecified
         )
         .devices
-        .sorted { $0.localizedName.localizedCaseInsensitiveCompare($1.localizedName) == .orderedAscending }
-        .map { ($0.localizedName, $0.uniqueID) }
-        return options
+        .sorted {
+            $0.localizedName.localizedCaseInsensitiveCompare($1.localizedName) == .orderedAscending
+        }
+        .map { PreferencesDeviceOption(id: $0.uniqueID, name: $0.localizedName) }
+        return [.systemDefault] + discovered
+    }
+}
+
+@MainActor
+final class PreferencesDeviceModel: ObservableObject {
+    @Published private(set) var microphones: [PreferencesDeviceOption] = [.systemDefault]
+    @Published private(set) var cameras: [PreferencesDeviceOption] = [.systemDefault]
+
+    private let loader: any PreferencesDeviceLoading
+    private var refreshGeneration: UInt64 = 0
+
+    init(loader: any PreferencesDeviceLoading = SystemPreferencesDeviceLoader()) {
+        self.loader = loader
+    }
+
+    func refresh() async {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        let catalog = await loader.load()
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
+        microphones = catalog.microphones
+        cameras = catalog.cameras
     }
 }

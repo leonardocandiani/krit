@@ -82,8 +82,8 @@ final class PresentationZoomController {
 
     /// Magnification bounds the shortcuts can reach. The lower bound stays
     /// above 1 so "zoomed in at minimum" is still visibly zoomed.
-    static let minLevel: Double = 1.25
-    static let maxLevel: Double = 6.0
+    nonisolated static let minLevel: Double = 1.25
+    nonisolated static let maxLevel: Double = 6.0
     /// Multiplicative step per zoom-in/out shortcut press.
     private static let levelStep: Double = 1.25
     /// Smoothing tick. 120 Hz so the glide stays fluid on ProMotion displays;
@@ -177,6 +177,9 @@ final class PresentationZoomController {
 
     /// True while the magnifier is on screen (any state but idle).
     var isActive: Bool { if case .idle = state { return false }; return true }
+    var uiTestHasLiveFrame: Bool {
+        isActive && !awaitingFirstFrame && currentFrame != nil && window?.alphaValue == 1
+    }
 
     // MARK: - Shortcuts
 
@@ -289,10 +292,10 @@ final class PresentationZoomController {
                 var overlay: SCWindow?
                 for attempt in 0..<3 {
                     if attempt > 0 { try await Task.sleep(nanoseconds: 100_000_000) }
-                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                    let snapshot = try await ScreenCaptureCatalog.shared.windows(.allContent)
                     guard let self, self.generation == gen else { return }
-                    display = content.displays.first { $0.displayID == displayID }
-                    overlay = content.windows.first { $0.windowID == overlayID }
+                    display = snapshot.display(id: displayID)
+                    overlay = snapshot.window(id: overlayID)
                     if display != nil, overlay != nil { break }
                 }
                 guard let self, self.generation == gen else { return }
@@ -451,7 +454,9 @@ final class PresentationZoomController {
         // on the main thread; it calls straight through without a queue hop
         // (a per-tick async dispatch adds a run-loop turn of jitter at 120 Hz).
         let timer = Timer(timeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
-            self?.tick()
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
         }
         // .common so the glide keeps running during menu tracking and drags.
         RunLoop.main.add(timer, forMode: .common)
@@ -600,9 +605,7 @@ final class PresentationZoomController {
     }
 
     private static func displayID(of screen: NSScreen) -> CGDirectDisplayID {
-        let key = NSDeviceDescriptionKey("NSScreenNumber")
-        let number = screen.deviceDescription[key] as? NSNumber
-        return number.map { CGDirectDisplayID(truncating: $0) } ?? CGMainDisplayID()
+        ScreenCaptureCatalog.displayID(of: screen) ?? CGMainDisplayID()
     }
 
     /// Frames are delivered off-main and hopped over; a serial queue keeps

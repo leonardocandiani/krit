@@ -54,7 +54,8 @@ final class VideoEditorState: ObservableObject {
 
     static let backgroundPresets = Array(ScreenshotBackgroundOptions.imagePresets.prefix(8))
     let wallpapers: [SystemWallpaperSource.Wallpaper] = SystemWallpaperSource.all
-    private var wallpaperThumbs: [Int: NSImage] = [:]
+    @Published private var wallpaperThumbs: [Int: NSImage] = [:]
+    private var loadingWallpaperThumbs: Set<Int> = []
 
     var backgroundOptions: VideoBackgroundOptions {
         var opts = VideoBackgroundOptions(
@@ -62,7 +63,6 @@ final class VideoEditorState: ObservableObject {
         )
         if backgroundKind == .wallpaper, selectedWallpaperIndex < wallpapers.count {
             opts.kind = .wallpaper
-            opts.wallpaperData = try? Data(contentsOf: wallpapers[selectedWallpaperIndex].url)
             opts.wallpaperIndex = wallpapers[selectedWallpaperIndex].imageIndex
         } else {
             let p = Self.backgroundPresets[min(backgroundPresetIndex, Self.backgroundPresets.count - 1)]
@@ -73,13 +73,20 @@ final class VideoEditorState: ObservableObject {
         return opts
     }
 
-    /// Downsampled wallpaper for the swatch grid and the live preview (cached).
+    /// Downsampled wallpaper for the swatch grid and the live preview. Decoding a
+    /// full wallpaper can take hundreds of milliseconds, so cache misses render a
+    /// placeholder and fill in through SystemWallpaperSource's background queue.
     func wallpaperThumbnail(_ i: Int) -> NSImage? {
         guard i >= 0, i < wallpapers.count else { return nil }
         if let c = wallpaperThumbs[i] { return c }
-        let img = Self.downsampledImage(url: wallpapers[i].url, index: wallpapers[i].imageIndex, maxPixel: 320)
-        if let img { wallpaperThumbs[i] = img }
-        return img
+        guard loadingWallpaperThumbs.insert(i).inserted else { return nil }
+        let wallpaper = wallpapers[i]
+        SystemWallpaperSource.thumbnail(for: wallpaper, maxPixel: 320) { [weak self] image in
+            guard let self else { return }
+            self.loadingWallpaperThumbs.remove(i)
+            if let image { self.wallpaperThumbs[i] = image }
+        }
+        return nil
     }
 
     static func downsampledImage(url: URL, index: Int, maxPixel: CGFloat) -> NSImage? {
@@ -128,10 +135,12 @@ final class VideoEditorState: ObservableObject {
         let interval = CMTime(seconds: 1.0 / 30.0, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self else { return }
-            self.currentTime = CMTimeGetSeconds(time)
-            if self.isPlaying, self.currentTime >= self.trimEnd - 0.02 {
-                self.pause()
-                self.seek(to: self.trimStart)
+            MainActor.assumeIsolated {
+                self.currentTime = CMTimeGetSeconds(time)
+                if self.isPlaying, self.currentTime >= self.trimEnd - 0.02 {
+                    self.pause()
+                    self.seek(to: self.trimStart)
+                }
             }
         }
     }
@@ -288,7 +297,6 @@ final class VideoEditorState: ObservableObject {
         let outURL = url.deletingLastPathComponent().appendingPathComponent("\(base) Edited.mp4")
         let segments = zoomSegments.filter(\.isEnabled)
         let paths = autoFocusPaths
-        let bg = backgroundOptions
         let trans = transitionDuration
         let trimmed = trimStart > 0.01 || trimEnd < duration - 0.01
         let range: CMTimeRange? = trimmed
@@ -296,21 +304,40 @@ final class VideoEditorState: ObservableObject {
                           duration: CMTime(seconds: max(trimEnd - trimStart, 0.05), preferredTimescale: 600))
             : nil
         let outDuration = trimEnd - trimStart
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await ZoomComposer.export(url: self.url, to: outURL, segments: segments, autoFocusPaths: paths, transitionDuration: trans, timeRange: range, background: bg)
-                await MainActor.run {
-                    self.isExporting = false
-                    ToastWindow.show(message: "Saved: \(outURL.lastPathComponent)", duration: 3.0)
-                    self.onExported?(outURL, max(outDuration, 0.01))
-                }
-            } catch {
-                await MainActor.run {
-                    self.isExporting = false
-                    ToastWindow.show(message: "Export failed.")
+        let sourceURL = url
+        resolveBackgroundOptions { [weak self] background in
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await ZoomComposer.export(url: sourceURL, to: outURL, segments: segments, autoFocusPaths: paths, transitionDuration: trans, timeRange: range, background: background)
+                    await MainActor.run {
+                        self.isExporting = false
+                        ToastWindow.show(message: "Saved: \(outURL.lastPathComponent)", duration: 3.0)
+                        self.onExported?(outURL, max(outDuration, 0.01))
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.isExporting = false
+                        ToastWindow.show(message: "Export failed.")
+                    }
                 }
             }
+        }
+    }
+
+    /// Snapshot the current background selection, loading full wallpaper bytes
+    /// off-main only when an export needs them. Preview rendering uses the
+    /// thumbnail path above and never needs these original bytes.
+    private func resolveBackgroundOptions(_ completion: @escaping (VideoBackgroundOptions) -> Void) {
+        var options = backgroundOptions
+        guard options.kind == .wallpaper, wallpapers.indices.contains(selectedWallpaperIndex) else {
+            completion(options)
+            return
+        }
+        let wallpaper = wallpapers[selectedWallpaperIndex]
+        SystemWallpaperSource.backgroundData(for: wallpaper) { data in
+            options.wallpaperData = data
+            completion(options)
         }
     }
 

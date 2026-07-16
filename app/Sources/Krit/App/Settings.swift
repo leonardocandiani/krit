@@ -22,8 +22,8 @@ enum Settings {
     /// screen, walk the AX tree, or write files through KRIT without the user ever
     /// asking for automation. Gating both behind this flag means a default install
     /// exposes no scriptable capture surface at all; a user who wants the CLI turns
-    /// it on deliberately in Preferences. The UI-test harness opens the same gate
-    /// through the `KRIT_UI_TEST` env var (see `AutomationGate`).
+    /// it on deliberately in Preferences. The UI-test harness is not an automation
+    /// bypass and is compiled only into test builds.
     static var automationEnabled: Bool {
         get { defaults.bool(forKey: "automationEnabled") }
         set { defaults.set(newValue, forKey: "automationEnabled") }
@@ -334,10 +334,10 @@ enum Settings {
 
     // MARK: - All-in-One
 
-    /// Last All-in-One selection rect, in AppKit global screen coordinates
-    /// (bottom-left, anchored to the primary display). Persisted via
-    /// NSStringFromRect so it survives relaunch; the All-in-One controller
-    /// revalidates it against the current screens before reusing it.
+    /// Last reusable area rect, in AppKit global screen coordinates
+    /// (bottom-left, anchored to the primary display). Area capture, recording,
+    /// OCR, QR, scrolling capture, and All-in-One all refresh this value so a
+    /// later All-in-One launch starts with the user's latest valid selection.
     static var allInOneRect: CGRect? {
         get {
             guard let raw = defaults.string(forKey: "allInOneRect"), !raw.isEmpty else { return nil }

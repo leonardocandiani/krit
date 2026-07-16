@@ -5,20 +5,25 @@ import ScreenCaptureKit
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSMenuDelegate {
 
     private var statusItem: NSStatusItem?
+    private var didBuildStatusMenu = false
     private var menuBarObserver: NSObjectProtocol?
     private var captureEngine: CaptureEngine!
     var hotkeyManager: HotkeyManager!
     var historyManager: HistoryManager!
     private let welcomeController = WelcomeWindowController()
     private var didRegisterHotkeys = false
-    private var captureTrigger: CaptureTrigger!
+    private var captureTrigger: CaptureTrigger?
     private var automationPort: AutomationPort?
     private var uiTestRunner: UITestRunner?
     private var presentationZoom: PresentationZoomController!
     private var liveAnnotation: LiveAnnotationController!
     private var featureTour: FeatureTourController!
+    private var launchStartedAt = ProcessInfo.processInfo.systemUptime
+    private(set) var launchCriticalReadyAt: TimeInterval?
+    private(set) var launchFirstIdleAt: TimeInterval?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        launchStartedAt = ProcessInfo.processInfo.systemUptime
         KritTrace.installPanicCapture()
         // Pin the chosen appearance (System / Light / Dark) before any window opens.
         AppearanceMode.applyCurrent()
@@ -45,31 +50,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             self?.presentationZoom.exitForCapture()
             self?.liveAnnotation.exitDrawModeKeepingAnnotations()
         }
-        captureTrigger = CaptureTrigger(engine: captureEngine)
+        if CaptureTrigger.isEnabled() {
+            captureTrigger = CaptureTrigger(engine: captureEngine)
+        }
         uiTestRunner = UITestRunner()
         refreshAutomationPort()
         setupStatusItem()
         registerHotkeys()
-        // Arms Sparkle's scheduled background update checks (the shared instance
-        // starts the updater on first touch).
-        _ = UpdaterManager.shared
+        launchCriticalReadyAt = ProcessInfo.processInfo.systemUptime
+        schedulePostFirstIdleWork()
+        if KritBundleRuntimeProbe.isRequested {
+            KritBundleRuntimeProbe.run()
+            return
+        }
         // Re-bind the dynamic per-preset hotkeys whenever a preset is added,
         // edited, or removed in Preferences.
         PresetStore.onChange = { [weak self] in self?.hotkeyManager.registerPresets() }
-        CaptureEngine.warmCaptureSound()
-        let promptForNativeShortcuts = { [weak self] in
-            NativeShortcutManager.promptIfNeeded {
-                self?.registerHotkeys()
-                self?.showReadyToastIfNeeded(delay: 2.2)
-            }
-        }
+        // A harness launch owns the visible surface for its scenario. First-run,
+        // shortcut, and release-note windows would cover that surface and make
+        // the result depend on whichever preferences domain the temp bundle uses.
+        guard !KritTestHarness.isEnabled else { return }
         // Feature Tour only follows the welcome wizard on a genuine first run
         // (the branch where showIfNeeded actually presented it and later
         // closes); the "already launched before" branch below keeps calling
         // promptForNativeShortcuts() alone, so normal launches and updates
         // never see the tour (WhatsNew already covers updates).
         let onWelcomeClose = { [weak self] in
-            promptForNativeShortcuts()
+            self?.promptForNativeShortcuts()
             // Match the capture actions: drop any live overlay (presentation zoom
             // or live-annotation draw mode, both at `.screenSaver` level) before
             // presenting, so the tour's `.floating` window can't open behind and be
@@ -79,7 +86,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             self?.featureTour.showOnFirstRunIfNeeded()
         }
         if !welcomeController.showIfNeeded(onClose: onWelcomeClose) {
-            promptForNativeShortcuts()
+            // Reading the global macOS shortcut domain can touch cfprefsd and the
+            // resulting alert enters a modal session. Neither belongs inside
+            // applicationDidFinishLaunching, after capture is already ready.
+            DispatchQueue.main.async { [weak self] in
+                self?.promptForNativeShortcuts()
+            }
         }
         // After an update, surface the release notes once (gated on a version
         // change; skipped on a fresh install, where the welcome runs instead).
@@ -88,10 +100,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
-    /// Brings the automation port up or down to match the current gate
-    /// (`Settings.automationEnabled` or the test env). Called at launch and again
-    /// whenever the Preferences toggle flips, so enabling automation takes effect
-    /// without a relaunch and disabling it tears the port down immediately.
+    /// Returns control to the first run-loop idle before initializing optional
+    /// services. The status item and global capture hotkeys are already live at
+    /// this point; Sparkle validation and sound resource I/O cannot delay them.
+    private func schedulePostFirstIdleWork() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.launchFirstIdleAt = ProcessInfo.processInfo.systemUptime
+            self.installStatusMenuIfNeeded()
+            _ = UpdaterManager.shared
+            CaptureEngine.warmCaptureSound()
+        }
+    }
+
+    private func promptForNativeShortcuts() {
+        NativeShortcutManager.promptIfNeeded { [weak self] in
+            self?.registerHotkeys()
+            self?.showReadyToastIfNeeded(delay: 2.2)
+        }
+    }
+
+    /// Brings the automation port up or down to match the persisted user opt-in.
+    /// Called at launch and again whenever the Preferences toggle flips, so enabling
+    /// automation takes effect without a relaunch and disabling it tears the port
+    /// down immediately.
     func refreshAutomationPort() {
         guard AutomationGate.isEnabled else {
             automationPort?.stop()
@@ -199,22 +231,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case fullscreen
     }
 
-    /// Triggers an interactive capture and, when `then` is non-empty, arms the
-    /// engine's one-shot completion so the chain runs against the PRESENTED image
-    /// once the user finishes the selection. Cancelling the capture clears the
-    /// armed chain (the engine zeroes onNextCaptureFinished on cancel/failure).
-    func captureInteractive(_ kind: InteractiveCaptureKind, then: [URLCommandRouter.ThenAction]) {
-        guard captureEngine != nil else { return }
+    /// Triggers an interactive capture and gives its `then` chain to the engine as
+    /// part of that request. A newer request replaces a pending selector and owns
+    /// its own follow-up. Once a capture attempt is accepted, a rejected request
+    /// cannot replace that attempt's chain. The harness may inject an isolated
+    /// history manager so its end-to-end capture never writes user history.
+    func captureInteractive(
+        _ kind: InteractiveCaptureKind,
+        then: [URLCommandRouter.ThenAction],
+        historyManagerOverride: HistoryManager? = nil
+    ) {
+        guard let engine = captureEngine, let liveHistoryManager = historyManager else { return }
+        let targetHistoryManager = historyManagerOverride ?? liveHistoryManager
         let chain = then.compactMap { $0.captureAction }
-        if !chain.isEmpty {
-            captureEngine.onNextCaptureFinished = { image, _ in
-                CaptureActionChain.apply(chain, to: image)
+        let followUp: ((CaptureDeliveryReceipt) -> Void)? = chain.isEmpty
+            ? nil
+            : { receipt in
+                CaptureActionChain.apply(
+                    chain,
+                    to: receipt.presentedImage,
+                    artifact: receipt.presentedArtifact
+                )
             }
-        }
-        switch kind {
-        case .area:       captureArea()
-        case .window:     captureWindow()
-        case .fullscreen: captureFullscreen()
+
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        engine.enqueueInteractiveRequest {
+            switch kind {
+            case .area:
+                await engine.startAreaCapture(
+                    historyManager: targetHistoryManager,
+                    followUp: followUp
+                )
+            case .window:
+                await engine.startWindowCapture(
+                    historyManager: targetHistoryManager,
+                    followUp: followUp
+                )
+            case .fullscreen:
+                await engine.captureFullscreen(
+                    historyManager: targetHistoryManager,
+                    followUp: followUp
+                )
+            }
         }
     }
 
@@ -300,16 +359,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 icon?.isTemplate = true
                 button.image = icon
             }
-            item.menu = buildMenu()
+            let menu = NSMenu()
+            menu.delegate = self
+            item.menu = menu
             statusItem = item
         } else if let item = statusItem {
             NSStatusBar.system.removeStatusItem(item)
             statusItem = nil
+            didBuildStatusMenu = false
         }
     }
 
     func buildMenu() -> NSMenu {
         let menu = NSMenu()
+        populateStatusMenu(menu)
+        return menu
+    }
+
+    private func installStatusMenuIfNeeded() {
+        guard !didBuildStatusMenu, let menu = statusItem?.menu else { return }
+        populateStatusMenu(menu)
+    }
+
+    private func populateStatusMenu(_ menu: NSMenu) {
+        guard !didBuildStatusMenu else { return }
+        didBuildStatusMenu = true
+        menu.removeAllItems()
         // Delegate refreshes the "Recent Captures" section on every open
         // (menuNeedsUpdate) so it always mirrors the current history.
         menu.delegate = self
@@ -380,31 +455,149 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
         let quit = NSMenuItem(title: "Quit KRIT", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
-
-        return menu
     }
 
     // Test-only: exposes the capture engine so the UI-test harness can exercise
     // the isolated window-capture path against a real KRIT window.
     var uiTestCaptureEngine: CaptureEngine { captureEngine }
+    var uiTestPresentationZoom: PresentationZoomController { presentationZoom }
+    var uiTestLaunchReadiness: [String: Any] {
+        let critical = launchCriticalReadyAt.map { ($0 - launchStartedAt) * 1_000 }
+        let firstIdle = launchFirstIdleAt.map { ($0 - launchStartedAt) * 1_000 }
+        return [
+            "criticalReady": launchCriticalReadyAt != nil,
+            "firstIdleReached": launchFirstIdleAt != nil,
+            "hotkeysReady": didRegisterHotkeys,
+            "statusMenuReady": didBuildStatusMenu,
+            "criticalReadyMs": critical ?? -1,
+            "firstIdleMs": firstIdle ?? -1,
+        ]
+    }
 
     // MARK: - Actions
 
-    @objc func allInOne()            { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startAllInOne(historyManager: historyManager) } }
-    @objc func captureArea()         { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startAreaCapture(historyManager: historyManager) } }
-    @objc func captureWindow()       { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startWindowCapture(historyManager: historyManager) } }
-    @objc func captureFullscreen()   { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.captureFullscreen(historyManager: historyManager) } }
-    @objc func capturePrevious()     { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.capturePreviousArea(historyManager: historyManager) } }
-    @objc func snapAndPaste()        { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startSnapAndPaste(historyManager: historyManager) } }
-    @objc func captureScrolling()    { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startScrollingCapture(historyManager: historyManager) } }
-    @objc func recordArea()          { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startAreaRecording() } }
-    @objc func recordWindow()        { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startWindowRecording() } }
-    @objc func recordFullscreen()    { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startFullscreenRecording() } }
+    private func enqueueInteractiveCapture(
+        _ operation: @escaping @MainActor (CaptureEngine, HistoryManager) async -> Void
+    ) {
+        guard let engine = captureEngine, let manager = historyManager else { return }
+        engine.enqueueInteractiveRequest {
+            await operation(engine, manager)
+        }
+    }
+
+    private func enqueueInteractiveEngineAction(
+        _ operation: @escaping @MainActor (CaptureEngine) async -> Void
+    ) {
+        guard let engine = captureEngine else { return }
+        engine.enqueueInteractiveRequest {
+            await operation(engine)
+        }
+    }
+
+    @objc func allInOne() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveCapture { engine, manager in
+            await engine.startAllInOne(historyManager: manager)
+        }
+    }
+
+    @objc func captureArea() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveCapture { engine, manager in
+            await engine.startAreaCapture(historyManager: manager)
+        }
+    }
+
+    @objc func captureWindow() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveCapture { engine, manager in
+            await engine.startWindowCapture(historyManager: manager)
+        }
+    }
+
+    @objc func captureFullscreen() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveCapture { engine, manager in
+            await engine.captureFullscreen(historyManager: manager)
+        }
+    }
+
+    @objc func capturePrevious() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveCapture { engine, manager in
+            await engine.capturePreviousArea(historyManager: manager)
+        }
+    }
+
+    @objc func snapAndPaste() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveCapture { engine, manager in
+            await engine.startSnapAndPaste(historyManager: manager)
+        }
+    }
+
+    @objc func captureScrolling() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveCapture { engine, manager in
+            await engine.startScrollingCapture(historyManager: manager)
+        }
+    }
+
+    @objc func recordArea() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveEngineAction { engine in
+            await engine.startAreaRecording()
+        }
+    }
+
+    @objc func recordWindow() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveEngineAction { engine in
+            await engine.startWindowRecording()
+        }
+    }
+
+    @objc func recordFullscreen() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveEngineAction { engine in
+            await engine.startFullscreenRecording()
+        }
+    }
     @objc func stopRecording()       { captureEngine.stopRecording() }
     @objc func reopenLastRecording() { captureEngine.reopenLastRecording() }
-    @objc func captureText()         { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startOCRCapture() } }
-    @objc func pickColor()           { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startColorPick() } }
-    @objc func scanQRCode()          { presentationZoom.exitForCapture(); liveAnnotation.exitDrawModeKeepingAnnotations(); Task { await captureEngine.startQRCodeCapture() } }
+    @objc func captureText() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveEngineAction { engine in
+            await engine.startOCRCapture()
+        }
+    }
+
+    @objc func pickColor() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveEngineAction { engine in
+            await engine.startColorPick()
+        }
+    }
+
+    @objc func scanQRCode() {
+        presentationZoom.exitForCapture()
+        liveAnnotation.exitDrawModeKeepingAnnotations()
+        enqueueInteractiveEngineAction { engine in
+            await engine.startQRCodeCapture()
+        }
+    }
     @objc func togglePresentationZoom() { presentationZoom.toggle() }
     @objc func toggleLiveAnnotation() { liveAnnotation.toggleDrawMode() }
     @objc func showEditor()          { AnnotationWindowController.bringOpenEditorsToFront() }
@@ -438,6 +631,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }()
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if !didBuildStatusMenu {
+            populateStatusMenu(menu)
+        }
         rebuildRecentCapturesSection(in: menu)
     }
 
@@ -462,7 +658,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let recents = historyManager.items.prefix(3)
         if recents.isEmpty {
             // No action and no target leaves the item disabled automatically.
-            section.append(NSMenuItem(title: "No captures yet", action: nil, keyEquivalent: ""))
+            let title = historyManager.isLoading ? "Loading captures…" : "No captures yet"
+            section.append(NSMenuItem(title: title, action: nil, keyEquivalent: ""))
         } else {
             for item in recents {
                 section.append(makeRecentCaptureMenuItem(for: item))
@@ -542,12 +739,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     @objc private func copyRecentCapture(_ sender: NSMenuItem) {
         guard let item = sender.representedObject as? HistoryItem else { return }
-        ImageExporter.copyToClipboard(image: item.fullImage)
+        ImageExporter.copyToClipboard(image: item.presentedImage)
     }
 
     @objc private func showRecentCaptureInFinder(_ sender: NSMenuItem) {
         guard let item = sender.representedObject as? HistoryItem else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.imagePath)])
+        NSWorkspace.shared.activateFileViewerSelecting([item.presentedFileURL])
     }
 
     @objc private func deleteRecentCapture(_ sender: NSMenuItem) {

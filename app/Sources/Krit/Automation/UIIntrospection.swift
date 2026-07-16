@@ -152,6 +152,16 @@ enum UIIntrospection {
             throw AutomationError.uiTargetNotFound("no view with accessibilityIdentifier '\(id)'. Available ids: \(available)")
         }
         let className = String(describing: type(of: found))
+        if let button = found as? NSButton {
+            guard button.isEnabled else {
+                throw AutomationError.uiTargetNotFound("view '\(id)' (\(className)) is disabled")
+            }
+            guard button.action != nil else {
+                throw AutomationError.uiTargetNotFound("view '\(id)' (\(className)) does not have an action")
+            }
+            button.performClick(nil)
+            return (className, id)
+        }
         guard found.accessibilityPerformPress() else {
             throw AutomationError.uiTargetNotFound("view '\(id)' (\(className)) does not implement accessibilityPerformPress()")
         }
@@ -163,8 +173,15 @@ enum UIIntrospection {
         // its window object stays alive, and pressing its hidden trash/close/camera
         // controls fires real side effects the user can't see. `isVisible` is false
         // for an ordered-out window, so it drops out of both the search and the
-        // available-ids list, matching what a user could actually click.
-        for window in NSApp.windows where window.isVisible {
+        // available-ids list, matching what a user could actually click. Start at
+        // the WindowServer-facing front of NSApp.orderedWindows: overlay cards reuse
+        // their action identifiers, and an automation press must choose the topmost
+        // visible card rather than arbitrary NSApp.windows insertion order.
+        var seenWindows = Set<ObjectIdentifier>()
+        let windows = (NSApp.orderedWindows + NSApp.windows).filter {
+            $0.isVisible && seenWindows.insert(ObjectIdentifier($0)).inserted
+        }
+        for window in windows {
             guard let content = window.contentView else { continue }
             if let match = searchView(content, targetId: id, seenIds: &seenIds) { return match }
         }

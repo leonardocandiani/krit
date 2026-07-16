@@ -14,8 +14,12 @@ final class PinnedWindow: NSWindow {
     }
 
     static func closeAll() {
-        pinned.forEach { $0.orderOut(nil) }
+        pinned.forEach {
+            $0.clearSnapHint()
+            $0.orderOut(nil)
+        }
         pinned.removeAll()
+        NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded()
     }
 
     private let imageView: DraggablePinnedImageView
@@ -94,7 +98,13 @@ final class PinnedWindow: NSWindow {
     }
 
     func show() {
+        // Pins are a persistent user-facing surface even when an automation action
+        // creates one from a background-only capture path. Order the persistent
+        // surface first, then promote the policy: AppKit can synchronously drain a
+        // prior close while ordering the window and briefly restore `.prohibited`.
+        // This keeps a new pin from appearing while the app stays background-only.
         orderFrontRegardless()
+        NSApp.setActivationPolicy(.accessory)
         SoundManager.play(.pin)
     }
 
@@ -146,6 +156,7 @@ final class PinnedWindow: NSWindow {
     }
 
     @objc private func closeTapped() {
+        clearSnapHint()
         PinnedWindow.pinned.removeAll { $0 === self }
         orderOut(nil)
         NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded()
@@ -471,6 +482,13 @@ extension PinnedWindow: NSWindowDelegate {
     func windowDidMove(_ notification: Notification) {
         handleWindowDidMove()
     }
+}
+
+extension PinnedWindow {
+    static var uiTestPinnedWindows: [PinnedWindow] { pinned }
+    var uiTestSnapMouseUpMonitorArmed: Bool { snapMouseUpMonitor != nil }
+    func uiTestArmSnapMouseUpMonitor() { armSnapMouseUpMonitor() }
+    func uiTestClose() { closeTapped() }
 }
 
 // NSImageView consumes mouseDown for its own drag-and-drop, which blocks

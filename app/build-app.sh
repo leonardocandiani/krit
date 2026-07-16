@@ -4,7 +4,59 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="KRIT"
 ENTITLEMENTS="$SCRIPT_DIR/Krit.entitlements"
-BUILD_PATH="/tmp/krit-app-build"
+APP_DESTINATION="${KRIT_APP_DESTINATION:-/Applications/$APP_NAME.app}"
+
+usage() {
+    printf '%s\n' \
+        'Usage: build-app.sh [--ui-test-harness] [--build-stamp VALUE]' \
+        '' \
+        '  --ui-test-harness  Build a local-only bundle that enables the unauthenticated' \
+        '                     UI harness when KRIT_UI_TEST=1 is supplied at launch.' \
+        '  --build-stamp      Override CFBundleVersion with one to three numeric components.'
+}
+
+UI_TEST_HARNESS=0
+BUILD_STAMP_OVERRIDE=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ui-test-harness) UI_TEST_HARNESS=1 ;;
+        --build-stamp)
+            if [ "$#" -lt 2 ]; then
+                echo "Error: --build-stamp requires a value" >&2
+                usage >&2
+                exit 2
+            fi
+            shift
+            BUILD_STAMP_OVERRIDE="$1"
+            ;;
+        --build-stamp=*) BUILD_STAMP_OVERRIDE="${1#*=}" ;;
+        -h|--help) usage; exit 0 ;;
+        *)
+            echo "Error: unknown argument '$1'" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if [ -n "$BUILD_STAMP_OVERRIDE" ] && ! [[ "$BUILD_STAMP_OVERRIDE" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+    echo "Error: --build-stamp must contain one to three numeric components" >&2
+    exit 2
+fi
+
+if [ "$UI_TEST_HARNESS" -eq 1 ]; then
+    BUILD_PATH="/tmp/krit-ui-test-build"
+else
+    BUILD_PATH="/tmp/krit-app-build"
+fi
+
+KEYBOARD_SHORTCUTS_PATCH="$SCRIPT_DIR/patches/keyboardshortcuts-2.4.0-resource-bundle.patch"
+if [ ! -f "$KEYBOARD_SHORTCUTS_PATCH" ]; then
+    echo "✗ KeyboardShortcuts resource patch not found: $KEYBOARD_SHORTCUTS_PATCH" >&2
+    exit 1
+fi
+KEYBOARD_SHORTCUTS_PATCH_SHA="$(shasum -a 256 "$KEYBOARD_SHORTCUTS_PATCH" | awk '{print $1}')"
 
 # Assemble and sign the bundle on an APFS path (BUILD_PATH), never inside the
 # source tree. This keeps build artifacts out of the repo and, critically,
@@ -14,12 +66,13 @@ APP_BUNDLE="$BUILD_PATH/$APP_NAME.app"
 
 if [ -f "$SCRIPT_DIR/.env.local" ]; then
     set -a
+    # Local release credentials are intentionally optional.
+    # shellcheck source=/dev/null
     source "$SCRIPT_DIR/.env.local"
     set +a
 fi
 
 SIGN_IDENTITY="${KRIT_CODESIGN_IDENTITY:--}"
-TIMESTAMP_MODE="${KRIT_CODESIGN_TIMESTAMP:-auto}"
 
 # Universal binary: build for BOTH Apple Silicon (arm64) and Intel (x86_64) so
 # the shipped app runs natively on every Mac. A multi-arch `swift build --arch …`
@@ -33,6 +86,42 @@ TIMESTAMP_MODE="${KRIT_CODESIGN_TIMESTAMP:-auto}"
 KRIT_ARCHS="${KRIT_ARCHS-arm64 x86_64}"
 ARCH_FLAGS=()
 for _a in $KRIT_ARCHS; do ARCH_FLAGS+=(--arch "$_a"); done
+
+# Keep dependency resolution locked to Package.resolved. SwiftPM's process
+# sandbox stays enabled for normal builds; nested automation sandboxes can opt
+# out explicitly when macOS refuses a second sandbox layer.
+SWIFTPM_FLAGS=(--disable-index-store --force-resolved-versions)
+SWIFTPM_RESOLVE_FLAGS=(--scratch-path "$BUILD_PATH" --force-resolved-versions)
+if [ "${KRIT_DISABLE_SWIFTPM_SANDBOX:-0}" = "1" ]; then
+    SWIFTPM_FLAGS+=(--disable-sandbox)
+    SWIFTPM_RESOLVE_FLAGS+=(--disable-sandbox)
+fi
+
+# The distributed-notification UI harness is compiled only for an explicit local
+# test bundle. A normal release build ignores KRIT_UI_TEST entirely, even when
+# the caller has a similarly named environment variable set.
+TEST_HARNESS_FLAGS=()
+if [ "$UI_TEST_HARNESS" -eq 1 ]; then
+    TEST_HARNESS_FLAGS=(-Xswiftc -D -Xswiftc KRIT_TEST_HARNESS)
+    echo "▶ Including local UI test harness"
+fi
+
+# SwiftPM does not reliably invalidate object files when only a custom `-D`
+# compilation condition changes. A stale object from a normal build makes a
+# plist-marked harness silently ignore KRIT_UI_TEST, which is worse than a
+# visible build failure. Keep one mode marker next to the disposable /tmp build
+# tree and start clean only when that mode changes or an older tree has no marker.
+BUILD_MODE="release:$KEYBOARD_SHORTCUTS_PATCH_SHA"
+if [ "$UI_TEST_HARNESS" -eq 1 ]; then
+    BUILD_MODE="ui-test-harness:$KEYBOARD_SHORTCUTS_PATCH_SHA"
+fi
+BUILD_MODE_FILE="$BUILD_PATH/.krit-build-mode"
+if [ ! -f "$BUILD_MODE_FILE" ] || [ "$(cat "$BUILD_MODE_FILE")" != "$BUILD_MODE" ]; then
+    echo "▶ Resetting stale $BUILD_MODE build artifacts…"
+    rm -rf "$BUILD_PATH" "${BUILD_PATH}-cli"
+    mkdir -p "$BUILD_PATH"
+    printf '%s\n' "$BUILD_MODE" > "$BUILD_MODE_FILE"
+fi
 
 # Fail loudly if a shipped Mach-O is missing one of the requested arch slices —
 # a half-universal binary that silently dropped Intel is exactly the bug this
@@ -52,17 +141,47 @@ assert_archs() {
 
 echo "▶ Building $APP_NAME (release, archs: $KRIT_ARCHS)…"
 cd "$SCRIPT_DIR"
+# SwiftPM incrementally copies resources into an existing bundle but does not
+# remove files that disappeared from Sources. Recreate only KRIT's generated
+# resource bundle so retired wallpapers cannot leak into a later release build.
+if [ -d "$BUILD_PATH" ]; then
+    find "$BUILD_PATH" -type d -name "Krit_KritKit.bundle" -prune -exec rm -rf {} +
+fi
+
+# SwiftPM's command-line resource accessor probes Bundle.main.bundleURL, which
+# is the .app root on macOS. A signed macOS app must keep resources under
+# Contents/Resources, so KeyboardShortcuts needs a deterministic source patch
+# that resolves its localization bundle from the standard app layout instead.
+echo "▶ Resolving locked dependencies…"
+swift package "${SWIFTPM_RESOLVE_FLAGS[@]}" resolve
+KEYBOARD_SHORTCUTS_CHECKOUT="$BUILD_PATH/checkouts/KeyboardShortcuts"
+if [ ! -d "$KEYBOARD_SHORTCUTS_CHECKOUT" ]; then
+    echo "✗ KeyboardShortcuts checkout not found under $BUILD_PATH/checkouts"
+    exit 1
+fi
+if git -C "$KEYBOARD_SHORTCUTS_CHECKOUT" apply --reverse --check "$KEYBOARD_SHORTCUTS_PATCH" >/dev/null 2>&1; then
+    echo "▶ KeyboardShortcuts resource patch already applied"
+else
+    if ! git -C "$KEYBOARD_SHORTCUTS_CHECKOUT" apply --check "$KEYBOARD_SHORTCUTS_PATCH"; then
+        echo "✗ KeyboardShortcuts resource patch no longer applies cleanly"
+        exit 1
+    fi
+    git -C "$KEYBOARD_SHORTCUTS_CHECKOUT" apply "$KEYBOARD_SHORTCUTS_PATCH"
+    echo "▶ Applied KeyboardShortcuts resource patch"
+fi
 # Build ONLY the app target here. The "krit" CLI product collides with the "Krit"
 # app binary in a shared release dir on case-insensitive volumes, so it is built
 # separately below into its own path.
-swift build -c release --product KritApp "${ARCH_FLAGS[@]}" --build-path "$BUILD_PATH" 2>&1
+swift build -c release --product KritApp "${SWIFTPM_FLAGS[@]}" \
+    "${ARCH_FLAGS[@]}" "${TEST_HARNESS_FLAGS[@]}" --build-path "$BUILD_PATH" 2>&1
 
 # The CLI product is named "krit", which collides with the "Krit" app binary in
 # the same release directory on case-insensitive volumes (APFS default, exFAT).
 # Build it into a dedicated path so both binaries materialize.
 CLI_BUILD_PATH="$BUILD_PATH-cli"
 echo "▶ Building krit CLI (release, archs: $KRIT_ARCHS)…"
-swift build -c release --product krit "${ARCH_FLAGS[@]}" --build-path "$CLI_BUILD_PATH" 2>&1
+swift build -c release --product krit "${SWIFTPM_FLAGS[@]}" \
+    "${ARCH_FLAGS[@]}" --build-path "$CLI_BUILD_PATH" 2>&1
 
 # Locating the product binary has to survive THREE SPM output layouts:
 #   - flat llbuild:        $BUILD_PATH/release/KritApp
@@ -119,10 +238,23 @@ cp "$BINARY"                "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$CLI_BINARY"            "$APP_BUNDLE/Contents/Helpers/krit"
 cp "$SCRIPT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
+if [ "$UI_TEST_HARNESS" -eq 1 ]; then
+    if /usr/libexec/PlistBuddy -c "Print :KritUIHarnessBuild" "$APP_BUNDLE/Contents/Info.plist" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Set :KritUIHarnessBuild true" "$APP_BUNDLE/Contents/Info.plist"
+    else
+        /usr/libexec/PlistBuddy -c "Add :KritUIHarnessBuild bool true" "$APP_BUNDLE/Contents/Info.plist"
+    fi
+else
+    /usr/libexec/PlistBuddy -c "Delete :KritUIHarnessBuild" "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || true
+fi
+
 # Stamp the bundle with the build time so the installed app is identifiable:
 #   defaults read /Applications/KRIT.app/Contents/Info CFBundleVersion
 # answers "which build am I actually running?" without guessing.
-BUILD_STAMP="$(date +%Y%m%d.%H%M)"
+# Local release verification can provide a deterministic stamp. Keeping that
+# input on the command line avoids silently inheriting a build number from the
+# environment, while normal builds continue to use the current build time.
+BUILD_STAMP="${BUILD_STAMP_OVERRIDE:-$(date +%Y%m%d.%H%M)}"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_STAMP" "$APP_BUNDLE/Contents/Info.plist"
 echo "▶ Build stamp: $BUILD_STAMP"
 
@@ -144,13 +276,10 @@ fi
 # through Bundle.module, which fatalErrors the instant its .bundle is missing
 # from the app: that was the Shortcuts-tab crash (KeyboardShortcuts'
 # RecorderCocoa -> String.localized -> Bundle.module on the absent
-# KeyboardShortcuts_KeyboardShortcuts.bundle). Prefer the CURRENT run's products
-# dir (same layout rule as the binaries), fall back to a tree scan.
-if [ ${#ARCH_FLAGS[@]} -gt 0 ]; then
-    PRODUCTS_DIR="$BUILD_PATH/apple/Products/Release"
-else
-    PRODUCTS_DIR="$BUILD_PATH/release"
-fi
+# KeyboardShortcuts_KeyboardShortcuts.bundle). Only copy bundles next to the
+# binary produced by this build. Dependency trees contain test fixtures that
+# must never leak into the application resources.
+PRODUCTS_DIR="$(dirname "$BINARY")"
 RESOURCE_BUNDLES=()
 if [ -d "$PRODUCTS_DIR" ]; then
     for b in "$PRODUCTS_DIR"/*.bundle; do
@@ -158,8 +287,8 @@ if [ -d "$PRODUCTS_DIR" ]; then
     done
 fi
 if [ ${#RESOURCE_BUNDLES[@]} -eq 0 ]; then
-    while IFS= read -r b; do RESOURCE_BUNDLES+=("$b"); done \
-        < <(find "$BUILD_PATH" -name "*.bundle" -type d 2>/dev/null)
+    echo "✗ No resource bundles found next to $BINARY"
+    exit 1
 fi
 for b in "${RESOURCE_BUNDLES[@]}"; do
     rm -rf "$APP_BUNDLE/Contents/Resources/$(basename "$b")"
@@ -262,14 +391,18 @@ else
         "$APP_BUNDLE"
 fi
 
-echo "▶ Copying to /Applications…"
-APPS_DEST="/Applications/$APP_NAME.app"
+echo "▶ Copying to $APP_DESTINATION…"
+APPS_DEST="$APP_DESTINATION"
+mkdir -p "$(dirname "$APPS_DEST")"
 rm -rf "$APPS_DEST"
 cp -R "$APP_BUNDLE" "$APPS_DEST"
 
 echo ""
-echo "✓ Done!  KRIT.app deployed to /Applications."
-echo "  Launch it from /Applications."
+echo "✓ Done!  KRIT.app deployed to $APPS_DEST."
+echo "  Launch it from $APPS_DEST."
+if [ "$UI_TEST_HARNESS" -eq 1 ]; then
+    echo "  This is a local UI harness bundle. Do not package or distribute it."
+fi
 echo ""
 echo "  First launch: grant Screen Recording permission when prompted"
 echo "  (System Settings → Privacy & Security → Screen Recording)"

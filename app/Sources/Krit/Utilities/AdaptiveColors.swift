@@ -54,30 +54,32 @@ enum KritColors {
     }
 
     static let pillButtonBackground = NSColor(name: "pillButton") { appearance in
+        let opaque = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
-        case .darkAqua: return NSColor.white.withAlphaComponent(0.92)
-        default:        return NSColor.white.withAlphaComponent(0.95)
+        case .darkAqua: return NSColor.black.withAlphaComponent(opaque ? 0.82 : 0.48)
+        default:        return NSColor.black.withAlphaComponent(opaque ? 0.82 : 0.52)
         }
     }
 
     static let pillButtonHover = NSColor(name: "pillButtonHover") { appearance in
+        let opaque = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
-        case .darkAqua: return NSColor.white
-        default:        return NSColor.white
+        case .darkAqua: return coral.withAlphaComponent(opaque ? 0.72 : 0.42)
+        default:        return coral.withAlphaComponent(opaque ? 0.76 : 0.46)
         }
     }
 
     static let pillButtonPressed = NSColor(name: "pillButtonPressed") { appearance in
         switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
-        case .darkAqua: return NSColor.white.withAlphaComponent(0.75)
-        default:        return NSColor.white.withAlphaComponent(0.75)
+        case .darkAqua: return coral.withAlphaComponent(0.76)
+        default:        return coral.withAlphaComponent(0.80)
         }
     }
 
     static let pillButtonText = NSColor(name: "pillButtonText") { appearance in
         switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
-        case .darkAqua: return NSColor.black.withAlphaComponent(0.85)
-        default:        return NSColor.black.withAlphaComponent(0.85)
+        case .darkAqua: return NSColor.white.withAlphaComponent(0.92)
+        default:        return NSColor.white.withAlphaComponent(0.94)
         }
     }
 
@@ -135,6 +137,22 @@ enum KritColors {
         switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
         case .darkAqua: return NSColor.white.withAlphaComponent(0.13)
         default:        return NSColor.black.withAlphaComponent(0.10)
+        }
+    }
+
+    /// Pointer feedback for compact editor tools. These remain neutral so coral
+    /// keeps its meaning as a primary action or a committed toggle state.
+    static let editorToolHoverFill = NSColor(name: "editorToolHoverFill") { appearance in
+        switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
+        case .darkAqua: return NSColor.white.withAlphaComponent(0.10)
+        default:        return NSColor.black.withAlphaComponent(0.08)
+        }
+    }
+
+    static let editorToolPressedFill = NSColor(name: "editorToolPressedFill") { appearance in
+        switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
+        case .darkAqua: return NSColor.white.withAlphaComponent(0.18)
+        default:        return NSColor.black.withAlphaComponent(0.15)
         }
     }
 

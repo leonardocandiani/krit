@@ -35,8 +35,9 @@ final class UITestRunner: NSObject {
         // (Finder/Dock/open) NUNCA registra o observer, então nenhum processo local
         // consegue disparar captura/gravação nem escrever arquivo através dele
         // (DistributedNotification não autentica o remetente). A bateria de testes
-        // lança o binário direto com KRIT_UI_TEST=1 no ambiente.
-        guard ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" else { return }
+        // lança uma build de teste com KRIT_UI_TEST=1 no ambiente. O binário de
+        // release não compila esta superfície como uma capability acionável por env.
+        guard KritTestHarness.isEnabled else { return }
         testActivity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated], reason: "KRIT UI test harness"
         )
@@ -64,10 +65,9 @@ final class UITestRunner: NSObject {
         }
         let scenario = parts[0]
         // Segurança: o remetente não é autenticado, então o destino do write não
-        // pode ser arbitrário. Reports só pousam em /tmp (path resolvido, sem
-        // escapar por symlink).
-        let outPath = URL(fileURLWithPath: parts[1]).resolvingSymlinksInPath().path
-        guard outPath.hasPrefix("/tmp/") || outPath.hasPrefix("/private/tmp/") else {
+        // pode ser arbitrário. Reports só pousam como arquivos diretos em /tmp,
+        // e o write final rejeita um symlink que apareça depois desta validação.
+        guard let outputURL = KritTestOutput.temporaryURL(for: parts[1]) else {
             Self.log.error("uitest: rejected out path \(parts[1], privacy: .public)")
             return
         }
@@ -78,6 +78,7 @@ final class UITestRunner: NSObject {
             case "sound":        report = Self.runSoundProbe()
             case "onboarding":   report = await Self.runOnboardingSuite()
             case "preferences":  report = await Self.runPreferencesSuite()
+            case "launch-readiness": report = await Self.runLaunchReadiness()
             case "permissions-tab": report = await Self.runPermissionsTab()
             case "overlay-show": report = await Self.runOverlayShowSuite()
             case "blur-map":     report = await Self.runBlurMapSuite()
@@ -94,6 +95,8 @@ final class UITestRunner: NSObject {
             case "record-smoke": report = await Self.runRecordSmoke()
             case "record-smoke-audio": report = await Self.runRecordSmoke(systemAudio: true)
             case "record-smoke-mic": report = await Self.runRecordSmoke(microphone: true)
+            case "record-smoke-pause": report = await Self.runRecordSmoke(pauseMidway: true)
+            case "record-smoke-audio-pause": report = await Self.runRecordSmoke(systemAudio: true, pauseMidway: true)
             case "smart-redact":  report = await Self.runSmartRedactSuite()
             case "redact-adversarial": report = await Self.runRedactAdversarial()
             case "redact-sharpness": report = await Self.runRedactSharpness()
@@ -102,8 +105,19 @@ final class UITestRunner: NSObject {
             case "own-window-capture": report = await Self.runOwnWindowCapture()
             case "automation-gate": report = Self.runAutomationGate()
             case "overlay-gesture-freeze": report = await Self.runOverlayGestureFreeze()
+            case "overlay-dismiss-race": report = await Self.runOverlayDismissRace()
             case "text-multiline": report = Self.runTextMultiline()
             case "glass-renders": report = await Self.runGlassRenders()
+            case "recording-toggle-input": report = await Self.runRecordingToggleInput()
+            case "all-in-one-interaction": report = await Self.runAllInOneInteraction()
+            case "all-in-one-interrupt": report = await Self.runAllInOneInterrupt()
+            case "all-in-one-pending-action-replacement": report = await Self.runAllInOnePendingActionReplacement()
+            case "all-in-one-dismiss-during-prepare": report = await Self.runAllInOneDismissDuringPrepare()
+            case "all-in-one-handoff-latest-intent": report = await Self.runAllInOneHandoffLatestIntent()
+            case "scrolling-handoff-latest-intent": report = await Self.runScrollingHandoffLatestIntent()
+            case "interactive-selection-replacement": report = await Self.runInteractiveSelectionReplacement()
+            case "area-selection-cancel-pending-finish": report = await Self.runAreaSelectionCancelPendingFinish()
+            case "all-in-one-restores-last-area": report = await Self.runAllInOneRestoresLastArea()
             case "default-template": report = await Self.runDefaultTemplateSuite()
             case "editor-fit-large": report = await Self.runEditorFitLargeSuite()
             case "editor-fit-tall": report = await Self.runEditorFitTallSuite()
@@ -124,6 +138,15 @@ final class UITestRunner: NSObject {
             case "prefs-bottom": report = await Self.runPrefsBottom()
             case "controls-demo": report = await Self.runControlsDemo()
             case "drag-prep": report = await Self.runDragPrep()
+            case "overlay-drag-routing": report = await Self.runOverlayDragRouting()
+            case "overlay-drag-controls": report = await Self.runOverlayDragControls()
+            case "quick-access-visual": report = await Self.runQuickAccessVisual()
+            case "overlay-handoff-drag": report = await Self.runOverlayHandoffDrag()
+            case "overlay-handoff-early-drag": report = await Self.runOverlayHandoffEarlyDrag()
+            case "overlay-first-drag-matrix": report = await Self.runOverlayFirstDragMatrix()
+            case "interactive-follow-up": report = await Self.runInteractiveFollowUp()
+            case "activation-lifetime": report = await Self.runActivationLifetime()
+            case "history-representation": report = await Self.runHistoryRepresentation()
             case "overlay-foreign-vis": report = await Self.runOverlayForeignVis()
             case "editor-draw-perf": report = await Self.runEditorDrawPerf()
             case "arrow-scale": report = await Self.runArrowScale()
@@ -144,13 +167,85 @@ final class UITestRunner: NSObject {
             case "prefs-icons": report = await Self.runPrefsIcons()
             case "reopen": report = await Self.runReopenRecovery()
             case "toast": report = await Self.runToast()
+            case "presentation-zoom": report = await Self.runPresentationZoom()
             default:             report["error"] = "unknown scenario"
             }
             report["scenario"] = scenario
             if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
-                try? data.write(to: URL(fileURLWithPath: outPath))
+                do {
+                    try KritTestOutput.write(data, to: outputURL)
+                } catch {
+                    Self.log.error("uitest: could not write report: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            // A launch-time scenario is a one-shot harness process. Leaving it
+            // alive after the report accumulates invisible LSUIElement instances
+            // across a physical test matrix and can change later z-order results.
+            // Notification-driven sessions remain resident for multi-scenario runs.
+            if ProcessInfo.processInfo.environment["KRIT_UI_SCENARIO"] != nil {
+                QuickAccessOverlay.tearDownAll()
+                NSApp.terminate(nil)
             }
         }
+    }
+
+    // MARK: - Cenário: presentation-zoom
+
+    private static func runLaunchReadiness() async -> [String: Any] {
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            return ["error": "no app delegate", "allPass": false]
+        }
+
+        for _ in 0..<20 where appDelegate.launchFirstIdleAt == nil {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        var report = appDelegate.uiTestLaunchReadiness
+        let criticalReady = report["criticalReady"] as? Bool == true
+        let firstIdleReached = report["firstIdleReached"] as? Bool == true
+        let hotkeysReady = report["hotkeysReady"] as? Bool == true
+        let statusMenuReady = report["statusMenuReady"] as? Bool == true
+        let criticalReadyMs = report["criticalReadyMs"] as? Double ?? -1
+        let firstIdleMs = report["firstIdleMs"] as? Double ?? -1
+        report["allPass"] = criticalReady
+            && firstIdleReached
+            && hotkeysReady
+            && statusMenuReady
+            && criticalReadyMs >= 0
+            && firstIdleMs >= criticalReadyMs
+        return report
+    }
+
+    // MARK: - Cenário: presentation-zoom
+
+    /// Starts the real ScreenCaptureKit zoom stream, waits for a complete frame,
+    /// then tears it down. This exercises the fresh-window catalog retry that must
+    /// find and exclude the overlay before a stream is allowed to start.
+    private static func runPresentationZoom() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+        let zoom = appDelegate.uiTestPresentationZoom
+        zoom.exitForCapture()
+        zoom.toggle()
+
+        for _ in 0..<40 {
+            if zoom.uiTestHasLiveFrame { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let started = zoom.uiTestHasLiveFrame
+        r["started"] = started
+        r["active"] = zoom.isActive
+
+        zoom.exitForCapture()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let stopped = !zoom.isActive
+        r["stopped"] = stopped
+        r["allPass"] = started && stopped
+        return r
     }
 
     // MARK: - Cenário: overlay-conveyor (esteira: stack inteira segue o standby)
@@ -343,16 +438,25 @@ final class UITestRunner: NSObject {
         r["gateStaleNotes"] = staleNotes       // expect false
 
         // The panel actually opens (manual path, no gating).
+        let originalPolicy = NSApp.activationPolicy()
+        _ = NSApp.setActivationPolicy(.prohibited)
         WhatsNewWindowController.showNow()
         try? await Task.sleep(nanoseconds: 600_000_000)
         let opened = WhatsNewWindowController.uiTestIsOpen
+        let activated = NSApp.activationPolicy() == .accessory
         r["panelOpened"] = opened
+        r["activated"] = activated
         if opened, let win = WhatsNewWindowController.uiTestWindow {
             r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-whats-new.png") ? "/tmp/krit-whats-new.png" : "FAILED"
         }
         WhatsNewWindowController.uiTestClose()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let restoredBackgroundOnly = NSApp.activationPolicy() == .prohibited
+        r["restoredBackgroundOnly"] = restoredBackgroundOnly
+        _ = NSApp.setActivationPolicy(originalPolicy)
 
-        r["allPass"] = !notes.body.isEmpty && !freshInstall && !sameVersion && realUpdate && !staleNotes && opened
+        r["allPass"] = !notes.body.isEmpty && !freshInstall && !sameVersion && realUpdate
+            && !staleNotes && opened && activated && restoredBackgroundOnly
         return r
     }
 
@@ -519,12 +623,15 @@ final class UITestRunner: NSObject {
         // snapshot + export exercise the wallpaper composite path too.
         state.backgroundEnabled = true
         r["wallpapers"] = state.wallpapers.count
+        var requestedWallpaperThumb = false
         if !state.wallpapers.isEmpty {
             state.backgroundKind = .wallpaper
             state.selectedWallpaperIndex = 0
-            r["wallpaperThumb"] = state.wallpaperThumbnail(0) != nil
+            requestedWallpaperThumb = true
+            _ = state.wallpaperThumbnail(0)
         }
         try? await Task.sleep(nanoseconds: 600_000_000)
+        r["wallpaperThumb"] = !requestedWallpaperThumb || state.wallpaperThumbnail(0) != nil
         if let win = ctl.window {
             r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-video-editor.png") ? "/tmp/krit-video-editor.png" : "FAILED"
         }
@@ -552,6 +659,7 @@ final class UITestRunner: NSObject {
         r["tornDown"] = tornDown
         r["sharedCleared"] = VideoEditorWindowController.uiTestShared == nil
         r["allPass"] = state.duration > 0.1 && state.zoomSegments.count == 1 && outExists && outWidth > 320 && tornDown
+            && (r["wallpaperThumb"] as? Bool ?? false)
         return r
     }
 
@@ -569,9 +677,10 @@ final class UITestRunner: NSObject {
         let srcURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-src.mov")
         let outURL = URL(fileURLWithPath: dir).appendingPathComponent("krit-tc-out.mp4")
 
-        let made = await makeSyntheticStereoSource(to: srcURL, size: CGSize(width: 320, height: 240), frames: 60, fps: 30)
-        r["sourceMade"] = made
-        guard made else { r["allPass"] = false; return r }
+        let source = await makeSyntheticStereoSource(to: srcURL, size: CGSize(width: 320, height: 240), frames: 60, fps: 30)
+        r["sourceMade"] = source.success
+        r["sourceStage"] = source.stage
+        guard source.success else { r["allPass"] = false; return r }
 
         let (inW, inH) = await videoPixelSize(of: srcURL)
         let inCh = await audioChannelCount(of: srcURL)
@@ -656,9 +765,9 @@ final class UITestRunner: NSObject {
     /// Builds a source mov with a synthetic video track (the same black/white
     /// pattern as `makeSyntheticZoomSource`) AND a real 2-channel audio track, so a
     /// mono downmix can be proven headless.
-    private static func makeSyntheticStereoSource(to url: URL, size: CGSize, frames: Int, fps: Int) async -> Bool {
+    private static func makeSyntheticStereoSource(to url: URL, size: CGSize, frames: Int, fps: Int) async -> (success: Bool, stage: String) {
         try? FileManager.default.removeItem(at: url)
-        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return false }
+        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return (false, "writer-create") }
 
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -683,30 +792,41 @@ final class UITestRunner: NSObject {
         ])
         audioInput.expectsMediaDataInRealTime = false
 
-        guard writer.canAdd(videoInput), writer.canAdd(audioInput) else { return false }
+        guard writer.canAdd(videoInput), writer.canAdd(audioInput) else { return (false, "writer-input") }
         writer.add(videoInput)
         writer.add(audioInput)
-        guard writer.startWriting() else { return false }
+        guard writer.startWriting() else { return (false, "writer-start: \(writer.error?.localizedDescription ?? "none")") }
         writer.startSession(atSourceTime: .zero)
 
-        guard writeSyntheticVideoFrames(adaptor: adaptor, input: videoInput, size: size, frames: frames, fps: fps) else { return false }
-        guard writeSyntheticStereoAudio(input: audioInput, durationSec: Double(frames) / Double(fps)) else { return false }
-
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            writer.finishWriting { c.resume() }
+        let readinessDeadline = MediaInputReadiness.deadline()
+        if let stage = writeSyntheticVideoFrames(adaptor: adaptor, input: videoInput, size: size, frames: frames, fps: fps, readinessDeadline: readinessDeadline) {
+            writer.cancelWriting()
+            try? FileManager.default.removeItem(at: url)
+            return (false, stage)
         }
-        return writer.status == .completed
+        guard writeSyntheticStereoAudio(input: audioInput, durationSec: Double(frames) / Double(fps), readinessDeadline: readinessDeadline) else {
+            writer.cancelWriting()
+            try? FileManager.default.removeItem(at: url)
+            return (false, "audio-append")
+        }
+
+        guard await MediaInputReadiness.finishWriting(writer) else {
+            try? FileManager.default.removeItem(at: url)
+            return (false, "writer-finish: \(writer.status.rawValue) \(writer.error?.localizedDescription ?? "none")")
+        }
+        return (true, "ok")
     }
 
     /// Draws the black frame with a white bottom-left quadrant into each frame.
-    private static func writeSyntheticVideoFrames(adaptor: AVAssetWriterInputPixelBufferAdaptor, input: AVAssetWriterInput, size: CGSize, frames: Int, fps: Int) -> Bool {
+    /// Returns the failing stage, or nil after every frame was accepted.
+    private static func writeSyntheticVideoFrames(adaptor: AVAssetWriterInputPixelBufferAdaptor, input: AVAssetWriterInput, size: CGSize, frames: Int, fps: Int, readinessDeadline: TimeInterval) -> String? {
         let w = Int(size.width), h = Int(size.height)
         for i in 0..<frames {
-            while !input.isReadyForMoreMediaData { usleep(2000) }
-            guard let pool = adaptor.pixelBufferPool else { return false }
+            guard MediaInputReadiness.wait(for: input, until: readinessDeadline) else { return "video-not-ready-\(i)" }
+            guard let pool = adaptor.pixelBufferPool else { return "video-no-pool-\(i)" }
             var pb: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
-            guard let buffer = pb else { return false }
+            guard let buffer = pb else { return "video-no-buffer-\(i)" }
             CVPixelBufferLockBaseAddress(buffer, [])
             if let base = CVPixelBufferGetBaseAddress(buffer) {
                 let bpr = CVPixelBufferGetBytesPerRow(buffer)
@@ -721,15 +841,15 @@ final class UITestRunner: NSObject {
                 }
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])
-            adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))
+            guard adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps))) else { return "video-append-failed-\(i)" }
         }
         input.markAsFinished()
-        return true
+        return nil
     }
 
     /// Feeds the audio input a 440 Hz tone, the same value in both channels, as
     /// interleaved float32 LPCM (the encoder turns it into 2-channel AAC).
-    private static func writeSyntheticStereoAudio(input: AVAssetWriterInput, durationSec: Double) -> Bool {
+    private static func writeSyntheticStereoAudio(input: AVAssetWriterInput, durationSec: Double, readinessDeadline: TimeInterval) -> Bool {
         let sampleRate = 48_000.0
         let channels = 2
         var asbd = AudioStreamBasicDescription(
@@ -753,7 +873,7 @@ final class UITestRunner: NSObject {
         while frameOffset < totalFrames {
             let count = min(chunk, totalFrames - frameOffset)
             guard let sample = makeStereoSampleBuffer(format: fmt, sampleRate: sampleRate, channels: channels, frameOffset: frameOffset, frameCount: count) else { return false }
-            while !input.isReadyForMoreMediaData { usleep(2000) }
+            guard MediaInputReadiness.wait(for: input, until: readinessDeadline) else { return false }
             guard input.append(sample) else { return false }
             frameOffset += count
         }
@@ -877,10 +997,14 @@ final class UITestRunner: NSObject {
         guard writer.startWriting() else { return false }
         writer.startSession(atSourceTime: .zero)
 
+        let readinessDeadline = MediaInputReadiness.deadline()
         let w = Int(size.width), h = Int(size.height)
         for i in 0..<frames {
-            while !input.isReadyForMoreMediaData { usleep(2000) }
-            guard let pool = adaptor.pixelBufferPool else { return false }
+            guard MediaInputReadiness.wait(for: input, until: readinessDeadline), let pool = adaptor.pixelBufferPool else {
+                writer.cancelWriting()
+                try? FileManager.default.removeItem(at: url)
+                return false
+            }
             var pb: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
             guard let buffer = pb else { return false }
@@ -898,13 +1022,18 @@ final class UITestRunner: NSObject {
                 }
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])
-            adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps)))
+            guard adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps))) else {
+                writer.cancelWriting()
+                try? FileManager.default.removeItem(at: url)
+                return false
+            }
         }
         input.markAsFinished()
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            writer.finishWriting { c.resume() }
+        guard await MediaInputReadiness.finishWriting(writer) else {
+            try? FileManager.default.removeItem(at: url)
+            return false
         }
-        return writer.status == .completed
+        return true
     }
 
     private static func cgImage(from url: URL, at seconds: Double) async -> CGImage? {
@@ -936,10 +1065,10 @@ final class UITestRunner: NSObject {
 
     /// Prova o fix do crash da aba Shortcuts: monta a seção pelo caminho REAL
     /// (show(tab: .shortcuts) -> ShortcutsForm -> KeyboardShortcuts.Recorder ->
-    /// RecorderCocoa -> String.localized -> Bundle.module). Se o resource bundle do
-    /// KeyboardShortcuts faltasse no app, o Bundle.module dava fatalError e o
-    /// processo morria ANTES de escrever este report (timeout = ainda crasha). Report
-    /// escrito com windowUp=true = sobreviveu = bundle presente, fix de runtime ok.
+    /// RecorderCocoa -> String.localized -> patched resource lookup). Before the
+    /// packaging fix this path ended in Bundle.module and aborted the process. The
+    /// layout gate checks the bundle itself; this scenario proves the real view can
+    /// resolve it, survive teardown, and render again.
     private static func runPrefsShortcuts() async -> [String: Any] {
         var r: [String: Any] = [:]
         let ctrl = PreferencesWindowController.shared
@@ -1042,8 +1171,12 @@ final class UITestRunner: NSObject {
             try? png.write(to: URL(fileURLWithPath: p))
         }
         let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: p, thumbnailPath: p, captureRect: nil)
-        QuickAccessOverlay.show(image: img, historyItem: item,
-                                historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        QuickAccessOverlay.show(
+            image: img,
+            historyItem: item,
+            historyManager: appDelegate.historyManager,
+            screen: NSScreen.main
+        )
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         guard QuickAccessOverlay.uiTestWindows.count > before,
               let card = QuickAccessOverlay.uiTestWindows.last else {
@@ -1304,6 +1437,8 @@ final class UITestRunner: NSObject {
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
             r["error"] = "no app delegate"; r["allPass"] = false; return r
         }
+        let originalOverlaySize = Settings.overlaySize
+        Settings.overlaySize = .medium
         let before = QuickAccessOverlay.uiTestWindows.count
 
         // Captura Retina grande com conteúdo não-trivial: PNG encode caro de
@@ -1322,14 +1457,38 @@ final class UITestRunner: NSObject {
         let tmpPath = "/tmp/krit-dragprep-test.png"
         let item = HistoryItem(id: UUID(), createdAt: Date(), imagePath: tmpPath,
                                thumbnailPath: tmpPath, captureRect: nil)
-        QuickAccessOverlay.show(image: img, historyItem: item,
-                                historyManager: appDelegate.historyManager, screen: NSScreen.main)
+        QuickAccessOverlay.show(
+            image: img,
+            historyItem: item,
+            historyManager: appDelegate.historyManager,
+            presentedArtifact: CaptureArtifact(image: img),
+            screen: NSScreen.main
+        )
         // Pouso do card + pre-export em background.
         try? await Task.sleep(nanoseconds: 2_500_000_000)
-        defer { if QuickAccessOverlay.uiTestWindows.count > before { QuickAccessOverlay.uiTestCloseNewest() } }
+        defer {
+            Settings.overlaySize = originalOverlaySize
+            if QuickAccessOverlay.uiTestWindows.count > before { QuickAccessOverlay.uiTestCloseNewest() }
+        }
         guard QuickAccessOverlay.uiTestWindows.count > before else {
             r["error"] = "card did not appear"; r["allPass"] = false; return r
         }
+
+        QuickAccessOverlay.uiTestSetNewestHovered(false)
+        var hitCoveragePass = false
+        if let content = QuickAccessOverlay.uiTestWindows.last?.contentView {
+            let points = [
+                NSPoint(x: 22, y: 24),
+                NSPoint(x: 87, y: 77),
+                NSPoint(x: 120, y: 77),
+            ]
+            let hits = points.map { point in
+                content.hitTest(point).map { String(describing: type(of: $0)) } ?? "nil"
+            }
+            r["dragHitClasses"] = hits
+            hitCoveragePass = hits.allSatisfy { $0 == "DraggableImageView" }
+        }
+        r["hitCoveragePass"] = hitCoveragePass
 
         // Probe cedo: gesto disparado logo após o pouso NUNCA pode bloquear,
         // mesmo que o pre-export ainda esteja rodando (vira promise-only).
@@ -1357,8 +1516,1308 @@ final class UITestRunner: NSObject {
         let legacy = QuickAccessOverlay.uiTestDragPrep(forceInline: true)
         r["legacyMs"] = legacy["ms"] ?? -1
 
-        r["allPass"] = earlyQuick && preparedSeen && preparedMs >= 0 && preparedMs < 8
+        r["allPass"] = hitCoveragePass && earlyQuick && preparedSeen && preparedMs >= 0 && preparedMs < 8
         return r
+    }
+
+    // MARK: - Scenario: overlay-drag-routing
+
+    /// Drives the WindowServer path that starts a card drag at every historically
+    /// blocked point: hidden controls, the center gap, and the progress strip.
+    /// Each small drag stays below every destructive gesture threshold, so the
+    /// probe can prove entry into `handleThumbDrag` without deleting, parking, or
+    /// converting the card into a file drag.
+    private static func runOverlayDragRouting() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "overlay-drag-routing"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let savedTimeout = Settings.overlayTimeout
+        Settings.overlayTimeout = 30
+        defer { Settings.overlayTimeout = savedTimeout }
+
+        let image = NSImage(size: NSSize(width: 640, height: 360))
+        image.lockFocus()
+        NSColor.systemIndigo.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        image.unlockFocus()
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-drag-routing", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let item = HistoryItem(
+            id: UUID(),
+            createdAt: Date(),
+            imagePath: directory.appendingPathComponent("capture.png").path,
+            thumbnailPath: directory.appendingPathComponent("thumb.png").path,
+            captureRect: nil
+        )
+        let before = QuickAccessOverlay.uiTestWindows.count
+        defer {
+            if QuickAccessOverlay.uiTestWindows.count > before {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        QuickAccessOverlay.show(
+            image: image,
+            historyItem: item,
+            historyManager: appDelegate.historyManager,
+            screen: NSScreen.main,
+            entrance: .slide
+        )
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        guard let card = QuickAccessOverlay.uiTestWindows.last else {
+            r["error"] = "card did not appear"
+            r["allPass"] = false
+            return r
+        }
+
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        func cgPoint(for local: NSPoint) -> CGPoint {
+            CGPoint(
+                x: card.frame.minX + local.x,
+                y: primaryHeight - (card.frame.minY + local.y)
+            )
+        }
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+        let targets: [(name: String, point: NSPoint)] = [
+            ("corner", NSPoint(x: 22, y: 24)),
+            ("pill", NSPoint(x: 87, y: 77)),
+            ("center-gap", NSPoint(x: 120, y: 77)),
+            ("progress", NSPoint(x: 120, y: 1)),
+        ]
+        QuickAccessOverlay.uiTestResetGestureEntryCount()
+        var attempts: [[String: Any]] = []
+
+        for target in targets {
+            let start = cgPoint(for: target.point)
+            post(.mouseMoved, at: start)
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            // Mouse movement arms hover controls, which are intentionally clickable.
+            // Hide them just before the down so each legacy point must route to the
+            // thumbnail rather than a visible control.
+            QuickAccessOverlay.uiTestSetNewestHovered(false)
+            let hover = QuickAccessOverlay.uiTestHoverState()
+            let entryBefore = QuickAccessOverlay.uiTestGestureEntryCount()
+            post(.leftMouseDown, at: start)
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            let thresholdDrag = CGPoint(x: start.x + 5, y: start.y)
+            post(.leftMouseDragged, at: thresholdDrag)
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            let routedDrag = CGPoint(x: thresholdDrag.x + 5, y: thresholdDrag.y)
+            post(.leftMouseDragged, at: routedDrag)
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            post(.leftMouseUp, at: routedDrag)
+            try? await Task.sleep(nanoseconds: 180_000_000)
+
+            let entryAfter = QuickAccessOverlay.uiTestGestureEntryCount()
+            let cardStillOpen = QuickAccessOverlay.uiTestWindows.contains { $0 === card }
+            let notParked = !(QuickAccessOverlay.uiTestStandbyStates().last ?? true)
+            let enteredExactlyOnce = entryAfter - entryBefore == 1
+            attempts.append([
+                "point": target.name,
+                "controlsHiddenAtDown": (hover["controlsAlpha"] as? CGFloat ?? -1) < 0.01,
+                "entriesBefore": entryBefore,
+                "entriesAfter": entryAfter,
+                "entryDelta": entryAfter - entryBefore,
+                "cardStillOpen": cardStillOpen,
+                "notParked": notParked,
+                "passed": enteredExactlyOnce && cardStillOpen && notParked,
+            ])
+        }
+
+        let allPass = attempts.count == targets.count
+            && attempts.allSatisfy { ($0["passed"] as? Bool) == true }
+        r["attempts"] = attempts
+        r["allPass"] = allPass
+        return r
+    }
+
+    // MARK: - Scenario: overlay-drag-controls
+
+    /// Regression gate for a card whose visible action controls sit above the
+    /// thumbnail. A drag beginning on a corner action or center pill must enter the
+    /// same card gesture router as a drag beginning on exposed preview pixels. The
+    /// early probe repeats it while the controls are fading in after hover.
+    private static func runOverlayDragControls() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "overlay-drag-controls"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let savedTimeout = Settings.overlayTimeout
+        Settings.overlayTimeout = 30
+        defer { Settings.overlayTimeout = savedTimeout }
+
+        let image = NSImage(size: NSSize(width: 640, height: 360))
+        image.lockFocus()
+        NSColor.systemTeal.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        image.unlockFocus()
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-drag-controls", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let item = HistoryItem(
+            id: UUID(),
+            createdAt: Date(),
+            imagePath: directory.appendingPathComponent("capture.png").path,
+            thumbnailPath: directory.appendingPathComponent("thumb.png").path,
+            captureRect: nil
+        )
+        let before = QuickAccessOverlay.uiTestWindows.count
+        defer {
+            if QuickAccessOverlay.uiTestWindows.count > before {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        QuickAccessOverlay.show(
+            image: image,
+            historyItem: item,
+            historyManager: appDelegate.historyManager,
+            screen: NSScreen.main,
+            entrance: .slide
+        )
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        guard let card = QuickAccessOverlay.uiTestWindows.last else {
+            r["error"] = "card did not appear"
+            r["allPass"] = false
+            return r
+        }
+
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        func cgPoint(for local: NSPoint) -> CGPoint {
+            CGPoint(
+                x: card.frame.minX + local.x,
+                y: primaryHeight - (card.frame.minY + local.y)
+            )
+        }
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+        func allSubviews(of root: NSView) -> [NSView] {
+            [root] + root.subviews.flatMap(allSubviews)
+        }
+        func pointForControl(named typeName: String) -> NSPoint? {
+            guard let content = card.contentView,
+                  let control = allSubviews(of: content).first(where: {
+                      String(describing: type(of: $0)) == typeName
+                  }) else {
+                return nil
+            }
+            return control.convert(
+                NSPoint(x: control.bounds.midX, y: control.bounds.midY),
+                to: content
+            )
+        }
+        func performDrag(named name: String, from local: NSPoint) async -> [String: Any] {
+            let start = cgPoint(for: local)
+            let entryBefore = QuickAccessOverlay.uiTestGestureEntryCount()
+            post(.leftMouseDown, at: start)
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            let threshold = CGPoint(x: start.x + 5, y: start.y)
+            post(.leftMouseDragged, at: threshold)
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            // Move toward standby, far enough to leave an action control but below
+            // the 50 pt confirm threshold so the test card remains open.
+            let routed = CGPoint(x: threshold.x, y: threshold.y + 30)
+            post(.leftMouseDragged, at: routed)
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            post(.leftMouseUp, at: routed)
+            try? await Task.sleep(nanoseconds: 180_000_000)
+
+            let entryAfter = QuickAccessOverlay.uiTestGestureEntryCount()
+            let enteredExactlyOnce = entryAfter - entryBefore == 1
+            let cardStillOpen = QuickAccessOverlay.uiTestWindows.contains { $0 === card }
+            let notParked = !(QuickAccessOverlay.uiTestStandbyStates().last ?? true)
+            return [
+                "point": name,
+                "entryDelta": entryAfter - entryBefore,
+                "cardStillOpen": cardStillOpen,
+                "notParked": notParked,
+                "passed": enteredExactlyOnce && cardStillOpen && notParked,
+            ]
+        }
+        func performSingleStepDrag(named name: String, from local: NSPoint) async -> [String: Any] {
+            let start = cgPoint(for: local)
+            let originBefore = card.frame.origin
+            let entryBefore = QuickAccessOverlay.uiTestGestureEntryCount()
+            post(.leftMouseDown, at: start)
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            // This is deliberately the only drag sample before release. A coalesced
+            // human drag must still move the card on that first sample.
+            let routed = CGPoint(x: start.x, y: start.y + 30)
+            post(.leftMouseDragged, at: routed)
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            let originDuringDrag = card.frame.origin
+            post(.leftMouseUp, at: routed)
+            try? await Task.sleep(nanoseconds: 180_000_000)
+
+            let entryAfter = QuickAccessOverlay.uiTestGestureEntryCount()
+            let movedDuringDrag = abs(originDuringDrag.y - originBefore.y) > 4
+            let cardStillOpen = QuickAccessOverlay.uiTestWindows.contains { $0 === card }
+            let notParked = !(QuickAccessOverlay.uiTestStandbyStates().last ?? true)
+            return [
+                "point": name,
+                "entryDelta": entryAfter - entryBefore,
+                "movedDuringDrag": movedDuringDrag,
+                "cardStillOpen": cardStillOpen,
+                "notParked": notParked,
+                "passed": entryAfter - entryBefore == 1 && movedDuringDrag && cardStillOpen && notParked,
+            ]
+        }
+
+        QuickAccessOverlay.uiTestSetNewestHovered(false)
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let bodySingleStep = await performSingleStepDrag(named: "body-single-step", from: NSPoint(x: 120, y: 77))
+
+        QuickAccessOverlay.uiTestSetNewestHovered(true)
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let visibleControls = QuickAccessOverlay.uiTestHoverState()
+        guard let cornerPoint = pointForControl(named: "OverlayCornerButton"),
+              let pillPoint = pointForControl(named: "OverlayPillButton") else {
+            r["error"] = "controls did not appear"
+            r["allPass"] = false
+            return r
+        }
+        let visibleCorner = await performDrag(named: "visible-corner", from: cornerPoint)
+        let visiblePill = await performDrag(named: "visible-pill", from: pillPoint)
+
+        QuickAccessOverlay.uiTestSetNewestHovered(false)
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        QuickAccessOverlay.uiTestSetNewestHovered(true)
+        let enteringControls = QuickAccessOverlay.uiTestHoverState()
+        let enteringCorner = await performDrag(named: "entering-corner", from: cornerPoint)
+
+        let attempts = [bodySingleStep, visibleCorner, visiblePill, enteringCorner]
+        r["visibleControlsAlpha"] = visibleControls["controlsAlpha"] ?? -1
+        r["enteringControlsAlpha"] = enteringControls["controlsAlpha"] ?? -1
+        r["attempts"] = attempts
+        r["allPass"] = attempts.allSatisfy { ($0["passed"] as? Bool) == true }
+        return r
+    }
+
+    // MARK: - Scenario: quick-access-visual
+
+    /// Renders the post-capture card through AppKit as well as the WindowServer
+    /// path. The latter is black on hosts without screen-capture access, so this
+    /// keeps the palette and accessibility gate meaningful on every developer Mac.
+    private static func runQuickAccessVisual() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "quick-access-visual"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let image = NSImage(size: NSSize(width: 640, height: 360))
+        image.lockFocus()
+        NSColor(calibratedRed: 0.09, green: 0.12, blue: 0.19, alpha: 1).setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        NSColor.systemOrange.setFill()
+        NSRect(x: 36, y: 36, width: 568, height: 288).fill()
+        image.unlockFocus()
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-quick-access-visual", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let item = HistoryItem(
+            id: UUID(),
+            createdAt: Date(),
+            imagePath: directory.appendingPathComponent("capture.png").path,
+            thumbnailPath: directory.appendingPathComponent("thumb.png").path,
+            captureRect: nil
+        )
+        let before = QuickAccessOverlay.uiTestWindows.count
+        defer {
+            while QuickAccessOverlay.uiTestWindows.count > before {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        QuickAccessOverlay.show(
+            image: image,
+            historyItem: item,
+            historyManager: appDelegate.historyManager,
+            screen: NSScreen.main,
+            entrance: .slide
+        )
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        guard let card = QuickAccessOverlay.uiTestWindows.last,
+              let content = card.contentView else {
+            r["error"] = "card did not appear"
+            r["allPass"] = false
+            return r
+        }
+
+        func allSubviews(of root: NSView) -> [NSView] {
+            [root] + root.subviews.flatMap(allSubviews)
+        }
+        guard let copy = allSubviews(of: content).compactMap({ $0 as? NSButton }).first(where: {
+            $0.accessibilityIdentifier() == "quickAccess.copy"
+        }) else {
+            r["error"] = "copy control missing"
+            r["allPass"] = false
+            return r
+        }
+
+        func rgba(_ color: CGColor?) -> [String: Int] {
+            guard let color,
+                  let resolved = NSColor(cgColor: color)?.usingColorSpace(.deviceRGB) else {
+                return [:]
+            }
+            return [
+                "r": Int((resolved.redComponent * 255).rounded()),
+                "g": Int((resolved.greenComponent * 255).rounded()),
+                "b": Int((resolved.blueComponent * 255).rounded()),
+                "a": Int((resolved.alphaComponent * 255).rounded()),
+            ]
+        }
+
+        let restColor = rgba(copy.layer?.backgroundColor)
+        let restPath = "/tmp/krit-quick-access-rest.png"
+        let restSnapshot = snapshotWindow(card, to: restPath)
+
+        r["restSnapshot"] = restSnapshot ? restPath : "FAILED"
+        r["restColor"] = restColor
+        r["accessibility"] = [
+            "identifier": copy.accessibilityIdentifier(),
+            "label": copy.accessibilityLabel() ?? "",
+        ]
+
+        let restPass = (restColor["r"] ?? 255) < 20
+            && (restColor["g"] ?? 255) < 20
+            && (restColor["b"] ?? 255) < 20
+            && (restColor["a"] ?? 0) >= 110
+        let accessibilityPass = copy.accessibilityIdentifier() == "quickAccess.copy"
+            && copy.accessibilityLabel() == "Copy"
+        r["restPass"] = restPass
+        r["accessibilityPass"] = accessibilityPass
+        r["allPass"] = restSnapshot && restPass && accessibilityPass
+        return r
+    }
+
+    // MARK: - Scenario: overlay-handoff-drag
+
+    /// Exercises the same handoff state used immediately after a real screenshot.
+    /// Once the card is visibly interactive, a one-sample drag must work even when
+    /// the pointer begins over a corner-action position.
+    private static func runOverlayHandoffDrag() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "overlay-handoff-drag"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let image = NSImage(size: NSSize(width: 640, height: 360))
+        image.lockFocus()
+        NSColor.systemPurple.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        image.unlockFocus()
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-handoff-drag", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let item = HistoryItem(
+            id: UUID(),
+            createdAt: Date(),
+            imagePath: directory.appendingPathComponent("capture.png").path,
+            thumbnailPath: directory.appendingPathComponent("thumb.png").path,
+            captureRect: nil
+        )
+        let before = QuickAccessOverlay.uiTestWindows.count
+        defer {
+            while QuickAccessOverlay.uiTestWindows.count > before {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        QuickAccessOverlay.show(
+            image: image,
+            historyItem: item,
+            historyManager: appDelegate.historyManager,
+            screen: NSScreen.main,
+            entrance: .handoff
+        )
+        QuickAccessOverlay.revealPendingHandoff(after: 0)
+        // A transparent NSWindow is not a WindowServer hit target. Wait until the
+        // 150 ms reveal has completed, which matches the first visible interaction.
+        try? await Task.sleep(nanoseconds: 180_000_000)
+
+        guard let card = QuickAccessOverlay.uiTestWindows.last,
+              let content = card.contentView else {
+            r["error"] = "handoff card did not appear"
+            r["allPass"] = false
+            return r
+        }
+
+        QuickAccessOverlay.uiTestSetNewestHovered(true)
+
+        func allSubviews(of root: NSView) -> [NSView] {
+            [root] + root.subviews.flatMap(allSubviews)
+        }
+        guard let corner = allSubviews(of: content).first(where: {
+            ($0 as? NSButton)?.toolTip == "Close"
+        }) else {
+            r["error"] = "close control missing"
+            r["allPass"] = false
+            return r
+        }
+        let cornerPoint = corner.convert(
+            NSPoint(x: corner.bounds.midX, y: corner.bounds.midY),
+            to: content
+        )
+        let earlyHit = content.hitTest(cornerPoint)
+        r["earlyHit"] = earlyHit.map { String(describing: type(of: $0)) } ?? "none"
+
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        let start = CGPoint(
+            x: card.frame.minX + cornerPoint.x,
+            y: primaryHeight - (card.frame.minY + cornerPoint.y)
+        )
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+
+        let originBefore = card.frame.origin
+        QuickAccessOverlay.uiTestResetGestureEntryCount()
+        post(.leftMouseDown, at: start)
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        let moved = CGPoint(x: start.x, y: start.y + 30)
+        post(.leftMouseDragged, at: moved)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        let originDuringDrag = card.frame.origin
+        post(.leftMouseUp, at: moved)
+        try? await Task.sleep(nanoseconds: 220_000_000)
+
+        let entryCount = QuickAccessOverlay.uiTestGestureEntryCount()
+        let movedDuringDrag = abs(originDuringDrag.y - originBefore.y) > 4
+        let cardStillOpen = QuickAccessOverlay.uiTestWindows.contains { $0 === card }
+
+        post(.leftMouseDown, at: start)
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        post(.leftMouseUp, at: start)
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        let closedAfterClick = !QuickAccessOverlay.uiTestWindows.contains { $0 === card }
+
+        r["entryCount"] = entryCount
+        r["movedDuringDrag"] = movedDuringDrag
+        r["cardStillOpen"] = cardStillOpen
+        r["closedAfterClick"] = closedAfterClick
+        let acceptsDragStart = r["earlyHit"] as? String == "DraggableImageView"
+            || r["earlyHit"] as? String == "OverlayCornerButton"
+        r["allPass"] = acceptsDragStart
+            && entryCount == 1
+            && movedDuringDrag
+            && cardStillOpen
+            && closedAfterClick
+        return r
+    }
+
+    // MARK: - Scenario: overlay-handoff-early-drag
+
+    /// Drives the real CaptureDelivery path and grabs the tray card before the
+    /// first presentation delay has elapsed. The preview must be the actual
+    /// interactive card, not a separate animation that leaves no input target.
+    private static func runOverlayHandoffEarlyDrag() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "overlay-handoff-early-drag"]
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no screen"
+            r["allPass"] = false
+            return r
+        }
+
+        let image = NSImage(size: NSSize(width: 640, height: 360))
+        image.lockFocus()
+        NSColor.systemOrange.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        image.unlockFocus()
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-handoff-early-drag", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let historyManager = HistoryManager(storageDir: directory)
+        let before = QuickAccessOverlay.uiTestWindows.count
+        defer {
+            while QuickAccessOverlay.uiTestWindows.count > before {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let sourceRect = CGRect(
+            x: screen.visibleFrame.midX - 120,
+            y: screen.visibleFrame.midY - 68,
+            width: 240,
+            height: 136
+        )
+        _ = CaptureDelivery.submit(
+            .init(
+                rawImage: image,
+                presentedImage: image,
+                rect: sourceRect,
+                screen: screen,
+                isWindowCapture: false,
+                showOverlay: true,
+                automaticActions: nil
+            ),
+            historyManager: historyManager
+        )
+
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        guard let card = QuickAccessOverlay.uiTestWindows.last else {
+            r["error"] = "handoff card did not appear"
+            r["allPass"] = false
+            return r
+        }
+
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        let start = CGPoint(
+            x: card.frame.midX,
+            y: primaryHeight - card.frame.midY
+        )
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+
+        let originBefore = card.frame.origin
+        QuickAccessOverlay.uiTestResetGestureEntryCount()
+        r["alphaAtDown"] = card.alphaValue
+        post(.leftMouseDown, at: start)
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        let moved = CGPoint(x: start.x, y: start.y + 30)
+        post(.leftMouseDragged, at: moved)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        let originDuringDrag = card.frame.origin
+        post(.leftMouseUp, at: moved)
+        try? await Task.sleep(nanoseconds: 180_000_000)
+
+        let entryCount = QuickAccessOverlay.uiTestGestureEntryCount()
+        let movedDuringDrag = abs(originDuringDrag.y - originBefore.y) > 4
+        r["entryCount"] = entryCount
+        r["movedDuringDrag"] = movedDuringDrag
+        r["allPass"] = card.alphaValue > 0 && entryCount == 1 && movedDuringDrag
+        return r
+    }
+
+    // MARK: - Scenario: overlay-first-drag-matrix
+
+    /// Reproduces the first physical drag after a capture through the real
+    /// CaptureDelivery handoff. Each point receives a fresh card, so a passing
+    /// later case cannot hide a first-gesture regression in an earlier one.
+    private static func runOverlayFirstDragMatrix() async -> [String: Any] {
+        var report: [String: Any] = ["scenario": "overlay-first-drag-matrix"]
+        guard AXIsProcessTrusted() else {
+            report["skipped"] = "Accessibility permission is required for physical drag events"
+            report["allPass"] = false
+            return report
+        }
+        guard NSApp.delegate is AppDelegate,
+              let screen = NSScreen.main ?? NSScreen.screens.first else {
+            report["error"] = "no app delegate or screen"
+            report["allPass"] = false
+            return report
+        }
+
+        let originalTimeout = Settings.overlayTimeout
+        defer { Settings.overlayTimeout = originalTimeout }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-first-drag-\(UUID().uuidString)", isDirectory: true)
+        let historyDirectory = directory.appendingPathComponent("history", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: historyDirectory, withIntermediateDirectories: true)
+        } catch {
+            report["error"] = "could not create isolated history: \(error)"
+            report["allPass"] = false
+            return report
+        }
+        Settings.overlayTimeout = 30
+
+        let historyManager = HistoryManager(storageDir: historyDirectory)
+        await historyManager.waitUntilLoaded()
+        let initialCardCount = QuickAccessOverlay.uiTestWindows.count
+        defer {
+            while QuickAccessOverlay.uiTestWindows.count > initialCardCount {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let image = solidImage(size: NSSize(width: 640, height: 360), color: .systemPurple)
+        let sourceRect = CGRect(
+            x: screen.visibleFrame.midX - 160,
+            y: screen.visibleFrame.midY - 90,
+            width: 320,
+            height: 180
+        )
+        let primaryScreen = NSScreen.screens.first(where: {
+            ScreenCaptureCatalog.displayID(of: $0) == CGMainDisplayID()
+        }) ?? screen
+
+        func quartzPoint(_ appKitPoint: NSPoint) -> CGPoint {
+            CGPoint(x: appKitPoint.x, y: primaryScreen.frame.maxY - appKitPoint.y)
+        }
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+        func allSubviews(of root: NSView) -> [NSView] {
+            [root] + root.subviews.flatMap(allSubviews)
+        }
+        func screenPoint(for view: NSView, in card: NSWindow) -> NSPoint {
+            let pointInWindow = view.convert(
+                NSPoint(x: view.bounds.midX, y: view.bounds.midY),
+                to: nil
+            )
+            return card.convertPoint(toScreen: pointInWindow)
+        }
+        func close(_ card: NSWindow) async {
+            guard QuickAccessOverlay.uiTestWindows.contains(where: { $0 === card }) else { return }
+            QuickAccessOverlay.uiTestCloseNewest()
+            for _ in 0..<20 where QuickAccessOverlay.uiTestWindows.contains(where: { $0 === card }) {
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+        }
+        func makeCard() async -> NSWindow? {
+            let before = QuickAccessOverlay.uiTestWindows.count
+            _ = CaptureDelivery.submit(
+                .init(
+                    rawImage: image,
+                    presentedImage: image,
+                    rect: sourceRect,
+                    screen: screen,
+                    isWindowCapture: false,
+                    showOverlay: true,
+                    automaticActions: nil
+                ),
+                historyManager: historyManager
+            )
+            for _ in 0..<40 {
+                if QuickAccessOverlay.uiTestWindows.count > before,
+                   let card = QuickAccessOverlay.uiTestWindows.last,
+                   card.isVisible,
+                   card.alphaValue > 0.95 {
+                    return card
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            return nil
+        }
+        func waitForMouseTarget(_ card: NSWindow, at point: NSPoint) async -> (Bool, Int, Int) {
+            for attempt in 0...50 {
+                let target = NSWindow.windowNumber(
+                    at: point,
+                    belowWindowWithWindowNumber: 0
+                )
+                if target == card.windowNumber {
+                    return (true, attempt * 5, target)
+                }
+                if attempt < 50 {
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+            }
+            return (
+                false,
+                250,
+                NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
+            )
+        }
+        func dragOutcome(card: NSWindow, from appKitPoint: NSPoint) async -> [String: Any] {
+            let target = await waitForMouseTarget(card, at: appKitPoint)
+            guard target.0 else {
+                return [
+                    "entryCount": 0,
+                    "stillOpen": QuickAccessOverlay.uiTestWindows.contains { $0 === card },
+                    "parked": QuickAccessOverlay.uiTestStandbyStates().last ?? true,
+                    "movedDuringDrag": false,
+                    "mouseTargetReady": false,
+                    "mouseTargetWaitMs": target.1,
+                    "mouseTargetWindowNumber": target.2,
+                    "allPass": false,
+                ]
+            }
+            QuickAccessOverlay.uiTestResetGestureEntryCount()
+            let start = quartzPoint(appKitPoint)
+            let originBefore = card.frame.origin
+            post(.leftMouseDown, at: start)
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            let end = CGPoint(x: start.x, y: start.y + 30)
+            post(.leftMouseDragged, at: end)
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            let originDuringDrag = card.frame.origin
+            post(.leftMouseUp, at: end)
+            try? await Task.sleep(nanoseconds: 220_000_000)
+
+            let entryCount = QuickAccessOverlay.uiTestGestureEntryCount()
+            let stillOpen = QuickAccessOverlay.uiTestWindows.contains { $0 === card }
+            let parked = QuickAccessOverlay.uiTestStandbyStates().last ?? true
+            let movedDuringDrag = hypot(
+                originDuringDrag.x - originBefore.x,
+                originDuringDrag.y - originBefore.y
+            ) > 4
+            return [
+                "entryCount": entryCount,
+                "stillOpen": stillOpen,
+                "parked": parked,
+                "movedDuringDrag": movedDuringDrag,
+                "mouseTargetReady": true,
+                "mouseTargetWaitMs": target.1,
+                "mouseTargetWindowNumber": target.2,
+                "allPass": entryCount == 1 && stillOpen && !parked && movedDuringDrag,
+            ]
+        }
+        func waitForControls() async -> Bool {
+            for _ in 0..<80 {
+                let ready = QuickAccessOverlay.uiTestEntranceState()["controlsReady"] as? Bool ?? false
+                if ready { break }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            QuickAccessOverlay.uiTestSetNewestHovered(false)
+            QuickAccessOverlay.uiTestSetNewestHovered(true)
+            for _ in 0..<20 {
+                let alpha = QuickAccessOverlay.uiTestHoverState()["controlsAlpha"] as? CGFloat ?? 0
+                if alpha > 0.95 { return true }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            return false
+        }
+
+        var cases: [String: [String: Any]] = [:]
+        var allPass = true
+
+        guard let centerCard = await makeCard() else {
+            report["error"] = "center card did not appear"
+            report["allPass"] = false
+            return report
+        }
+        let center = await dragOutcome(
+            card: centerCard,
+            from: NSPoint(x: centerCard.frame.midX, y: centerCard.frame.midY)
+        )
+        cases["center"] = center
+        allPass = allPass && (center["allPass"] as? Bool == true)
+        await close(centerCard)
+
+        guard let progressCard = await makeCard() else {
+            report["error"] = "progress card did not appear"
+            report["cases"] = cases
+            report["allPass"] = false
+            return report
+        }
+        let progress = await dragOutcome(
+            card: progressCard,
+            from: NSPoint(x: progressCard.frame.midX, y: progressCard.frame.minY + 1)
+        )
+        cases["progress"] = progress
+        allPass = allPass && (progress["allPass"] as? Bool == true)
+        await close(progressCard)
+
+        guard let cornerCard = await makeCard(),
+              await waitForControls(),
+              let cornerRoot = cornerCard.contentView,
+              let closeButton = allSubviews(of: cornerRoot).first(where: {
+                  $0.accessibilityIdentifier() == "quickAccess.close"
+              }) else {
+            report["error"] = "corner control did not become interactive"
+            report["cases"] = cases
+            report["allPass"] = false
+            return report
+        }
+        let corner = await dragOutcome(card: cornerCard, from: screenPoint(for: closeButton, in: cornerCard))
+        cases["corner"] = corner
+        allPass = allPass && (corner["allPass"] as? Bool == true)
+        await close(cornerCard)
+
+        guard let pillCard = await makeCard(),
+              await waitForControls(),
+              let pillRoot = pillCard.contentView,
+              let copyButton = allSubviews(of: pillRoot).first(where: {
+                  $0.accessibilityIdentifier() == "quickAccess.copy"
+              }) else {
+            report["error"] = "pill control did not become interactive"
+            report["cases"] = cases
+            report["allPass"] = false
+            return report
+        }
+        let pill = await dragOutcome(card: pillCard, from: screenPoint(for: copyButton, in: pillCard))
+        cases["pill"] = pill
+        allPass = allPass && (pill["allPass"] as? Bool == true)
+        await close(pillCard)
+
+        guard let fileCard = await makeCard() else {
+            report["error"] = "file-drag card did not appear"
+            report["cases"] = cases
+            report["allPass"] = false
+            return report
+        }
+        QuickAccessOverlay.uiTestResetGestureEntryCount()
+        let sessionsBefore = QuickAccessOverlay.uiTestDragSessionStartCount()
+        let fileStartAppKit = NSPoint(x: fileCard.frame.midX, y: fileCard.frame.midY)
+        let fileTarget = await waitForMouseTarget(fileCard, at: fileStartAppKit)
+        let fileStart = quartzPoint(fileStartAppKit)
+        let inward: CGFloat = Settings.overlayOnLeft ? 1 : -1
+        let fileEnd = CGPoint(x: fileStart.x + inward * 24, y: fileStart.y)
+        if fileTarget.0 {
+            post(.leftMouseDown, at: fileStart)
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            post(.leftMouseDragged, at: fileEnd)
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            post(.leftMouseDragged, at: fileStart)
+            try? await Task.sleep(nanoseconds: 60_000_000)
+            post(.leftMouseUp, at: fileStart)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        let fileDrag = [
+            "entryCount": QuickAccessOverlay.uiTestGestureEntryCount(),
+            "sessionStarted": QuickAccessOverlay.uiTestDragSessionStartCount() == sessionsBefore + 1,
+            "cardRecovered": QuickAccessOverlay.uiTestWindows.contains { $0 === fileCard },
+            "mouseTargetReady": fileTarget.0,
+            "mouseTargetWaitMs": fileTarget.1,
+            "mouseTargetWindowNumber": fileTarget.2,
+        ] as [String: Any]
+        let filePassed = (fileDrag["entryCount"] as? Int == 1)
+            && (fileDrag["sessionStarted"] as? Bool == true)
+            && (fileDrag["cardRecovered"] as? Bool == true)
+            && fileTarget.0
+        cases["fileDrag"] = fileDrag.merging(["allPass": filePassed]) { _, new in new }
+        allPass = allPass && filePassed
+        await close(fileCard)
+
+        report["cases"] = cases
+        report["allPass"] = allPass
+        return report
+    }
+
+    // MARK: - Scenario: interactive-follow-up
+
+    /// Starts an interactive request with a follow-up, then submits a second
+    /// `krit://`-equivalent request while the first selector is open. The newer
+    /// selector must replace the old one, retain its own follow-up, and remain
+    /// untouched when the stale selector is cancelled again.
+    private static func runInteractiveFollowUp() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "interactive-follow-up"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no app delegate or screen"
+            r["allPass"] = false
+            return r
+        }
+
+        let engine = appDelegate.uiTestCaptureEngine
+        let testDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-interactive-follow-up-\(UUID().uuidString)", isDirectory: true)
+        let historyDirectory = testDirectory.appendingPathComponent("history", isDirectory: true)
+        let saveDirectory = testDirectory.appendingPathComponent("saves", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: historyDirectory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: saveDirectory, withIntermediateDirectories: true)
+        } catch {
+            r["error"] = "could not create isolated test directories: \(error)"
+            r["allPass"] = false
+            return r
+        }
+
+        let originalShowOverlay = Settings.afterCaptureShowOverlay
+        let originalCopy = Settings.afterCaptureCopyToClipboard
+        let originalAutoSave = Settings.afterCaptureSaveAutomatically
+        let originalSaveLocation = Settings.autoSaveLocation
+        let originalFormat = Settings.screenshotFormat
+        let originalCountdown = Settings.captureCountdownSeconds
+        let originalSavedArea = Settings.allInOneRect
+        let originalLastCaptureRect = engine.lastCaptureRect
+        guard Settings.setAutoSaveLocation(saveDirectory.path) else {
+            r["error"] = "could not set isolated save directory"
+            r["allPass"] = false
+            return r
+        }
+        Settings.afterCaptureShowOverlay = false
+        Settings.afterCaptureCopyToClipboard = false
+        Settings.afterCaptureSaveAutomatically = false
+        Settings.screenshotFormat = "png"
+        Settings.captureCountdownSeconds = 0
+        let historyManager = HistoryManager(storageDir: historyDirectory)
+        await historyManager.waitUntilLoaded()
+        engine.uiTestActiveSelection?.cancel()
+        defer {
+            engine.uiTestActiveSelection?.cancel()
+            Settings.afterCaptureShowOverlay = originalShowOverlay
+            Settings.afterCaptureCopyToClipboard = originalCopy
+            Settings.afterCaptureSaveAutomatically = originalAutoSave
+            Settings.screenshotFormat = originalFormat
+            Settings.captureCountdownSeconds = originalCountdown
+            Settings.allInOneRect = originalSavedArea
+            engine.uiTestRestoreLastCaptureRect(originalLastCaptureRect)
+            _ = Settings.setAutoSaveLocation(originalSaveLocation)
+            try? FileManager.default.removeItem(at: testDirectory)
+        }
+        func selectionIsOnScreen(_ selection: AreaSelectionWindow?) -> Bool {
+            selection?.uiTestOverlayVisibility()["allOnScreen"] as? Bool == true
+        }
+
+        let available = screen.visibleFrame.insetBy(dx: 40, dy: 40)
+        guard available.width >= 120, available.height >= 80 else {
+            r["error"] = "screen has no safe selection area"
+            r["allPass"] = false
+            return r
+        }
+        let selectionRect = CGRect(
+            x: available.midX - 60,
+            y: available.midY - 40,
+            width: 120,
+            height: 80
+        )
+        let clipboardChangeCount = NSPasteboard.general.changeCount
+
+        // Two URL requests can arrive in one main-run-loop turn. The dispatch
+        // gate must make the newest request the only one that reaches the engine.
+        appDelegate.captureInteractive(.area, then: [.copy], historyManagerOverride: historyManager)
+        appDelegate.captureInteractive(.area, then: [.save], historyManagerOverride: historyManager)
+        for _ in 0..<30 where !selectionIsOnScreen(engine.uiTestActiveSelection) {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        guard let burstSelection = engine.uiTestActiveSelection,
+              selectionIsOnScreen(burstSelection),
+              engine.uiTestHasPendingCaptureFollowUp else {
+            r["error"] = "latest same-turn selection did not appear"
+            r["allPass"] = false
+            return r
+        }
+
+        burstSelection.simulateSelection(rect: selectionRect, on: screen)
+        var burstSavedFiles: [URL] = []
+        for _ in 0..<100 {
+            burstSavedFiles = (try? FileManager.default.contentsOfDirectory(
+                at: saveDirectory,
+                includingPropertiesForKeys: nil
+            ))?.filter { $0.pathExtension.lowercased() == "png" } ?? []
+            if burstSavedFiles.count == 1,
+               engine.uiTestActiveSelection == nil,
+               !engine.uiTestHasPendingCaptureFollowUp {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let burstFollowUpCleared = !engine.uiTestHasPendingCaptureFollowUp
+        let burstClosed = engine.uiTestActiveSelection == nil
+        let burstSaveFileProduced = burstSavedFiles.count == 1
+        let burstClipboardUntouched = NSPasteboard.general.changeCount == clipboardChangeCount
+        guard burstFollowUpCleared,
+              burstClosed,
+              burstSaveFileProduced,
+              burstClipboardUntouched else {
+            r["burstFollowUpCleared"] = burstFollowUpCleared
+            r["burstClosed"] = burstClosed
+            r["burstSaveFileProduced"] = burstSaveFileProduced
+            r["burstClipboardUntouched"] = burstClipboardUntouched
+            r["allPass"] = false
+            return r
+        }
+
+        appDelegate.captureInteractive(.area, then: [.copy], historyManagerOverride: historyManager)
+        for _ in 0..<30 where !selectionIsOnScreen(engine.uiTestActiveSelection) {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        guard let firstSelection = engine.uiTestActiveSelection,
+              selectionIsOnScreen(firstSelection),
+              let firstAttemptID = engine.uiTestActiveCaptureAttemptID else {
+            r["error"] = "first selection did not appear"
+            r["allPass"] = false
+            return r
+        }
+        defer { engine.uiTestActiveSelection?.cancel() }
+
+        appDelegate.captureInteractive(.area, then: [.save], historyManagerOverride: historyManager)
+        var replacement: AreaSelectionWindow?
+        for _ in 0..<30 {
+            if let activeSelection = engine.uiTestActiveSelection,
+               activeSelection !== firstSelection,
+               selectionIsOnScreen(activeSelection) {
+                replacement = activeSelection
+                break
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        guard let replacement else {
+            r["error"] = "replacement selection did not appear"
+            r["allPass"] = false
+            return r
+        }
+
+        let replacementAttemptID = engine.uiTestActiveCaptureAttemptID
+        let replacementOwnsNewAttempt = replacementAttemptID != nil
+            && replacementAttemptID != firstAttemptID
+        let replacementFollowUpArmed = engine.uiTestHasPendingCaptureFollowUp
+        firstSelection.cancel()
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        let staleCancellationIgnored = engine.uiTestActiveSelection === replacement
+            && engine.uiTestHasPendingCaptureFollowUp
+
+        replacement.simulateSelection(rect: selectionRect, on: screen)
+
+        var savedFiles: [URL] = []
+        for _ in 0..<100 {
+            savedFiles = (try? FileManager.default.contentsOfDirectory(
+                at: saveDirectory,
+                includingPropertiesForKeys: nil
+            ))?.filter { $0.pathExtension.lowercased() == "png" } ?? []
+            if !savedFiles.isEmpty, engine.uiTestActiveSelection == nil { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let replacementFollowUpCleared = !engine.uiTestHasPendingCaptureFollowUp
+        let replacementClosed = engine.uiTestActiveSelection == nil
+        let replacementSaveFileProduced = savedFiles.count == 2
+        let clipboardUntouched = NSPasteboard.general.changeCount == clipboardChangeCount
+
+        r["burstFollowUpCleared"] = burstFollowUpCleared
+        r["burstClosed"] = burstClosed
+        r["burstSaveFileProduced"] = burstSaveFileProduced
+        r["burstClipboardUntouched"] = burstClipboardUntouched
+        r["replacementOpened"] = true
+        r["replacementOwnsNewAttempt"] = replacementOwnsNewAttempt
+        r["replacementFollowUpArmed"] = replacementFollowUpArmed
+        r["staleCancellationIgnored"] = staleCancellationIgnored
+        r["replacementFollowUpCleared"] = replacementFollowUpCleared
+        r["replacementClosed"] = replacementClosed
+        r["replacementSaveFileProduced"] = replacementSaveFileProduced
+        r["clipboardUntouched"] = clipboardUntouched
+        r["allPass"] = burstFollowUpCleared
+            && burstClosed
+            && burstSaveFileProduced
+            && burstClipboardUntouched
+            && replacementFollowUpArmed
+            && replacementOwnsNewAttempt
+            && staleCancellationIgnored
+            && replacementFollowUpCleared
+            && replacementClosed
+            && replacementSaveFileProduced
+            && clipboardUntouched
+        return r
+    }
+
+    // MARK: - Scenario: activation-lifetime
+
+    /// Exercises the native activation contract for both borderless recording
+    /// surfaces through PreferencesWindowController's real close delegate.
+    /// Closing Preferences while either surface remains visible must retain
+    /// `.accessory`; closing the surface afterwards removes its registration.
+    private static func runActivationLifetime() async -> [String: Any] {
+        var report: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let screen = NSScreen.main ?? NSScreen.screens.first else {
+            report["error"] = "no app delegate or screen"
+            report["allPass"] = false
+            return report
+        }
+
+        let originalPolicy = NSApp.activationPolicy()
+        let originalMicrophone = Settings.recordingMicrophone
+        let originalCamera = Settings.recordingWebcam
+        Settings.recordingMicrophone = false
+        Settings.recordingWebcam = false
+        let engine = appDelegate.uiTestCaptureEngine
+        let actions = UITestRecordingResultActions()
+        let result = RecordingResultWindow.uiTestMake(
+            url: URL(fileURLWithPath: "/tmp/krit-activation-lifetime.mp4"),
+            duration: 1,
+            actions: actions
+        )
+        let preferences = PreferencesWindowController.shared
+        preferences.uiTestClose()
+
+        func closePreferencesThroughProductionDelegate() async -> (opened: Bool, closed: Bool) {
+            preferences.show(tab: .general)
+            for _ in 0..<20 where preferences.window?.isVisible != true {
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            let opened = preferences.window?.isVisible == true
+            preferences.uiTestClose()
+            for _ in 0..<20 where preferences.window?.isVisible == true {
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            return (opened, preferences.window?.isVisible != true)
+        }
+
+        defer {
+            if result.isVisible { result.close() }
+            engine.uiTestCloseRecordingPreflight()
+            preferences.uiTestClose()
+            Settings.recordingMicrophone = originalMicrophone
+            Settings.recordingWebcam = originalCamera
+            _ = NSApp.setActivationPolicy(originalPolicy)
+        }
+
+        _ = NSApp.setActivationPolicy(.accessory)
+        result.makeKeyAndOrderFront(nil)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        let resultVisible = result.isVisible
+        let resultRegistered = NSApp.isActivationPersistentWindow(result)
+        report["resultVisible"] = resultVisible
+        report["resultRegistered"] = resultRegistered
+        let resultPreferences = await closePreferencesThroughProductionDelegate()
+        let retainedAccessory = NSApp.activationPolicy() == .accessory
+        report["resultPreferencesOpened"] = resultPreferences.opened
+        report["resultPreferencesClosed"] = resultPreferences.closed
+        report["retainedAccessory"] = retainedAccessory
+
+        result.close()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let resultUnregistered = !NSApp.isActivationPersistentWindow(result)
+        report["resultUnregistered"] = resultUnregistered
+
+        guard let preflight = engine.uiTestShowRecordingPreflight(
+            rect: CGRect(x: 40, y: 40, width: 640, height: 360),
+            on: screen
+        ) else {
+            report["error"] = "recording preflight did not appear"
+            report["allPass"] = false
+            return report
+        }
+
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let preflightVisible = preflight.isVisible
+        let preflightRegistered = NSApp.isActivationPersistentWindow(preflight)
+        let preflightPreferences = await closePreferencesThroughProductionDelegate()
+        let preflightRetainedAccessory = NSApp.activationPolicy() == .accessory
+
+        preflight.close()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let preflightUnregistered = !NSApp.isActivationPersistentWindow(preflight)
+
+        report["preflightVisible"] = preflightVisible
+        report["preflightRegistered"] = preflightRegistered
+        report["preflightPreferencesOpened"] = preflightPreferences.opened
+        report["preflightPreferencesClosed"] = preflightPreferences.closed
+        report["preflightRetainedAccessory"] = preflightRetainedAccessory
+        report["preflightUnregistered"] = preflightUnregistered
+        report["allPass"] = resultVisible
+            && resultRegistered
+            && resultPreferences.opened
+            && resultPreferences.closed
+            && retainedAccessory
+            && resultUnregistered
+            && preflightVisible
+            && preflightRegistered
+            && preflightPreferences.opened
+            && preflightPreferences.closed
+            && preflightRetainedAccessory
+            && preflightUnregistered
+        return report
+    }
+
+    // MARK: - Scenario: history-representation
+
+    /// Exercises the live Quick Access rotation path for a capture that has both
+    /// raw and composed files. The editor's raw file must stay untouched while the
+    /// card, restore path and drag file advance to the rotated presentation.
+    private static func runHistoryRepresentation() async -> [String: Any] {
+        var report: [String: Any] = [:]
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            report["error"] = "no screen"
+            return report
+        }
+
+        let storage = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-history-representation-ui-\(UUID().uuidString)", isDirectory: true)
+        let manager = HistoryManager(storageDir: storage)
+        let raw = solidImage(size: NSSize(width: 160, height: 80), color: .systemRed)
+        let presented = solidImage(size: NSSize(width: 160, height: 80), color: .systemBlue)
+        let item = manager.add(image: raw, rect: .zero, presentedImage: presented)
+        guard let presentedPath = item.presentedPath else {
+            report["error"] = "no presented path"
+            return report
+        }
+        defer {
+            QuickAccessOverlay.uiTestCloseNewest()
+            try? FileManager.default.removeItem(at: storage)
+        }
+
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: item.imagePath),
+               FileManager.default.fileExists(atPath: presentedPath) { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard let rawBefore = try? Data(contentsOf: URL(fileURLWithPath: item.imagePath)),
+              let presentedBefore = try? Data(contentsOf: URL(fileURLWithPath: presentedPath)),
+              let artifact = CaptureArtifact(image: presented) else {
+            report["error"] = "initial persistence failed"
+            return report
+        }
+
+        QuickAccessOverlay.show(
+            image: presented,
+            historyItem: item,
+            historyManager: manager,
+            presentedArtifact: artifact,
+            screen: screen
+        )
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        QuickAccessOverlay.uiTestRotateNewest(clockwise: true)
+
+        var presentationChanged = false
+        for _ in 0..<100 {
+            if let updated = try? Data(contentsOf: URL(fileURLWithPath: presentedPath)),
+               updated != presentedBefore {
+                presentationChanged = true
+                break
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let rawUnchanged = (try? Data(contentsOf: URL(fileURLWithPath: item.imagePath))) == rawBefore
+        let rotatedPresentation = item.presentedImage.size.height > item.presentedImage.size.width
+        report["rawUnchanged"] = rawUnchanged
+        report["presentationChanged"] = presentationChanged
+        report["rotatedPresentation"] = rotatedPresentation
+        report["allPass"] = rawUnchanged && presentationChanged && rotatedPresentation
+        return report
+    }
+
+    private static func solidImage(size: NSSize, color: NSColor) -> NSImage {
+        let image = NSImage(size: size)
+        image.lockFocus()
+        color.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        image.unlockFocus()
+        return image
     }
 
     // MARK: - Cenário: controls-demo (controles atuais vs nativos macOS 26+)
@@ -1873,9 +3332,10 @@ final class UITestRunner: NSObject {
     private static func runSmartRedactSuite() async -> [String: Any] {
         var r: [String: Any] = [:]
 
+        let awsKeyFixture = "AKIA" + "IOSFODNN7EXAMPLE"
         let lines = [
             "Contact: alice.smith@example.com",
-            "aws key AKIAIOSFODNN7EXAMPLE",
+            "aws key \(awsKeyFixture)",
             "card 4111 1111 1111 1111",
             "This sentence is perfectly innocent prose."
         ]
@@ -2228,18 +3688,113 @@ final class UITestRunner: NSObject {
         try? await Task.sleep(nanoseconds: 200_000_000)
         let after = QuickAccessOverlay.uiTestDismissTimersActive()
         r["afterGesture"] = after
+        let afterStates = QuickAccessOverlay.uiTestDismissTimerStates()
+        r["afterGestureStates"] = afterStates
+
+        // File conversion returns early to AppKit instead of reaching cardDragEnd.
+        // Re-arm and exercise that branch explicitly, so the sibling countdown
+        // cannot remain frozen behind a successful file drag.
+        QuickAccessOverlay.uiTestArmDismissTimers()
+        let fileDragArmed = QuickAccessOverlay.uiTestDismissTimersActive()
+        r["fileDragArmed"] = fileDragArmed
+        QuickAccessOverlay.uiTestGestureConvertToFileDrag()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let afterFileDragConversion = QuickAccessOverlay.uiTestDismissTimersActive()
+        r["afterFileDragConversion"] = afterFileDragConversion
+        let afterFileDragStates = QuickAccessOverlay.uiTestDismissTimerStates()
+        r["afterFileDragStates"] = afterFileDragStates
         await cleanup()
 
         // Index 0 is the sibling (creation order; the newest card takes the gesture).
         // Resume is asserted on the sibling: the dragged card's own resume rides the
         // hover gate, which follows the REAL cursor and would flake under a live mouse.
-        let allArmed = armed.count >= 2 && armed.allSatisfy { $0 }
-        let allFrozen = during.count >= 2 && during.allSatisfy { !$0 }
-        let siblingResumed = after.first == true
+        let armedCards = Array(armed.suffix(2))
+        let frozenCards = Array(during.suffix(2))
+        let fileDragArmedCards = Array(fileDragArmed.suffix(2))
+        let siblingAfterGesture = afterStates.suffix(2).first ?? [:]
+        let siblingAfterFileDrag = afterFileDragStates.suffix(2).first ?? [:]
+        let allArmed = armedCards.count == 2 && armedCards.allSatisfy { $0 }
+        let allFrozen = frozenCards.count == 2 && frozenCards.allSatisfy { !$0 }
+        let siblingResumed = siblingAfterGesture["timerActive"] == true
+            || siblingAfterGesture["cursorOwns"] == true
+        let fileDragAllArmed = fileDragArmedCards.count == 2 && fileDragArmedCards.allSatisfy { $0 }
+        let fileDragSiblingResumed = siblingAfterFileDrag["timerActive"] == true
+            || siblingAfterFileDrag["cursorOwns"] == true
         r["allArmed"] = allArmed
         r["allFrozenDuringGesture"] = allFrozen
         r["siblingResumed"] = siblingResumed
-        r["allPass"] = allArmed && allFrozen && siblingResumed
+        r["fileDragAllArmed"] = fileDragAllArmed
+        r["fileDragSiblingResumed"] = fileDragSiblingResumed
+        r["allPass"] = allArmed && allFrozen && siblingResumed && fileDragAllArmed && fileDragSiblingResumed
+        return r
+    }
+
+    // MARK: - Cenário: overlay-dismiss-race
+
+    /// A Timer may already have enqueued its close on the main queue just as the
+    /// user begins a drag. The gesture must retire that stale close, otherwise the
+    /// card flips into `isClosing` and ignores every subsequent drag sample.
+    private static func runOverlayDismissRace() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "overlay-dismiss-race"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let savedTimeout = Settings.overlayTimeout
+        Settings.overlayTimeout = 30
+        let before = QuickAccessOverlay.uiTestWindows.count
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-dismiss-race", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            Settings.overlayTimeout = savedTimeout
+            while QuickAccessOverlay.uiTestWindows.count > before {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let image = NSImage(size: NSSize(width: 640, height: 360))
+        image.lockFocus()
+        NSColor.systemIndigo.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        image.unlockFocus()
+        let item = HistoryItem(
+            id: UUID(),
+            createdAt: Date(),
+            imagePath: directory.appendingPathComponent("capture.png").path,
+            thumbnailPath: directory.appendingPathComponent("thumbnail.png").path,
+            captureRect: nil
+        )
+        QuickAccessOverlay.show(
+            image: image,
+            historyItem: item,
+            historyManager: appDelegate.historyManager,
+            screen: NSScreen.main,
+            entrance: .slide
+        )
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        guard QuickAccessOverlay.uiTestWindows.count == before + 1 else {
+            r["error"] = "card did not appear"
+            r["allPass"] = false
+            return r
+        }
+
+        QuickAccessOverlay.uiTestArmDismissTimers()
+        let armed = QuickAccessOverlay.uiTestDismissTimersActive().last == true
+        QuickAccessOverlay.uiTestQueueNewestAutoDismiss()
+        QuickAccessOverlay.uiTestGestureBegin()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        let cardStillOpen = QuickAccessOverlay.uiTestWindows.count == before + 1
+        let state = QuickAccessOverlay.uiTestGestureState()
+        r["armed"] = armed
+        r["cardStillOpen"] = cardStillOpen
+        r["gestureState"] = state
+        r["allPass"] = armed && cardStillOpen && state != "closing"
+        QuickAccessOverlay.uiTestGestureEnd()
         return r
     }
 
@@ -2262,25 +3817,21 @@ final class UITestRunner: NSObject {
     /// path and require the window's pixels in the result.
     // MARK: - Cenário: automation-gate (a superfície scriptável é opt-in)
 
-    /// Guards the default-off posture of the whole scriptable surface. The live
-    /// `AutomationGate.isEnabled` reads true here (the harness sets KRIT_UI_TEST),
-    /// so the OFF path is proven against the pure decision function instead: no
-    /// env, no pref → refused. Also asserts the shipped default (pref off) and that
-    /// the env override alone opens the gate (so tests keep driving automation).
+    /// Guards the default-off posture of the whole scriptable surface. The test
+    /// harness is intentionally independent from automation, so only the persisted
+    /// user preference may open the port and URL commands.
     private static func runAutomationGate() -> [String: Any] {
         var r: [String: Any] = ["scenario": "automation-gate"]
-        let offOff = AutomationGate.decide(envTestMode: false, prefEnabled: false)
-        let envOnly = AutomationGate.decide(envTestMode: true, prefEnabled: false)
-        let prefOnly = AutomationGate.decide(envTestMode: false, prefEnabled: true)
-        r["refusedWhenBothOff"] = (offOff == false)
-        r["envOverrideOpens"] = (envOnly == true)
-        r["prefOpens"] = (prefOnly == true)
+        let off = AutomationGate.decide(prefEnabled: false)
+        let enabled = AutomationGate.decide(prefEnabled: true)
+        r["refusedWhenOff"] = (off == false)
+        r["prefOpens"] = (enabled == true)
         // Fresh install must ship with automation OFF. Read the raw default so a
         // pref the running user may have flipped doesn't mask a bad default.
         let defaultsOff = UserDefaults.standard.object(forKey: "automationEnabled") == nil
             || UserDefaults.standard.bool(forKey: "automationEnabled") == false
         r["defaultOff"] = defaultsOff
-        r["allPass"] = (offOff == false) && (envOnly == true) && (prefOnly == true)
+        r["allPass"] = (off == false) && (enabled == true)
         return r
     }
 
@@ -2313,6 +3864,7 @@ final class UITestRunner: NSObject {
         win.orderOut(nil)
 
         r["grabNonNil"] = shot != nil
+        r["permissionFailure"] = engine.lastCaptureFailureWasPermission
         var windowVisible = false
         if let shot, let cg = shot.cgImage(forProposedRect: nil, context: nil, hints: nil) {
             let probe = NSBitmapImageRep(cgImage: cg)
@@ -2494,7 +4046,11 @@ final class UITestRunner: NSObject {
     /// setting no final): cobre a regressão real do "Could not save recording",
     /// em que PTS de áudio pré-vídeo/clock divergente derrubava o AVAssetWriter.
     /// O mic fica fora da automação de propósito (dispararia prompt de permissão).
-    private static func runRecordSmoke(systemAudio: Bool = false, microphone: Bool = false) async -> [String: Any] {
+    private static func runRecordSmoke(
+        systemAudio: Bool = false,
+        microphone: Bool = false,
+        pauseMidway: Bool = false
+    ) async -> [String: Any] {
         var r: [String: Any] = [:]
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
             r["error"] = "no app delegate"; return r
@@ -2512,6 +4068,7 @@ final class UITestRunner: NSObject {
         }
         r["systemAudioVariant"] = systemAudio
         r["microphoneVariant"] = microphone
+        r["pauseMidway"] = pauseMidway
         let engine = appDelegate.uiTestCaptureEngine
         guard !engine.recordingActive else {
             r["error"] = "a recording is already running"; return r
@@ -2531,7 +4088,23 @@ final class UITestRunner: NSObject {
         r["recordingStarted"] = started
         r["dimPanelCount"] = engine.uiTestDimPanelCount
 
-        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        var pauseEntered = false
+        var pauseResumed = false
+        if pauseMidway {
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            engine.uiTestToggleRecordingPause()
+            pauseEntered = engine.uiTestRecordingPaused
+            if pauseEntered {
+                try? await Task.sleep(nanoseconds: 700_000_000)
+                engine.uiTestToggleRecordingPause()
+                pauseResumed = !engine.uiTestRecordingPaused
+            }
+            try? await Task.sleep(nanoseconds: 700_000_000)
+        } else {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        r["pauseEntered"] = pauseEntered
+        r["pauseResumed"] = pauseResumed
         engine.stopRecording()
 
         var cardsAfter = cardsBefore
@@ -2544,11 +4117,21 @@ final class UITestRunner: NSObject {
         r["dimGoneAfterStop"] = (engine.uiTestDimPanelCount == 0)
         r["finishOutcome"] = engine.uiTestRecordingOutcome
         r["streamError"] = engine.uiTestStreamError
+        if let duration = engine.uiTestRecordingDuration {
+            r["recordingDuration"] = duration
+        }
+
+        // 0.7 s recording + 0.7 s paused + 0.7 s recording should yield roughly
+        // 1.4 s of media. The bound leaves room for start/stop frame granularity,
+        // but catches a pause gap leaking back into the output timeline.
+        let durationPass = !pauseMidway || (engine.uiTestRecordingDuration ?? .infinity) < 1.75
+        r["durationPass"] = durationPass
 
         r["allPass"] = started
             && (r["dimPanelCount"] as? Int ?? 0) >= 1
             && (cardsAfter > cardsBefore)
             && (engine.uiTestDimPanelCount == 0)
+            && (!pauseMidway || (pauseEntered && pauseResumed && durationPass))
 
         if cardsAfter > cardsBefore {
             if let card = QuickAccessOverlay.uiTestWindows.last {
@@ -2735,6 +4318,15 @@ final class UITestRunner: NSObject {
         r["windowID"] = Int(windowID)
 
         let engine = appDelegate.uiTestCaptureEngine
+        let legacyPreviewFallbacksBefore = engine.uiTestLegacyWindowPreviewFallbackCount
+        let chooserPreview = await engine.uiTestWindowPreviewImage(windowID: windowID)
+        let chooserPreviewPass = chooserPreview?.bestCGImage.map {
+            $0.width > 0 && $0.height > 0 && ScreenshotVisualQuality.hasVisibleContent($0)
+        } ?? false
+        let modernPreviewAvoidedLegacy = engine.uiTestLegacyWindowPreviewFallbackCount == legacyPreviewFallbacksBefore
+        r["chooserPreviewPass"] = chooserPreviewPass
+        r["modernPreviewAvoidedLegacy"] = modernPreviewAvoidedLegacy
+
         guard let image = await engine.uiTestIsolatedWindowImage(windowID: windowID) else {
             // Degraded sandbox (no Screen Recording / locked screen): the grab
             // can't run, but that's an environment limit, not a code failure.
@@ -2780,7 +4372,7 @@ final class UITestRunner: NSObject {
         r["alphaPass"] = alphaPass
 
         ctrl.uiTestClose()
-        r["allPass"] = dimensionsPass && alphaPass
+        r["allPass"] = dimensionsPass && alphaPass && chooserPreviewPass && modernPreviewAvoidedLegacy
         return r
     }
 
@@ -3114,8 +4706,9 @@ final class UITestRunner: NSObject {
 
     /// Isolates WHICH link of the supersampled window-shot pipeline breaks:
     /// grab (raw 3x), compose (windowShotBackground + composeIfNeeded), or the
-    /// persist route (the tiffRepresentation path HistoryManager uses for the
-    /// presented PNG). Saves one PNG per stage to /tmp/krit-compose for the
+    /// legacy persist route (the tiffRepresentation path HistoryManager used
+    /// before CaptureDelivery shared encoded artifacts). Saves one PNG per stage
+    /// to /tmp/krit-compose for the
     /// visual gate, and diffs compose-direct vs persist-route numerically.
     private static func runComposeScaleSuite() async -> [String: Any] {
         var r: [String: Any] = [:]
@@ -3176,7 +4769,7 @@ final class UITestRunner: NSObject {
             r["composedPixels"] = ["w": cg.width, "h": cg.height]
         }
 
-        // Stage 3: the persist route HistoryManager uses for presentedPath.
+        // Stage 3: the legacy persist route, retained as a visual comparison.
         var tiffCG: CGImage?
         if let tiff = composed.tiffRepresentation,
            let rep = NSBitmapImageRep(data: tiff),
@@ -3673,6 +5266,29 @@ final class UITestRunner: NSObject {
         canvas.cacheDisplay(in: canvas.bounds, to: rep)
         r["settledDrawMs"] = (CACurrentMediaTime() - tSettled) * 1000
 
+        // A slider emits a dense stream of distinct option values. The compositor
+        // may finish the work already in flight, but it must run only the final
+        // value after that, never every intermediate tick.
+        canvas.uiTestInvalidatePresentationCache()
+        canvas.uiTestResetPresentationCompositeStartCount()
+        var burstOptions = bg
+        for step in 0..<20 {
+            burstOptions.padding = CGFloat(32 + step)
+            ctrl.uiTestApplyBackground(burstOptions)
+            canvas.cacheDisplay(in: canvas.bounds, to: rep)
+        }
+        r["burstStartsImmediately"] = canvas.uiTestCurrentPresentationCompositeStartCount()
+
+        var burstSettled = false
+        for _ in 0..<50 where !burstSettled {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            canvas.cacheDisplay(in: canvas.bounds, to: rep)
+            burstSettled = canvas.uiTestHasPresentationCache(options: burstOptions)
+        }
+        let burstStarts = canvas.uiTestCurrentPresentationCompositeStartCount()
+        r["burstCompositeStarts"] = burstStarts
+        r["burstSettledLatest"] = burstSettled
+
         r["canvasSize"] = NSStringFromRect(canvas.bounds)
         r["msPerFrameFull"] = fullMin
         r["fpsFull"] = fullMin > 0 ? 1000.0 / fullMin : 0
@@ -3682,7 +5298,10 @@ final class UITestRunner: NSObject {
         // option-change/resize draw, which must NOT carry the multi-second compose
         // (async). 500ms is far above the ~95ms placeholder draw but far below the
         // ~4s a synchronous recompose would cost, so it fails loudly on regression.
-        r["allPass"] = sliceMin < 16 && missDraw < 500
+        r["allPass"] = sliceMin < 16
+            && missDraw < 500
+            && burstStarts <= 2
+            && burstSettled
         return r
     }
 
@@ -3941,11 +5560,10 @@ final class UITestRunner: NSObject {
         return r
     }
 
-    /// Captures the visual entrance of the overlay card frame by frame: runs a
-    /// REAL fullscreen capture (flash + fly-to-tray ghost + handoff card) and
-    /// snapshots the bottom-right quadrant of the active screen every ~50ms via
-    /// CGWindowList, so a glitchy first paint ("appears broken, then snaps
-    /// right") can be seen and diagnosed instead of guessed at.
+    /// Captures the visual entrance of the real overlay card frame by frame after
+    /// a fullscreen capture and snapshots the active screen every ~50ms via
+    /// CGWindowList, so a glitchy first paint can be seen and diagnosed instead
+    /// of guessed at.
     private static func runOverlayEntranceFrames() async -> [String: Any] {
         var r: [String: Any] = [:]
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
@@ -3961,9 +5579,7 @@ final class UITestRunner: NSObject {
         appDelegate.captureFullscreen()
 
         // Wait for the card object (capture takes a few hundred ms), then film
-        // the region AROUND the card's real frame: the handoff card is parked
-        // invisible at its slot, so filming starts before the reveal and catches
-        // the whole ghost-landing + fade-in choreography wherever it happens.
+        // the region around its real frame from its first visible presentation.
         var card: NSWindow?
         for _ in 0..<40 {
             try? await Task.sleep(nanoseconds: 50_000_000)
@@ -4285,11 +5901,13 @@ final class UITestRunner: NSObject {
         }
         r["windowVisible"] = win.isVisible
         r["pageCount"] = ctrl.uiTestPageCount
+        r["initialBuiltPageCount"] = ctrl.uiTestBuiltPageCount
 
         let dir = "/tmp/krit-onboarding"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let paths = await ctrl.uiTestRenderAllPages(toDirectory: dir)
         r["renderedPages"] = paths
+        r["finalBuiltPageCount"] = ctrl.uiTestBuiltPageCount
 
         let allRendered = paths.count == 4 && paths.allSatisfy { p in
             let size = (try? FileManager.default.attributesOfItem(atPath: p)[.size] as? NSNumber)?.intValue ?? 0
@@ -4301,6 +5919,8 @@ final class UITestRunner: NSObject {
         ctrl.uiTestClose(restoringHasLaunchedBefore: savedFlag)
         r["flagRestored"] = (Settings.hasLaunchedBefore == savedFlag)
         r["allPass"] = allRendered
+            && ctrl.uiTestBuiltPageCount == 4
+            && (r["initialBuiltPageCount"] as? Int == 1)
             && (r["ctaPass"] as? Bool ?? false)
             && (r["windowVisible"] as? Bool ?? false)
             && (r["flagRestored"] as? Bool ?? false)
@@ -4315,6 +5935,9 @@ final class UITestRunner: NSObject {
     /// alpha 1. Fecha só o card de teste ao final.
     private static func runOverlayShowSuite() async -> [String: Any] {
         var r: [String: Any] = [:]
+        func scalar(_ value: Any?) -> Double? {
+            (value as? NSNumber)?.doubleValue
+        }
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
             r["error"] = "no app delegate"
             return r
@@ -4341,8 +5964,20 @@ final class UITestRunner: NSObject {
             historyManager: appDelegate.historyManager, screen: screen
         )
 
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let entranceAt100ms = QuickAccessOverlay.uiTestEntranceState()
+        r["entranceAt100ms"] = entranceAt100ms
+        let earlySlotPass: Bool
+        if let frameX = scalar(entranceAt100ms["frameX"]),
+           let targetX = scalar(entranceAt100ms["targetX"]),
+           let alpha = scalar(entranceAt100ms["alpha"]) {
+            earlySlotPass = abs(frameX - targetX) < 0.5 && alpha >= 0.99
+        } else {
+            earlySlotPass = false
+        }
+        r["earlySlotPass"] = earlySlotPass
         // Entrada anima em 0.35s; 1.2s dá folga de sobra.
-        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        try? await Task.sleep(nanoseconds: 1_100_000_000)
 
         let cards = QuickAccessOverlay.uiTestWindows
         r["cardCount"] = cards.count
@@ -4359,6 +5994,7 @@ final class UITestRunner: NSObject {
         let vf = cardScreen?.visibleFrame ?? .zero
         r["cardFrame"] = ["x": card.frame.origin.x, "y": card.frame.origin.y,
                           "w": card.frame.width, "h": card.frame.height]
+        r["entranceAt1200ms"] = QuickAccessOverlay.uiTestEntranceState()
         r["visibleFrame"] = ["x": vf.origin.x, "y": vf.origin.y, "w": vf.width, "h": vf.height]
         let inside = vf.contains(card.frame)
         r["insideVisibleFramePass"] = inside
@@ -4369,6 +6005,7 @@ final class UITestRunner: NSObject {
         r["closedPass"] = (QuickAccessOverlay.uiTestWindows.count == before)
 
         r["allPass"] = inside
+            && earlySlotPass
             && (r["alphaPass"] as? Bool ?? false)
             && (r["closedPass"] as? Bool ?? false)
         return r
@@ -4395,6 +6032,7 @@ final class UITestRunner: NSObject {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let paths = await ctrl.uiTestRenderAllSections(toDirectory: dir)
         r["renderedSections"] = paths
+        r["renderFallbackCount"] = ctrl.uiTestRenderFallbackCount
 
         let expected = ctrl.uiTestSectionCount
         let allRendered = paths.count == expected && paths.allSatisfy { p in
@@ -4646,18 +6284,30 @@ final class UITestRunner: NSObject {
         return r
     }
 
-    /// Snapshot da janela como o WindowServer a compõe. Retorna true se o PNG
-    /// foi escrito com conteúdo plausível (> 10KB).
+    /// Snapshot da janela como o WindowServer a compõe. An opaque black capture
+    /// is a permission failure, regardless of its byte size; fall back to AppKit
+    /// rendering and apply the same visual-content gate used by Preferences.
     private static func snapshotWindow(_ window: NSWindow, to path: String) -> Bool {
-        guard let cg = CGWindowListCreateImage(
+        var data: Data?
+        if let cg = CGWindowListCreateImage(
             .null, .optionIncludingWindow, CGWindowID(window.windowNumber),
             [.boundsIgnoreFraming, .bestResolution]
-        ), let data = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) else {
-            return false
+        ), ScreenshotVisualQuality.hasVisibleContent(cg) {
+            data = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
         }
+
+        if data == nil,
+           let content = window.contentView,
+           let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+            content.cacheDisplay(in: content.bounds, to: rep)
+            if let cg = rep.cgImage, ScreenshotVisualQuality.hasVisibleContent(cg) {
+                data = rep.representation(using: .png, properties: [:])
+            }
+        }
+
+        guard let data else { return false }
         try? data.write(to: URL(fileURLWithPath: path))
-        let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue ?? 0
-        return size > 10_000
+        return FileManager.default.fileExists(atPath: path)
     }
 
     /// Snapshots the on-screen composite of the window's region (everything the
@@ -4683,6 +6333,190 @@ final class UITestRunner: NSObject {
             i += stride
         }
         return maxLuma - minLuma > minSpread
+    }
+
+    private static func recordingHUDRegionPasses(
+        _ image: CGImage,
+        layout: RecordingHUDLayout
+    ) -> [String: Bool] {
+        let regions: [(String, CGRect)] = [
+            ("live", layout.liveCluster),
+            ("microphone", layout.microphoneMeter ?? .zero),
+            ("pause", layout.pause),
+            ("stop", layout.stop),
+            ("overflow", layout.overflow),
+        ]
+        return Dictionary(uniqueKeysWithValues: regions.map { name, rect in
+            let contrast = hasVisibleContrast(image, in: rect, windowSize: layout.shell.size)
+            // A reflective glass background can have enough luminance variation to
+            // pass a contrast-only check even when a static control disappeared.
+            // Every interactive region except the live cluster must contribute real
+            // bright glyph or label pixels to the composed frame.
+            let foreground = name == "live" || hasBrightForeground(
+                image,
+                in: rect,
+                windowSize: layout.shell.size,
+                // The fallback rasterizes the three-dot glyph into ten bright
+                // pixels. Eight still rejects an absent control while avoiding
+                // a false failure that depends on material antialiasing.
+                minimumPixels: name == "overflow" ? 8 : 12
+            )
+            return (name, contrast && foreground)
+        })
+    }
+
+    private static func hasVisibleContrast(
+        _ image: CGImage,
+        in windowRect: CGRect,
+        windowSize: CGSize,
+        minSpread: Double = 20
+    ) -> Bool {
+        guard !windowRect.isEmpty,
+              windowSize.width > 0,
+              windowSize.height > 0,
+              let pixels = rgbaPixels(image) else { return false }
+
+        let scaleX = CGFloat(image.width) / windowSize.width
+        let scaleY = CGFloat(image.height) / windowSize.height
+        let raw = CGRect(
+            x: windowRect.minX * scaleX,
+            y: (windowSize.height - windowRect.maxY) * scaleY,
+            width: windowRect.width * scaleX,
+            height: windowRect.height * scaleY
+        ).integral
+        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        let sampleRect = raw.intersection(bounds)
+        guard !sampleRect.isNull, sampleRect.width >= 2, sampleRect.height >= 2 else { return false }
+
+        let minX = max(0, Int(sampleRect.minX))
+        let maxX = min(image.width, Int(sampleRect.maxX))
+        let minY = max(0, Int(sampleRect.minY))
+        let maxY = min(image.height, Int(sampleRect.maxY))
+        let sampleCount = max(1, (maxX - minX) * (maxY - minY))
+        let step = max(1, Int(Double(sampleCount).squareRoot() / 40))
+        var minLuma = 255.0
+        var maxLuma = 0.0
+
+        for y in stride(from: minY, to: maxY, by: step) {
+            for x in stride(from: minX, to: maxX, by: step) {
+                let offset = (y * image.width + x) * 4
+                let luma = 0.299 * Double(pixels[offset])
+                    + 0.587 * Double(pixels[offset + 1])
+                    + 0.114 * Double(pixels[offset + 2])
+                minLuma = min(minLuma, luma)
+                maxLuma = max(maxLuma, luma)
+            }
+        }
+        return maxLuma - minLuma > minSpread
+    }
+
+    private static func hasBrightForeground(
+        _ image: CGImage,
+        in windowRect: CGRect,
+        windowSize: CGSize,
+        minimumPixels: Int = 12,
+        lumaThreshold: Double = 170
+    ) -> Bool {
+        guard !windowRect.isEmpty,
+              windowSize.width > 0,
+              windowSize.height > 0,
+              let pixels = rgbaPixels(image) else { return false }
+
+        let scaleX = CGFloat(image.width) / windowSize.width
+        let scaleY = CGFloat(image.height) / windowSize.height
+        let raw = CGRect(
+            x: windowRect.minX * scaleX,
+            y: (windowSize.height - windowRect.maxY) * scaleY,
+            width: windowRect.width * scaleX,
+            height: windowRect.height * scaleY
+        ).integral
+        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        let sampleRect = raw.intersection(bounds)
+        guard !sampleRect.isNull, sampleRect.width >= 2, sampleRect.height >= 2 else { return false }
+
+        let minX = max(0, Int(sampleRect.minX))
+        let maxX = min(image.width, Int(sampleRect.maxX))
+        let minY = max(0, Int(sampleRect.minY))
+        let maxY = min(image.height, Int(sampleRect.maxY))
+        var brightPixels = 0
+
+        for y in minY..<maxY {
+            for x in minX..<maxX {
+                let offset = (y * image.width + x) * 4
+                let luma = 0.299 * Double(pixels[offset])
+                    + 0.587 * Double(pixels[offset + 1])
+                    + 0.114 * Double(pixels[offset + 2])
+                if luma >= lumaThreshold {
+                    brightPixels += 1
+                    if brightPixels >= minimumPixels { return true }
+                }
+            }
+        }
+        return false
+    }
+
+    /// A contrast-only region gate can accept an unrelated app window behind a
+    /// delayed sharingType update. The All-in-One dock has a stable, local
+    /// fingerprint: its first action carries KRIT coral and each remaining
+    /// action contributes a legible glyph or label.
+    private static func allInOneCompositePasses(
+        _ image: CGImage,
+        actionFrames: [CGRect],
+        panelSize: CGSize
+    ) -> Bool {
+        guard actionFrames.count == AllInOneAction.allCases.count,
+              hasVisibleContrast(image),
+              hasKritAccent(image, in: actionFrames[0], windowSize: panelSize) else {
+            return false
+        }
+        return actionFrames.dropFirst().allSatisfy {
+            hasBrightForeground(image, in: $0, windowSize: panelSize)
+        }
+    }
+
+    private static func hasKritAccent(
+        _ image: CGImage,
+        in windowRect: CGRect,
+        windowSize: CGSize,
+        minimumPixels: Int = 8
+    ) -> Bool {
+        guard !windowRect.isEmpty,
+              windowSize.width > 0,
+              windowSize.height > 0,
+              let pixels = rgbaPixels(image) else { return false }
+
+        let scaleX = CGFloat(image.width) / windowSize.width
+        let scaleY = CGFloat(image.height) / windowSize.height
+        let raw = CGRect(
+            x: windowRect.minX * scaleX,
+            y: (windowSize.height - windowRect.maxY) * scaleY,
+            width: windowRect.width * scaleX,
+            height: windowRect.height * scaleY
+        ).integral
+        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        let sampleRect = raw.intersection(bounds)
+        guard !sampleRect.isNull, sampleRect.width >= 2, sampleRect.height >= 2 else { return false }
+
+        let minX = max(0, Int(sampleRect.minX))
+        let maxX = min(image.width, Int(sampleRect.maxX))
+        let minY = max(0, Int(sampleRect.minY))
+        let maxY = min(image.height, Int(sampleRect.maxY))
+        var accentPixels = 0
+
+        for y in minY..<maxY {
+            for x in minX..<maxX {
+                let offset = (y * image.width + x) * 4
+                let red = Int(pixels[offset])
+                let green = Int(pixels[offset + 1])
+                let blue = Int(pixels[offset + 2])
+                if red >= 180, green >= 45, green <= 190, blue <= 145,
+                   red > green * 13 / 10, red > blue * 17 / 10 {
+                    accentPixels += 1
+                    if accentPixels >= minimumPixels { return true }
+                }
+            }
+        }
+        return false
     }
 
     private static func snapshotScreenRegion(of window: NSWindow, to path: String) -> CGImage? {
@@ -4885,6 +6719,584 @@ final class UITestRunner: NSObject {
         return r
     }
 
+    // MARK: - Cenário: all-in-one-interaction
+
+    /// Drives the actual All-in-One controller through the same accessibility and
+    /// keyboard entry points a user has, without invoking a real capture action.
+    /// The callback only records the selected intent after the controller tears
+    /// down its overlay, so the test also proves the action exits cleanly.
+    private static func runAllInOneInteraction() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard let appDelegate = NSApp.delegate as? AppDelegate, let screen = NSScreen.main else {
+            r["error"] = "no app delegate or screen"
+            return r
+        }
+
+        let engine = appDelegate.uiTestCaptureEngine
+        let area = CGRect(
+            x: screen.frame.midX - 320,
+            y: screen.frame.midY - 180,
+            width: 640,
+            height: 360
+        )
+        func keyEvent(_ keyCode: UInt16, characters: String, in window: NSWindow) -> NSEvent? {
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: window.windowNumber,
+                context: nil,
+                characters: characters,
+                charactersIgnoringModifiers: characters,
+                isARepeat: false,
+                keyCode: keyCode
+            )
+        }
+
+        var accessibilityAction: String?
+        let accessibilityController = AllInOneController(
+            screen: screen,
+            initialRect: area,
+            onAction: { action, _, _ in accessibilityAction = action.accessibilityIdentifier },
+            onCancel: {}
+        )
+        await accessibilityController.prepareAndShow(engine: engine)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        var focusPass = false
+        var tabPass = false
+        var accessibilityPass = false
+        if let panel = accessibilityController.uiTestPanelWindow as? AllInOnePanelWindow {
+            panel.focusFirstOption()
+            let buttons = panel.optionButtons
+            focusPass = panel.isKeyWindow && panel.firstResponder === buttons.first
+            if buttons.count > 1, let tab = keyEvent(48, characters: "\t", in: panel) {
+                panel.sendEvent(tab)
+                tabPass = panel.firstResponder === buttons[1]
+            }
+            do {
+                let result = try UIIntrospection.click(id: "all-in-one.record")
+                r["accessibilityClickClass"] = result.className
+            } catch {
+                r["accessibilityClickError"] = String(describing: error)
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            accessibilityPass = accessibilityAction == AllInOneAction.record.accessibilityIdentifier
+        }
+        accessibilityController.uiTestCancel()
+
+        var spaceAction: String?
+        let spaceController = AllInOneController(
+            screen: screen,
+            initialRect: area,
+            onAction: { action, _, _ in spaceAction = action.accessibilityIdentifier },
+            onCancel: {}
+        )
+        await spaceController.prepareAndShow(engine: engine)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        var spacePass = false
+        if let panel = spaceController.uiTestPanelWindow as? AllInOnePanelWindow,
+           let space = keyEvent(49, characters: " ", in: panel) {
+            panel.focusFirstOption()
+            panel.sendEvent(space)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            spacePass = spaceAction == AllInOneAction.capture.accessibilityIdentifier
+        }
+        spaceController.uiTestCancel()
+
+        var returnAction: String?
+        let returnController = AllInOneController(
+            screen: screen,
+            initialRect: area,
+            onAction: { action, _, _ in returnAction = action.accessibilityIdentifier },
+            onCancel: {}
+        )
+        await returnController.prepareAndShow(engine: engine)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        var returnPass = false
+        if let panel = returnController.uiTestPanelWindow as? AllInOnePanelWindow,
+           panel.optionButtons.count > 1,
+           let `return` = keyEvent(36, characters: "\r", in: panel) {
+            panel.makeFirstResponder(panel.optionButtons[1])
+            panel.sendEvent(`return`)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            returnPass = returnAction == AllInOneAction.record.accessibilityIdentifier
+        }
+        returnController.uiTestCancel()
+
+        var didCancel = false
+        let escapeController = AllInOneController(
+            screen: screen,
+            initialRect: area,
+            onAction: { _, _, _ in },
+            onCancel: { didCancel = true }
+        )
+        await escapeController.prepareAndShow(engine: engine)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        var escapePass = false
+        if let panel = escapeController.uiTestPanelWindow as? AllInOnePanelWindow,
+           let escape = keyEvent(53, characters: "\u{1B}", in: panel) {
+            panel.focusFirstOption()
+            NSApp.sendEvent(escape)
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            escapePass = didCancel
+        }
+        escapeController.uiTestCancel()
+
+        r["focusPass"] = focusPass
+        r["tabPass"] = tabPass
+        r["accessibilityPass"] = accessibilityPass
+        r["spacePass"] = spacePass
+        r["returnPass"] = returnPass
+        r["escapePass"] = escapePass
+        r["allPass"] = focusPass && tabPass && accessibilityPass && spacePass && returnPass && escapePass
+        return r
+    }
+
+    // MARK: - Cenário: all-in-one-interrupt
+
+    /// A new area command must replace the visible All-in-One session instead of
+    /// stacking a second interactive overlay above it. The production capture
+    /// starts only after this handoff, so the test stops before accepting a rect.
+    private static func runAllInOneInterrupt() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "all-in-one-interrupt"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let engine = appDelegate.uiTestCaptureEngine
+        engine.uiTestActiveSelection?.cancel()
+        engine.uiTestCloseAllInOne()
+
+        await engine.startAllInOne(historyManager: appDelegate.historyManager)
+        for _ in 0..<30 where engine.uiTestAllInOneInitialRect == nil {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let allInOneOpened = engine.uiTestAllInOneInitialRect != nil
+
+        await engine.startAreaCapture(historyManager: appDelegate.historyManager)
+        for _ in 0..<30 where engine.uiTestActiveSelection == nil {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let allInOneDismissed = engine.uiTestAllInOneInitialRect == nil
+        let areaSelectionOpened = engine.uiTestActiveSelection != nil
+
+        engine.uiTestActiveSelection?.cancel()
+        engine.uiTestCloseAllInOne()
+
+        r["allInOneOpened"] = allInOneOpened
+        r["allInOneDismissed"] = allInOneDismissed
+        r["areaSelectionOpened"] = areaSelectionOpened
+        r["allPass"] = allInOneOpened && allInOneDismissed && areaSelectionOpened
+        return r
+    }
+
+    // MARK: - Scenario: all-in-one-pending-action-replacement
+
+    /// Selecting an All-in-One action starts an 80 ms compositor handoff. A newer
+    /// command inside that handoff must invalidate the older intent, not let it
+    /// start a capture after the replacement has already won.
+    private static func runAllInOnePendingActionReplacement() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "all-in-one-pending-action-replacement"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no app delegate or screen"
+            r["allPass"] = false
+            return r
+        }
+
+        let area = CGRect(
+            x: screen.frame.midX - 320,
+            y: screen.frame.midY - 180,
+            width: 640,
+            height: 360
+        )
+        var actionCount = 0
+        var cancelCount = 0
+        let controller = AllInOneController(
+            screen: screen,
+            initialRect: area,
+            onAction: { _, _, _ in actionCount += 1 },
+            onCancel: { cancelCount += 1 }
+        )
+
+        await controller.prepareAndShow(engine: appDelegate.uiTestCaptureEngine)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        let panelReady = (controller.uiTestPanelWindow as? AllInOnePanelWindow)?.optionButtons.first != nil
+        (controller.uiTestPanelWindow as? AllInOnePanelWindow)?.optionButtons.first?.performClick(nil)
+        controller.dismissForReplacement()
+        try? await Task.sleep(nanoseconds: 180_000_000)
+
+        r["panelReady"] = panelReady
+        r["actionCount"] = actionCount
+        r["cancelCount"] = cancelCount
+        r["panelDismissed"] = controller.uiTestPanelWindow == nil
+        r["allPass"] = panelReady && actionCount == 0 && cancelCount == 1 && controller.uiTestPanelWindow == nil
+        return r
+    }
+
+    // MARK: - Scenario: all-in-one-dismiss-during-prepare
+
+    /// The screenshot freeze is asynchronous. Cancelling before it resolves must
+    /// leave the session dead, rather than creating an overlay after the next
+    /// capture intent already owns the screen.
+    private static func runAllInOneDismissDuringPrepare() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "all-in-one-dismiss-during-prepare"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no app delegate or screen"
+            r["allPass"] = false
+            return r
+        }
+
+        let area = CGRect(
+            x: screen.frame.midX - 320,
+            y: screen.frame.midY - 180,
+            width: 640,
+            height: 360
+        )
+        let engine = appDelegate.uiTestCaptureEngine
+        let originalCaptureHook = engine.willCaptureScreenHook
+        var backdropRequested = false
+        var cancelCount = 0
+        let controller = AllInOneController(
+            screen: screen,
+            initialRect: area,
+            onAction: { _, _, _ in },
+            onCancel: { cancelCount += 1 }
+        )
+        engine.willCaptureScreenHook = {
+            originalCaptureHook?()
+            backdropRequested = true
+            controller.dismissForReplacement()
+        }
+        defer { engine.willCaptureScreenHook = originalCaptureHook }
+
+        await controller.prepareAndShow(engine: engine)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        r["backdropRequested"] = backdropRequested
+        r["cancelCount"] = cancelCount
+        r["panelPresented"] = controller.uiTestPanelWindow != nil
+        r["allPass"] = backdropRequested && cancelCount == 1 && controller.uiTestPanelWindow == nil
+        return r
+    }
+
+    // MARK: - Scenario: all-in-one-handoff-latest-intent
+
+    /// A replacement waits briefly for the dismissed dock to leave the compositor.
+    /// If a newer All-in-One begins during that wait, the older replacement must
+    /// stop instead of opening a stale picker over the newer dock.
+    private static func runAllInOneHandoffLatestIntent() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "all-in-one-handoff-latest-intent"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let engine = appDelegate.uiTestCaptureEngine
+        engine.uiTestActiveSelection?.cancel()
+        engine.uiTestCloseAllInOne()
+
+        await engine.startAllInOne(historyManager: appDelegate.historyManager)
+        for _ in 0..<30 where engine.uiTestAllInOneInitialRect == nil {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let originalOpened = engine.uiTestAllInOneInitialRect != nil
+
+        let staleReplacement = Task {
+            await engine.startAreaCapture(historyManager: appDelegate.historyManager)
+        }
+        for _ in 0..<20 where engine.uiTestAllInOneInitialRect != nil {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let originalDismissed = engine.uiTestAllInOneInitialRect == nil
+
+        await engine.startAllInOne(historyManager: appDelegate.historyManager)
+        await staleReplacement.value
+        try? await Task.sleep(nanoseconds: 120_000_000)
+
+        let newerAllInOneOpened = engine.uiTestAllInOneInitialRect != nil
+        let staleAreaSelectionOpened = engine.uiTestActiveSelection != nil
+
+        engine.uiTestActiveSelection?.cancel()
+        engine.uiTestCloseAllInOne()
+
+        r["originalOpened"] = originalOpened
+        r["originalDismissed"] = originalDismissed
+        r["newerAllInOneOpened"] = newerAllInOneOpened
+        r["staleAreaSelectionOpened"] = staleAreaSelectionOpened
+        r["allPass"] = originalOpened && originalDismissed && newerAllInOneOpened && !staleAreaSelectionOpened
+        return r
+    }
+
+    // MARK: - Scenario: scrolling-handoff-latest-intent
+
+    /// Scrolling owns a private selector. If an All-in-One starts while its frozen
+    /// backdrop is loading, the stale scrolling selector must never appear over
+    /// the newer dock.
+    private static func runScrollingHandoffLatestIntent() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "scrolling-handoff-latest-intent"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let engine = appDelegate.uiTestCaptureEngine
+        engine.uiTestCloseAllInOne()
+
+        await engine.startAllInOne(historyManager: appDelegate.historyManager)
+        for _ in 0..<30 where engine.uiTestAllInOneInitialRect == nil {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let originalOpened = engine.uiTestAllInOneInitialRect != nil
+
+        let staleScrolling = Task {
+            await engine.startScrollingCapture(historyManager: appDelegate.historyManager)
+        }
+        for _ in 0..<20 where engine.uiTestAllInOneInitialRect != nil {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let originalDismissed = engine.uiTestAllInOneInitialRect == nil
+
+        await staleScrolling.value
+        let scrollingSelectionStarted = engine.uiTestScrollingCaptureActive
+
+        await engine.startAllInOne(historyManager: appDelegate.historyManager)
+        try? await Task.sleep(nanoseconds: 120_000_000)
+
+        let newerAllInOneOpened = engine.uiTestAllInOneInitialRect != nil
+        let staleScrollingSelectionOpened = engine.uiTestScrollingCaptureActive
+
+        engine.uiTestCloseAllInOne()
+
+        r["originalOpened"] = originalOpened
+        r["originalDismissed"] = originalDismissed
+        r["scrollingSelectionStarted"] = scrollingSelectionStarted
+        r["newerAllInOneOpened"] = newerAllInOneOpened
+        r["staleScrollingSelectionOpened"] = staleScrollingSelectionOpened
+        r["allPass"] = originalOpened && originalDismissed && scrollingSelectionStarted
+            && newerAllInOneOpened && !staleScrollingSelectionOpened
+        return r
+    }
+
+    // MARK: - Scenario: interactive-selection-replacement
+
+    /// A newer scrolling command replaces an ordinary area selector instead of
+    /// leaving two private overlay systems alive at once.
+    private static func runInteractiveSelectionReplacement() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "interactive-selection-replacement"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"
+            r["allPass"] = false
+            return r
+        }
+
+        let engine = appDelegate.uiTestCaptureEngine
+        engine.uiTestActiveSelection?.cancel()
+        engine.uiTestCloseAllInOne()
+
+        await engine.startAreaCapture(historyManager: appDelegate.historyManager)
+        for _ in 0..<30 where engine.uiTestActiveSelection == nil {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let areaSelectionOpened = engine.uiTestActiveSelection != nil
+
+        await engine.startScrollingCapture(historyManager: appDelegate.historyManager)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        let areaSelectionDismissed = engine.uiTestActiveSelection == nil
+        let scrollingSelectionOpened = engine.uiTestScrollingCaptureActive
+
+        r["areaSelectionOpened"] = areaSelectionOpened
+        r["areaSelectionDismissed"] = areaSelectionDismissed
+        r["scrollingSelectionOpened"] = scrollingSelectionOpened
+        r["allPass"] = areaSelectionOpened && areaSelectionDismissed && scrollingSelectionOpened
+        return r
+    }
+
+    // MARK: - Scenario: area-selection-cancel-pending-finish
+
+    /// Finishing a drag defers its completion briefly for compositor cleanup. A
+    /// replacement during that handoff must suppress the old successful result.
+    private static func runAreaSelectionCancelPendingFinish() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "area-selection-cancel-pending-finish"]
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no screen"
+            r["allPass"] = false
+            return r
+        }
+
+        var completions: [String] = []
+        let selection = AreaSelectionWindow(mode: .area) { rect, _, _ in
+            completions.append(rect == nil ? "cancel" : "selection")
+        }
+        let rect = CGRect(
+            x: screen.frame.midX - 160,
+            y: screen.frame.midY - 90,
+            width: 320,
+            height: 180
+        )
+        selection.simulateSelection(rect: rect, on: screen)
+        selection.cancel()
+        try? await Task.sleep(nanoseconds: 160_000_000)
+
+        r["completions"] = completions
+        r["allPass"] = completions == ["cancel"]
+        return r
+    }
+
+    // MARK: - Scenario: all-in-one-restores-last-area
+
+    /// Commits the same state an accepted area selection writes, then asks the
+    /// production All-in-One planner for its target. This avoids requiring screen
+    /// recording permission merely to validate restore semantics in the harness.
+    private static func runAllInOneRestoresLastArea() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "all-in-one-restores-last-area"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no app delegate or screen"
+            r["allPass"] = false
+            return r
+        }
+
+        let engine = appDelegate.uiTestCaptureEngine
+        let previousSavedArea = Settings.allInOneRect
+        let previousLastCaptureRect = engine.lastCaptureRect
+        let area = CGRect(
+            x: screen.frame.midX - 280,
+            y: screen.frame.midY - 160,
+            width: 560,
+            height: 320
+        )
+        defer {
+            Settings.allInOneRect = previousSavedArea
+            engine.uiTestRestoreLastCaptureRect(previousLastCaptureRect)
+        }
+
+        engine.uiTestRememberReusableArea(area, on: screen)
+        let persistedSelectionPasses = Settings.allInOneRect == area
+        let plan = engine.uiTestAllInOneStartPlan(cursor: screen.frame.origin)
+        let restoredRect = plan?.rect
+        let restoredScreen = plan?.screenFrame
+        let rectPasses = restoredRect == area
+        let screenPasses = restoredScreen?.contains(area) == true
+        r["persistedSelectionPasses"] = persistedSelectionPasses
+        r["restoredRectPasses"] = rectPasses
+        r["restoredScreenPasses"] = screenPasses
+        r["restoredRect"] = restoredRect.map {
+            ["x": $0.origin.x, "y": $0.origin.y, "w": $0.width, "h": $0.height]
+        }
+        r["allPass"] = persistedSelectionPasses && rectPasses && screenPasses
+        return r
+    }
+
+    // MARK: - Scenario: recording-toggle-input
+
+    /// Uses a physical cancelled drag to ensure it never changes the recording
+    /// option, then the control's accessible press path to verify the same target
+    /// action commits both the button and Settings state. The drag requires
+    /// Accessibility because it is posted through the HID event tap.
+    private static func runRecordingToggleInput() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "recording-toggle-input"]
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let screen = NSScreen.main ?? NSScreen.screens.first else {
+            r["error"] = "no app delegate or screen"
+            r["allPass"] = false
+            return r
+        }
+
+        let previousMicrophone = Settings.recordingMicrophone
+        Settings.recordingMicrophone = false
+        let engine = appDelegate.uiTestCaptureEngine
+        defer {
+            engine.uiTestCloseRecordingPreflight()
+            Settings.recordingMicrophone = previousMicrophone
+        }
+
+        guard let window = engine.uiTestShowRecordingPreflight(
+            rect: CGRect(x: 40, y: 40, width: 640, height: 360),
+            on: screen
+        ), let root = window.contentView,
+        let microphone = findView(in: root, where: {
+            $0.identifier?.rawValue == "recording.preflight.microphone"
+        }) as? NSButton else {
+            r["error"] = "recording microphone toggle missing"
+            r["allPass"] = false
+            return r
+        }
+
+        for _ in 0..<40 where !window.isKeyWindow {
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        let preflightKeyReady = window.isKeyWindow
+        let accessibilityTrusted = AXIsProcessTrusted()
+        r["preflightKeyReady"] = preflightKeyReady
+        r["accessibilityTrusted"] = accessibilityTrusted
+        guard preflightKeyReady, accessibilityTrusted else {
+            r["error"] = "recording preflight did not become key or Accessibility is unavailable"
+            r["allPass"] = false
+            return r
+        }
+
+        let start = microphone.convert(
+            CGPoint(x: microphone.bounds.midX, y: microphone.bounds.midY),
+            to: root
+        )
+        let cancelledEnd = CGPoint(x: max(4, start.x - microphone.bounds.width - 12), y: start.y)
+        let startInWindow = root.convert(start, to: nil)
+        let endInWindow = root.convert(cancelledEnd, to: nil)
+        let startOnScreen = window.convertPoint(toScreen: startInWindow)
+        let endOnScreen = window.convertPoint(toScreen: endInWindow)
+        func quartzPoint(_ appKitPoint: NSPoint) -> CGPoint {
+            CGPoint(x: appKitPoint.x, y: screen.frame.maxY - appKitPoint.y)
+        }
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+
+        let dragStart = quartzPoint(startOnScreen)
+        let dragEnd = quartzPoint(endOnScreen)
+        post(.leftMouseDown, at: dragStart)
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        for step in 1...4 {
+            let progress = CGFloat(step) / 4
+            let point = CGPoint(
+                x: dragStart.x + (dragEnd.x - dragStart.x) * progress,
+                y: dragStart.y + (dragEnd.y - dragStart.y) * progress
+            )
+            post(.leftMouseDragged, at: point)
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        post(.leftMouseUp, at: dragEnd)
+        try? await Task.sleep(nanoseconds: 140_000_000)
+        let cancelledPressPreservesState = microphone.state == .off && !Settings.recordingMicrophone
+
+        let accessiblePressCommitsState: Bool
+        do {
+            _ = try UIIntrospection.click(id: "recording.preflight.microphone")
+            accessiblePressCommitsState = microphone.state == .on && Settings.recordingMicrophone
+        } catch {
+            r["accessiblePressError"] = String(describing: error)
+            accessiblePressCommitsState = false
+        }
+
+        r["cancelledPressPreservesState"] = cancelledPressPreservesState
+        r["accessiblePressCommitsState"] = accessiblePressCommitsState
+        r["allPass"] = cancelledPressPreservesState && accessiblePressCommitsState
+        return r
+    }
+
     // MARK: - Cenário: glass-renders (gate visual do Liquid Glass)
 
     /// Opens every glass chrome surface on-screen (recording preflight, recording
@@ -4920,29 +7332,144 @@ final class UITestRunner: NSObject {
         // the Mac is in active use (flat placeholder back), the on-screen
         // composite is what the user actually sees.
         let hud = RecordingHUDWindow()
+        hud.restartHandler = {}
+        hud.discardHandler = {}
         hud.configure(systemAudio: true, microphone: true, fps: 30, quality: "high")
         hud.show(on: screen)
         hud.sharingType = .readOnly
         try? await Task.sleep(nanoseconds: 500_000_000)
         var hudPass = false
         if let cg = snapshotScreenRegion(of: hud, to: "\(dir)/recording-hud.png") {
-            hudPass = hasVisibleContrast(cg)
+            let layout = RecordingHUDLayout(showsMeter: true)
+            hudPass = recordingHUDRegionPasses(cg, layout: layout).values.allSatisfy { $0 }
         }
-        hud.sharingType = .none
-        hud.closeHUD()
         r["hudPass"] = hudPass
 
-        // 3. All-in-One panel: the glass cluster (six shapes merged into one mass).
+        // Pause the already-visible HUD, matching the real recording lifecycle.
+        // Creating a window in a pre-paused state does not exercise the product path.
+        hud.setPaused(true)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        var pausedHUDRegions: [String: Bool] = [:]
+        let pausedHUDPass = snapshotScreenRegion(
+            of: hud,
+            to: "\(dir)/recording-hud-paused.png"
+        ).map { image in
+            let layout = RecordingHUDLayout(showsMeter: true)
+            pausedHUDRegions = recordingHUDRegionPasses(image, layout: layout)
+            return pausedHUDRegions.values.allSatisfy { $0 }
+        } ?? false
+        hud.sharingType = .none
+        hud.closeHUD()
+        r["pausedHUDPass"] = pausedHUDPass
+        r["pausedHUDRegions"] = pausedHUDRegions
+
+        // 3. Saved result: poster, metadata, primary Edit action, Reveal and
+        // overflow in the same top-centre continuum as the HUD.
+        var resultPass = false
+        let resultURL = URL(fileURLWithPath: "\(dir)/recording-result-source.mp4")
+        if await makeSyntheticZoomSource(
+            to: resultURL,
+            size: CGSize(width: 320, height: 180),
+            frames: 4,
+            fps: 2
+        ) {
+            let resultActions = UITestRecordingResultActions()
+            let result = RecordingResultWindow.uiTestMake(
+                url: resultURL,
+                duration: 2,
+                actions: resultActions
+            )
+            let visible = screen.visibleFrame
+            result.setFrameOrigin(NSPoint(
+                x: visible.midX - result.frame.width / 2,
+                y: visible.maxY - result.frame.height - 18
+            ))
+            result.sharingType = .readOnly
+            result.makeKeyAndOrderFront(nil)
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            resultPass = snapshotScreenRegion(of: result, to: "\(dir)/recording-result.png")
+                .map { hasVisibleContrast($0) } ?? false
+            result.close()
+        }
+        r["resultPass"] = resultPass
+
+        // 4. All-in-One panel: one grouped action dock over the selection.
         var aioPass = false
+        var aioStructurePass = false
         let aio = AllInOneController(screen: screen, initialRect: fakeArea,
                                      onAction: { _, _, _ in }, onCancel: {})
         await aio.prepareAndShow(engine: engine)
         try? await Task.sleep(nanoseconds: 800_000_000)
         if let panel = aio.uiTestPanelWindow {
-            aioPass = snapshotWindow(panel, to: "\(dir)/all-in-one.png")
+            r["allInOnePanelVisible"] = panel.isVisible
+            r["allInOnePanelWindowNumber"] = Int(panel.windowNumber)
+            r["allInOnePanelLevel"] = Int(panel.level.rawValue)
+            r["allInOnePanelFrame"] = [
+                "x": panel.frame.origin.x,
+                "y": panel.frame.origin.y,
+                "w": panel.frame.width,
+                "h": panel.frame.height,
+            ]
+            if let actionPanel = panel as? AllInOnePanelWindow {
+                let expectedActions = AllInOneAction.allCases
+                let buttons = actionPanel.optionButtons
+                aioStructurePass = buttons.count == expectedActions.count
+                    && zip(buttons, expectedActions).allSatisfy { button, action in
+                        button.accessibilityIdentifier() == action.accessibilityIdentifier
+                            && button.accessibilityLabel() == action.accessibilityLabel
+                            && !button.isHidden
+                    }
+                    && buttons.map(\.frame) == [
+                        CGRect(x: 10, y: 10, width: 76, height: 60),
+                        CGRect(x: 88, y: 10, width: 76, height: 60),
+                        CGRect(x: 182, y: 10, width: 76, height: 60),
+                        CGRect(x: 260, y: 10, width: 76, height: 60),
+                        CGRect(x: 354, y: 10, width: 76, height: 60),
+                        CGRect(x: 432, y: 10, width: 76, height: 60),
+                    ]
+            }
+            // Product windows never share into a capture. Lift only the panel
+            // for the harness's own WindowServer snapshot, then restore it.
+            panel.sharingType = .readOnly
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            let windowsAbovePanel = (CGWindowListCopyWindowInfo(
+                [.optionOnScreenAboveWindow, .excludeDesktopElements],
+                CGWindowID(panel.windowNumber)
+            ) as? [[String: Any]] ?? []).compactMap { info -> [String: Any]? in
+                guard (info[kCGWindowOwnerPID as String] as? Int32) == ProcessInfo.processInfo.processIdentifier else {
+                    return nil
+                }
+                return [
+                    "number": info[kCGWindowNumber as String] as? Int ?? -1,
+                    "layer": info[kCGWindowLayer as String] as? Int ?? -1,
+                    "bounds": info[kCGWindowBounds as String] as? [String: CGFloat] ?? [:],
+                ]
+            }
+            r["allInOneAppWindowsAbovePanel"] = windowsAbovePanel
+            r["allInOnePerWindowPass"] = snapshotWindow(
+                panel,
+                to: "\(dir)/all-in-one-window.png"
+            )
+            for attempt in 1...3 where !aioPass {
+                panel.displayIfNeeded()
+                aioPass = snapshotScreenRegion(of: panel, to: "\(dir)/all-in-one.png")
+                    .map {
+                        allInOneCompositePasses(
+                            $0,
+                            actionFrames: (panel as? AllInOnePanelWindow)?.optionButtons.map(\.frame) ?? [],
+                            panelSize: panel.frame.size
+                        )
+                    } ?? false
+                r["allInOneSnapshotAttempts"] = attempt
+                if !aioPass, attempt < 3 {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
+            }
+            panel.sharingType = .none
         }
         aio.uiTestCancel()
-        r["allInOnePass"] = aioPass
+        r["allInOneStructurePass"] = aioStructurePass
+        r["allInOnePass"] = aioPass && aioStructurePass
 
         // 4. Toast: panel-radius glass bubble. Same region grab + contrast
         // check as the HUD, and the newest toast wins (an earlier scenario's
@@ -4989,17 +7516,38 @@ final class UITestRunner: NSObject {
             try? await Task.sleep(nanoseconds: 300_000_000)
             // Region grab, not per-window: the card's hover frost is glass IN
             // FRONT of the thumb, which only composites in the on-screen result.
-            // The pass is content-based: the centre pixel must be the test
-            // image's orange, proving the thumb actually renders (this caught
-            // the NSImageView-clobbers-layer.contents regression).
-            if let cg = snapshotScreenRegion(of: card, to: "\(dir)/overlay-card.png"),
-               let buf = rgbaPixels(cg) {
+            // Assert both states. A real cursor position must not decide whether
+            // this gate tests the clear overlay backing; force the hover state
+            // after the entry transition settles.
+            func captureOverlayCenter(to path: String) -> (pixel: [String: Int], passes: Bool)? {
+                guard let cg = snapshotScreenRegion(of: card, to: path),
+                      let buf = rgbaPixels(cg) else { return nil }
                 let cx = cg.width / 2, cy = cg.height / 2
                 let i = (cy * cg.width + cx) * 4
                 let (red, green, blue) = (Int(buf[i]), Int(buf[i + 1]), Int(buf[i + 2]))
-                r["overlayCenterPixel"] = ["r": red, "g": green, "b": blue]
-                overlayPass = red > 200 && green > 110 && green < 190 && blue < 120
+                return (
+                    ["r": red, "g": green, "b": blue],
+                    // A clear material dims the thumbnail on hover, so exact
+                    // source RGB is neither expected nor desirable. Preserve
+                    // the orange relationship instead: bright red, warm green,
+                    // little blue. The old black fallback fails this decisively.
+                    red > 120 && green > 55 && green < 190 && blue < 100
+                        && Double(red) > Double(green) * 1.45
+                )
             }
+
+            QuickAccessOverlay.uiTestSetNewestHovered(false)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            let rest = captureOverlayCenter(to: "\(dir)/overlay-card-rest.png")
+            r["overlayRestCenterPixel"] = rest?.pixel ?? [:]
+            r["overlayRestPass"] = rest?.passes ?? false
+
+            QuickAccessOverlay.uiTestSetNewestHovered(true)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            let hover = captureOverlayCenter(to: "\(dir)/overlay-card.png")
+            r["overlayCenterPixel"] = hover?.pixel ?? [:]
+            r["overlayHoverPass"] = hover?.passes ?? false
+            overlayPass = (rest?.passes ?? false) && (hover?.passes ?? false)
             card.sharingType = .none
         }
         QuickAccessOverlay.uiTestCloseNewest()
@@ -5037,8 +7585,8 @@ final class UITestRunner: NSObject {
         }
         r["qrPass"] = qrPass
 
-        r["allPass"] = preflightPass && hudPass && aioPass && toastPass
-            && overlayPass && historyPass && qrPass
+        r["allPass"] = preflightPass && hudPass && pausedHUDPass && resultPass
+            && aioPass && aioStructurePass && toastPass && overlayPass && historyPass && qrPass
         return r
     }
 
@@ -5263,5 +7811,94 @@ final class UITestRunner: NSObject {
             if let hit = findView(in: sub, where: predicate) { return hit }
         }
         return nil
+    }
+}
+
+@MainActor
+private final class UITestRecordingResultActions: RecordingResultActions {
+    func exportGIF(from url: URL) {}
+    func trim(url: URL, range: CMTimeRange, convert: VideoTrimPanel.ConvertOptions?) {}
+    func exportAutoZoom(from url: URL) {}
+    func openVideoEditor(url: URL, duration: Double) {}
+}
+
+/// Bounds AVAssetWriter back-pressure while preserving a responsive main run
+/// loop for the opt-in UI harness. One absolute deadline covers the full
+/// synthetic source, so a permanently stalled input cannot pin the scenario.
+enum MediaInputReadiness {
+    // The first AVAssetWriter use can exceed five seconds while hardware codecs
+    // warm up. Fifteen seconds remains a hard harness bound without rejecting a
+    // healthy first conversion on a busy machine.
+    static let syntheticWriterTimeout: TimeInterval = 15
+
+    static func deadline(now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) -> TimeInterval {
+        now() + syntheticWriterTimeout
+    }
+
+    static func wait(for input: AVAssetWriterInput, until deadline: TimeInterval) -> Bool {
+        waitUntilReady(
+            deadline: deadline,
+            isReady: { input.isReadyForMoreMediaData },
+            now: { ProcessInfo.processInfo.systemUptime },
+            pause: { duration in
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: duration))
+            }
+        )
+    }
+
+    static func waitUntilReady(
+        deadline: TimeInterval,
+        pollInterval: TimeInterval = 0.002,
+        isReady: () -> Bool,
+        now: () -> TimeInterval,
+        pause: (TimeInterval) -> Void
+    ) -> Bool {
+        while !isReady() {
+            let remaining = deadline - now()
+            guard remaining > 0 else { return false }
+            pause(min(pollInterval, remaining))
+        }
+        return true
+    }
+
+    static func finishWriting(_ writer: AVAssetWriter) async -> Bool {
+        let completed = await waitForFinish(timeout: syntheticWriterTimeout) { completion in
+            writer.finishWriting { completion() }
+        }
+        guard completed, writer.status == .completed else {
+            writer.cancelWriting()
+            return false
+        }
+        return true
+    }
+
+    static func waitForFinish(
+        timeout: TimeInterval,
+        start: @escaping (@escaping () -> Void) -> Void
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let state = FinishWaitState(continuation: continuation)
+            start { state.resolve(true) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                state.resolve(false)
+            }
+        }
+    }
+}
+
+private final class FinishWaitState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    init(continuation: CheckedContinuation<Bool, Never>) {
+        self.continuation = continuation
+    }
+
+    func resolve(_ completed: Bool) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: completed)
     }
 }

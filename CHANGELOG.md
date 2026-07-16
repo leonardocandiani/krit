@@ -2,6 +2,50 @@
 
 All notable changes to KRIT, newest first.
 
+## Unreleased
+
+### Security
+- Legacy distributed capture notifications now exist only inside the explicit UI test environment. A normal KRIT launch no longer registers that unauthenticated local capture surface.
+- UI-test capture artifacts are confined to `/tmp`, including screenshots, sidecars and area-selection snapshots.
+
+### Reliability
+- Launch now has an explicit capture-ready boundary: the status item and global hotkeys are armed before the first run-loop idle, while Sparkle validation, sound resource warming and native-shortcut conflict probing run afterward. The status menu is also populated after that boundary instead of constructing every item and SF Symbol on the critical path.
+- The native screenshot-shortcut conflict dialog now honors its one-time contract instead of reappearing on every launch when the user chooses to open System Settings.
+- First-run onboarding now builds each page on demand instead of constructing four complete AppKit view trees before the welcome window appears.
+- The synthetic media sources used by UI regression scenarios now share a bounded 15-second writer deadline, cancel partial output on failure, and report the failing stage instead of waiting forever.
+- Smart Redact and text-aware highlighter detection run their synchronous Vision work away from the AppKit main thread, so large screenshots keep the editor responsive while recognition runs.
+- OCR and QR recognition use that same background Vision executor, keeping capture-selection interactions responsive on large images.
+- Video editor wallpaper thumbnails and full export backgrounds now decode off the main thread, avoiding cold UI stalls from multi-megabyte image files.
+- Cached wallpaper thumbnails now complete asynchronously too, avoiding reentrant SwiftUI state publication during view rendering.
+- Wallpaper thumbnail cache entries now include their requested pixel size, so a small swatch never degrades the larger editor preview.
+- Video playback ticks and editor-sidebar animation completions now retain their MainActor isolation under Swift 6 concurrency checks.
+- Save-panel, history, keystroke, camera, scrolling-stitch and mono-audio callbacks now preserve their execution ownership under Swift 6 concurrency checks.
+- Post-capture delivery now stages the overlay and raw history record before any encode, then shares one per-capture rendition cache across history, clipboard, autosave and scripted actions. Image encoding and silent file writes no longer block AppKit, and a failed destination does not cancel the remaining actions.
+- Quick Access drag preparation now consumes that same per-capture rendition cache, eliminating the second full-size encode that the card previously started after every normal capture.
+- Screenshot, recording, Presentation Zoom and live-wallpaper capture now share one ScreenCaptureKit catalog. Display topology is cached until macOS reports a screen change, window inventories stay fresh, and concurrent discovery is single-flight.
+- Window chooser previews on macOS 14 and later now retry ScreenCaptureKit instead of falling through to the obsolete CoreGraphics window API. Ventura keeps the legacy fallback it still requires.
+- Screenshot and recording regions now use one tested pixel-grid conversion based on the real `NSScreen` backing scale, fixing 1x external-display buffers and mixed AppKit/CoreGraphics monitor coordinates.
+- History index loading, validation, image persistence and deletes now run through a serial disk actor instead of the AppKit main actor. Captures made during startup merge safely with disk history, and delete operations cannot race a slow encode into recreating orphaned files.
+- Recording Preferences now discover microphones and cameras away from the SwiftUI render path, then refresh when hardware connects or disconnects.
+- UI screenshot gates reject opaque black WindowServer frames and fall back to AppKit rendering, so a permission failure cannot pass visual verification based on PNG file size alone.
+- Microphone discovery uses AVFoundation's modern `.external` device type on macOS 14 and later while preserving Ventura's legacy device types.
+
+### Design
+- Preferences now use a native AppKit source list and a single fresh SwiftUI form host. The window is resizable, section changes are instant, light and dark appearance share the same hierarchy, and reopening reloads current settings instead of retaining nine stale UI trees.
+- Every Preferences section has a compact title and purpose header. Capture adds an honest permission-aware readiness state and a visual, keyboard-accessible background chooser.
+- Colored icon tiles were replaced with quieter hierarchical SF Symbols. KRIT coral is reserved for navigation state and active choices.
+
+### Accessibility
+- Preferences navigation is a native source list with arrow-key navigation, type-select, stable selected-row semantics and a VoiceOver label.
+- Onboarding keeps actionable labels and explanatory notes at secondary-label contrast instead of making them look disabled.
+
+### Compatibility
+- Preferences keep scroll-end breathing room on macOS 13, use structural sidebar material on every supported system and keep the forced glass fallback consistent for clustered surfaces.
+- The installed bundle keeps a macOS 13 minimum deployment target, modern ScreenCaptureKit and AVFoundation paths stay version-gated, and the ad-hoc signed app passes deep code-signature verification.
+
+### Documentation
+- Architecture and contribution guides now describe the native Swift runtime, real build commands and automation boundary.
+
 ## 0.28.1
 
 ### KRIT v0.28.1

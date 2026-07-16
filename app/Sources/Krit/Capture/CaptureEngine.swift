@@ -9,6 +9,107 @@ import AudioToolbox
 import os
 import os.log
 
+/// The still-capture primitive depends on the OS features available, while the
+/// user-facing intent stays the same. macOS 13 has ScreenCaptureKit streams but
+/// not `SCScreenshotManager`, so icon exclusion must choose the one-frame stream.
+enum ScreenImageCaptureBackend: Equatable {
+    case screenshotManager
+    case oneFrameStream
+    case coreGraphics
+
+    static func resolve(
+        excludeDesktopIcons: Bool,
+        screenshotManagerAvailable: Bool,
+        streamAvailable: Bool
+    ) -> Self {
+        if screenshotManagerAvailable { return .screenshotManager }
+        if excludeDesktopIcons && streamAvailable { return .oneFrameStream }
+        return .coreGraphics
+    }
+}
+
+struct AllInOneRestoredSelection: Equatable {
+    let rect: CGRect
+    let screenIndex: Int
+}
+
+enum AllInOneSelectionRestore {
+    static func resolve(
+        candidates: [CGRect?],
+        screenFrames: [CGRect]
+    ) -> AllInOneRestoredSelection? {
+        for case let rect? in candidates where isReusable(rect) {
+            if let screenIndex = screenFrames.firstIndex(where: { $0.contains(rect) }) {
+                return AllInOneRestoredSelection(rect: rect, screenIndex: screenIndex)
+            }
+        }
+        return nil
+    }
+
+    static func defaultRect(in screenFrame: CGRect) -> CGRect {
+        let width = screenFrame.width * 0.6
+        let height = screenFrame.height * 0.6
+        return CGRect(
+            x: screenFrame.midX - width / 2,
+            y: screenFrame.midY - height / 2,
+            width: width,
+            height: height
+        )
+    }
+
+    private static func isReusable(_ rect: CGRect) -> Bool {
+        !rect.isNull
+            && !rect.isEmpty
+            && rect.origin.x.isFinite
+            && rect.origin.y.isFinite
+            && rect.width.isFinite
+            && rect.height.isFinite
+            && rect.width > 0
+            && rect.height > 0
+    }
+}
+
+/// Resolves the app that should receive an interactive capture follow-up. The
+/// All-in-One controller activates KRIT while it is visible, so its original
+/// source must be remembered before presentation rather than read later from
+/// the current frontmost app.
+enum InteractiveCaptureRoute {
+    static func allInOneSourceProcessIdentifier(
+        frontmostProcessIdentifier: pid_t?,
+        kritProcessIdentifier: pid_t
+    ) -> pid_t? {
+        guard let frontmostProcessIdentifier,
+              frontmostProcessIdentifier != kritProcessIdentifier else {
+            return nil
+        }
+        return frontmostProcessIdentifier
+    }
+
+    static func snapAndPasteTargetProcessIdentifier(
+        allInOneSourceProcessIdentifier: pid_t?,
+        frontmostProcessIdentifier: pid_t?
+    ) -> pid_t? {
+        allInOneSourceProcessIdentifier ?? frontmostProcessIdentifier
+    }
+}
+
+/// Preserves event-receipt order while capture work waits for the main actor.
+/// The engine's intent token handles replacement after a request starts; this
+/// gate prevents an older queued entry point from starting after a newer one.
+struct InteractiveCaptureDispatchGate {
+    private var latestRequestID = UUID()
+
+    mutating func beginRequest() -> UUID {
+        let requestID = UUID()
+        latestRequestID = requestID
+        return requestID
+    }
+
+    func isLatest(_ requestID: UUID) -> Bool {
+        latestRequestID == requestID
+    }
+}
+
 /// Central coordinator for all capture modes.
 @MainActor
 final class CaptureEngine {
@@ -18,7 +119,7 @@ final class CaptureEngine {
     /// Hard ceiling on a captured buffer's edge in pixels. ScreenCaptureKit
     /// rejects configurations past the GPU texture limit; clamp the supersampled
     /// width/height here so Maximum on a huge display degrades instead of failing.
-    static let maxCaptureEdge = 16384
+    static let maxCaptureEdge = ScreenCaptureDisplayGeometry.maxCaptureEdge
 
     /// Set when the SCK path fails because Screen Recording consent is missing,
     /// so callers can surface the permission alert instead of failing silently.
@@ -35,29 +136,44 @@ final class CaptureEngine {
     // Remembers the last selected area for "Capture Previous Area"
     private(set) var lastCaptureRect: CGRect?
 
-    /// One-shot completion for the NEXT interactive capture to finish. Fired in
-    /// finishCapture with the PRESENTED image (the composed one for window/template
-    /// default shots), then cleared so it never leaks into a later capture. Cleared
-    /// without firing when that capture is cancelled or fails. The `krit://` router
-    /// uses this to run `then=` chains on the interactive flows it can't grab
-    /// headlessly. Setting it again while one is pending replaces it.
-    var onNextCaptureFinished: ((NSImage, HistoryItem?) -> Void)?
-
-    /// Hands the pending image to the one-shot completion and clears it.
-    private func fireOnNextCaptureFinished(image: NSImage, item: HistoryItem?) {
-        guard let handler = onNextCaptureFinished else { return }
-        onNextCaptureFinished = nil
-        handler(image, item)
+    /// A capture owns its follow-up from acceptance until it either finishes or
+    /// cancels. A rejected request never receives an attempt and therefore cannot
+    /// clear an in-flight request's metadata or `then=` chain.
+    private struct CaptureAttempt {
+        let id = UUID()
+        let followUp: ((CaptureDeliveryReceipt) -> Void)?
     }
 
-    /// Clears a pending one-shot completion without firing it (cancel/failure).
-    private func clearOnNextCaptureFinished() {
-        onNextCaptureFinished = nil
+    private var activeCaptureAttempt: CaptureAttempt?
+
+    private struct AllInOneStartPlan {
+        let screen: NSScreen
+        let initialRect: CGRect
     }
 
-    /// App to refocus + paste into once the next interactive capture finishes
-    /// (Snap & Paste). Captured before the selection overlay steals focus.
-    private var snapAndPasteTarget: NSRunningApplication?
+    private func beginCaptureAttempt(
+        followUp: ((CaptureDeliveryReceipt) -> Void)? = nil
+    ) -> CaptureAttempt? {
+        guard activeCaptureAttempt == nil else { return nil }
+        let attempt = CaptureAttempt(followUp: followUp)
+        activeCaptureAttempt = attempt
+        return attempt
+    }
+
+    /// Takes an accepted attempt exactly once. A stale completion cannot deliver a
+    /// screenshot after its original attempt has already been cancelled.
+    private func takeCaptureAttempt(_ attempt: CaptureAttempt) -> CaptureAttempt? {
+        guard let activeCaptureAttempt, activeCaptureAttempt.id == attempt.id else { return nil }
+        self.activeCaptureAttempt = nil
+        return activeCaptureAttempt
+    }
+
+    /// Ends a screenshot attempt that never reached `finishCapture`. Source-app
+    /// metadata belongs to the same attempt, so only the owner may clear it.
+    private func abandonCaptureAttempt(_ attempt: CaptureAttempt, historyManager: HistoryManager) {
+        guard takeCaptureAttempt(attempt) != nil else { return }
+        historyManager.cancelPreparedCapture()
+    }
 
     private var areaSelectionWindow: AreaSelectionWindow?
     // Guards back-to-back fullscreen/previous triggers from stacking countdowns
@@ -65,7 +181,12 @@ final class CaptureEngine {
     private var countdownActive = false
     private var scrollingCapture: ScrollingCaptureController?
     private var allInOneController: AllInOneController?
+    private var allInOneSessionID: UUID?
+    private var allInOneSourceProcessIdentifier: pid_t?
+    private var interactiveCaptureIntentID = UUID()
+    private var interactiveCaptureDispatchGate = InteractiveCaptureDispatchGate()
     private var recordingControlsWindow: RecordingControlsWindow?
+    private(set) var uiTestLegacyWindowPreviewFallbackCount = 0
     private var recordingScreenChooserWindow: RecordingScreenChooserWindow?
     private var recordingWindowChooserWindow: RecordingWindowChooserWindow?
     private let recordingEngine = RecordingEngine()
@@ -73,65 +194,130 @@ final class CaptureEngine {
     var recordingActive: Bool { recordingEngine.active }
     var recordingActionsEnabled: Bool { !recordingEngine.active && !recordingSetupActive }
 
+    /// Claims the newest external interactive request before scheduling its
+    /// asynchronous work. This keeps URL commands, menu actions and hotkeys in
+    /// receipt order even when several arrive in one run-loop turn.
+    func enqueueInteractiveRequest(_ operation: @escaping @MainActor () async -> Void) {
+        let requestID = interactiveCaptureDispatchGate.beginRequest()
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.interactiveCaptureDispatchGate.isLatest(requestID) else {
+                return
+            }
+            await operation()
+        }
+    }
+
     private var recordingSetupActive: Bool {
         areaSelectionWindow != nil || allInOneController != nil || recordingControlsWindow != nil || recordingScreenChooserWindow != nil || recordingWindowChooserWindow != nil
     }
 
-    // Cached SCShareableContent. `SCShareableContent.excludingDesktopWindows`
-    // enumerates every on-screen window and routinely costs 30-100 ms. For
-    // area/fullscreen/previous capture modes we only need the display list, and
-    // the display list only changes when the user plugs/unplugs a monitor or
-    // changes resolution, NSApplication.didChangeScreenParametersNotification
-    // is the perfect invalidator.
-    @available(macOS 14.0, *)
-    private static var cachedContent: SCShareableContent?
-    private static var cachedContentIncludesWindows = false
-    private static var observerInstalled = false
-
-    init() {
-        installScreenChangeObserverIfNeeded()
+    /// Every interactive capture surface must leave the WindowServer before a
+    /// new capture flow can create its own overlay. All-in-One owns two windows,
+    /// so merely starting another area picker could otherwise leave its frozen
+    /// backdrop and dock in the next grab.
+    private func dismissAllInOneForReplacement() async {
+        guard let controller = allInOneController else { return }
+        let sessionID = allInOneSessionID
+        controller.dismissForReplacement()
+        if let sessionID {
+            clearAllInOneSession(id: sessionID)
+        }
+        // Match the existing selection handoff delay. `orderOut` is synchronous,
+        // but the compositor needs one short turn before another capture samples
+        // the screen beneath it.
+        try? await Task.sleep(nanoseconds: 80_000_000)
     }
 
-    private func installScreenChangeObserverIfNeeded() {
-        guard !Self.observerInstalled else { return }
-        Self.observerInstalled = true
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task { @MainActor in
-                if #available(macOS 14.0, *) {
-                    Self.cachedContent = nil
-                    Self.cachedContentIncludesWindows = false
-                }
+    /// An interactive command may need to wait for a dismissed All-in-One dock to
+    /// leave the compositor. The newest command owns the screen if another intent
+    /// arrives during that yield, so every replacement revalidates this token
+    /// before creating its own surface.
+    private func beginInteractiveCaptureIntent() -> UUID {
+        dismissPendingInteractiveSurfaces()
+        let intentID = UUID()
+        interactiveCaptureIntentID = intentID
+        return intentID
+    }
+
+    /// Closes setup-only surfaces before a newer interactive intent takes over.
+    /// Ongoing recording and a running scrolling capture are deliberately left
+    /// alone: their stop actions own real media work and must not be torn down by
+    /// an unrelated screenshot hotkey.
+    private func dismissPendingInteractiveSurfaces() {
+        if let selection = areaSelectionWindow {
+            selection.cancel()
+            if areaSelectionWindow === selection {
+                areaSelectionWindow = nil
+            }
+        }
+
+        if let scrollingCapture {
+            scrollingCapture.cancelPendingSelection()
+            if !scrollingCapture.isActive, self.scrollingCapture === scrollingCapture {
+                self.scrollingCapture = nil
+            }
+        }
+
+        if let controls = recordingControlsWindow {
+            controls.closeControls()
+            if recordingControlsWindow === controls {
+                recordingControlsWindow = nil
+            }
+        }
+
+        if let chooser = recordingScreenChooserWindow {
+            chooser.closeChooser()
+            if recordingScreenChooserWindow === chooser {
+                recordingScreenChooserWindow = nil
+            }
+        }
+
+        if let chooser = recordingWindowChooserWindow {
+            chooser.closeChooser()
+            if recordingWindowChooserWindow === chooser {
+                recordingWindowChooserWindow = nil
             }
         }
     }
 
-    @available(macOS 14.0, *)
-    private static func shareableContent(includeWindows: Bool) async throws -> SCShareableContent {
-        // Only reuse the cache if it covers what the caller needs. A cache
-        // populated for "displays only" can't serve window-capture mode.
-        if let cached = cachedContent, cachedContentIncludesWindows || !includeWindows {
-            return cached
+    private func ownsInteractiveCaptureIntent(_ intentID: UUID) -> Bool {
+        interactiveCaptureIntentID == intentID
+    }
+
+    private func beginAllInOneReplacement() async -> UUID {
+        let intentID = beginInteractiveCaptureIntent()
+        await dismissAllInOneForReplacement()
+        return intentID
+    }
+
+    /// A continuation selected inside All-in-One already owns a valid intent.
+    /// External entry points claim a new one and dismiss any pending surface.
+    private func acquireInteractiveCaptureIntent(
+        continuing existingIntentID: UUID?
+    ) async -> UUID? {
+        if let existingIntentID {
+            return ownsInteractiveCaptureIntent(existingIntentID) ? existingIntentID : nil
         }
-        let content = try await SCShareableContent.excludingDesktopWindows(
-            false,
-            onScreenWindowsOnly: includeWindows
-        )
-        cachedContent = content
-        cachedContentIncludesWindows = includeWindows
-        return content
+        return await beginAllInOneReplacement()
     }
 
     // MARK: - Area Capture
 
-    func startAreaCapture(historyManager: HistoryManager) async {
+    func startAreaCapture(
+        historyManager: HistoryManager,
+        followUp: ((CaptureDeliveryReceipt) -> Void)? = nil
+    ) async {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard areaSelectionWindow == nil else { return } // already selecting
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil else {
+            return
+        }
+        guard let attempt = beginCaptureAttempt(followUp: followUp) else { return }
         AreaSelectionDiag.mark("startAreaCapture")
         // Snapshot the source app BEFORE the overlay activates KRIT and steals focus,
         // so the history thumbnail can badge where the shot came from.
@@ -142,13 +328,16 @@ final class CaptureEngine {
         let hideIcons = Settings.hideDesktopIconsWhileCapturing
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
-            guard let rect else {
-                self.areaSelectionWindow = nil
-                self.clearOnNextCaptureFinished()
-                self.snapAndPasteTarget = nil
+            guard self.ownsInteractiveCaptureIntent(intentID) else {
+                self.abandonCaptureAttempt(attempt, historyManager: historyManager)
                 return
             }
-            self.lastCaptureRect = rect
+            guard let rect else {
+                self.areaSelectionWindow = nil
+                self.abandonCaptureAttempt(attempt, historyManager: historyManager)
+                return
+            }
+            self.rememberReusableArea(rect, on: screen)
             // Fast path (no self-timer): build the shot by cropping the frozen frame
             // the overlay already holds (dark, icon-free) instead of tearing the
             // overlay down to re-grab the live screen. The re-grab is what briefly
@@ -159,14 +348,31 @@ final class CaptureEngine {
                let shot = self.areaSelectionWindow?.croppedFrozenImage(globalRect: rect, on: screen) {
                 self.captureMoment(rect: rect, on: screen)
                 self.areaSelectionWindow = nil
-                self.finishCapture(image: shot, rect: rect, on: screen, historyManager: historyManager, isWindowCapture: false)
+                self.finishCapture(
+                    image: shot,
+                    rect: rect,
+                    on: screen,
+                    historyManager: historyManager,
+                    isWindowCapture: false,
+                    attempt: attempt
+                )
                 return
             }
             // Self-timer (or a missing frozen frame): re-grab live, still icon-free.
             self.areaSelectionWindow = nil
-            Task { await self.captureRect(rect, on: screen, historyManager: historyManager, excludeDesktopIcons: hideIcons) }
+            Task {
+                await self.captureRect(
+                    rect,
+                    on: screen,
+                    historyManager: historyManager,
+                    excludeDesktopIcons: hideIcons,
+                    attempt: attempt
+                )
+            }
         }
-        await areaSelectionWindow?.prepareAndShow(engine: self)
+        await areaSelectionWindow?.prepareAndShow(engine: self, canPresent: { [weak self] in
+            self?.ownsInteractiveCaptureIntent(intentID) == true
+        })
     }
 
     // MARK: - Color Pick
@@ -179,12 +385,17 @@ final class CaptureEngine {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard areaSelectionWindow == nil else { return } // already selecting
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil else { return } // already selecting
         let picker = AreaSelectionWindow(mode: .colorPick) { [weak self] _, _, _ in
             // Cancel path (Esc / click before the frozen frame lands).
+            guard self?.ownsInteractiveCaptureIntent(intentID) == true else { return }
             self?.areaSelectionWindow = nil
         }
         picker.onColorPicked = { [weak self] hex in
+            guard self?.ownsInteractiveCaptureIntent(intentID) == true else { return }
             self?.areaSelectionWindow = nil
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
@@ -192,69 +403,142 @@ final class CaptureEngine {
             ToastWindow.show(message: "\(hex) copied")
         }
         areaSelectionWindow = picker
-        await picker.prepareAndShow(engine: self)
+        await picker.prepareAndShow(engine: self, canPresent: { [weak self] in
+            self?.ownsInteractiveCaptureIntent(intentID) == true
+        })
     }
 
     // MARK: - All-in-One
 
-    /// CleanShot-style All-in-One: shows the persisted selection (or a centered
-    /// default the first time) with handles and a floating options panel. Each
-    /// option routes to the real capture/record/tool path. The adjusted rect is
-    /// saved as the new static selection on Capture, Record, and OCR.
+    /// CleanShot-style All-in-One: shows the latest reusable selection (or a
+    /// centered default the first time) with handles and a floating options panel.
+    /// Each option routes to the real capture/record/tool path.
     func startAllInOne(historyManager: HistoryManager) async {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        // Reuse the area-selection re-entry guard plus our own controller guard so
-        // All-in-One can't stack over an in-flight selection or another All-in-One.
-        guard areaSelectionWindow == nil, allInOneController == nil else { return }
+        // Repeated All-in-One invokes leave the existing dock alone. Any other
+        // pending interactive surface is replaced below by the new intent.
+        guard allInOneController == nil else { return }
+        let intentID = beginInteractiveCaptureIntent()
 
-        // Target the display under the cursor (matches fullscreen capture).
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main ?? NSScreen.screens.first
-        guard let screen else { return }
+        guard let plan = makeAllInOneStartPlan(
+            screens: NSScreen.screens,
+            cursor: NSEvent.mouseLocation
+        ) else { return }
 
-        let initialRect = restoredAllInOneRect(on: screen)
-
+        let sessionID = UUID()
+        let sourceProcessIdentifier = InteractiveCaptureRoute.allInOneSourceProcessIdentifier(
+            frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+            kritProcessIdentifier: pid_t(ProcessInfo.processInfo.processIdentifier)
+        )
         let controller = AllInOneController(
-            screen: screen,
-            initialRect: initialRect,
+            screen: plan.screen,
+            initialRect: plan.initialRect,
             onAction: { [weak self] action, rect, screen in
                 guard let self else { return }
-                self.allInOneController = nil
-                self.handleAllInOne(action: action, rect: rect, on: screen, historyManager: historyManager)
+                guard self.ownsInteractiveCaptureIntent(intentID),
+                      self.allInOneSessionID == sessionID else { return }
+                self.clearAllInOneSession(id: sessionID)
+                self.handleAllInOne(
+                    action: action,
+                    rect: rect,
+                    on: screen,
+                    historyManager: historyManager,
+                    intentID: intentID
+                )
             },
             onCancel: { [weak self] in
-                self?.allInOneController = nil
+                self?.clearAllInOneSession(id: sessionID)
             }
         )
         allInOneController = controller
+        allInOneSessionID = sessionID
+        allInOneSourceProcessIdentifier = sourceProcessIdentifier
         await controller.prepareAndShow(engine: self)
     }
 
-    /// The starting rect for All-in-One in AppKit global coordinates: the saved
-    /// rect if it still fits a current screen, otherwise a centered 60% box on
-    /// `screen` (the first-run default).
-    private func restoredAllInOneRect(on screen: NSScreen) -> CGRect {
-        if let saved = Settings.allInOneRect,
-           NSScreen.screens.contains(where: { $0.frame.contains(saved) }) {
-            return saved
-        }
-        let f = screen.frame
-        let w = f.width * 0.6
-        let h = f.height * 0.6
-        return CGRect(x: f.midX - w / 2, y: f.midY - h / 2, width: w, height: h)
+    private func clearAllInOneSession(id: UUID) {
+        guard allInOneSessionID == id else { return }
+        allInOneController = nil
+        allInOneSessionID = nil
+        allInOneSourceProcessIdentifier = nil
     }
 
-    private func handleAllInOne(action: AllInOneAction, rect: CGRect, on screen: NSScreen, historyManager: HistoryManager) {
+    /// The newest valid area wins for this process, then the persisted fallback
+    /// carries that selection across relaunch. A rect that no longer belongs to
+    /// one current display is deliberately discarded instead of being clamped.
+    private func restoredAllInOneSelection(in screens: [NSScreen]) -> AllInOneRestoredSelection? {
+        AllInOneSelectionRestore.resolve(
+            candidates: [lastCaptureRect, Settings.allInOneRect],
+            screenFrames: screens.map(\.frame)
+        )
+    }
+
+    private func makeAllInOneStartPlan(
+        screens: [NSScreen],
+        cursor: CGPoint
+    ) -> AllInOneStartPlan? {
+        guard !screens.isEmpty else { return nil }
+        let cursorScreen = screens.first(where: { $0.frame.contains(cursor) }) ?? NSScreen.main ?? screens[0]
+        let restoredSelection = restoredAllInOneSelection(in: screens)
+        let screen: NSScreen
+        if let restoredSelection, screens.indices.contains(restoredSelection.screenIndex) {
+            // Keep the area on its owning display. Moving it into the display
+            // under the cursor would silently select different content.
+            screen = screens[restoredSelection.screenIndex]
+        } else {
+            screen = cursorScreen
+        }
+        return AllInOneStartPlan(
+            screen: screen,
+            initialRect: restoredAllInOneRect(on: screen, restoredSelection: restoredSelection)
+        )
+    }
+
+    /// The starting rect for All-in-One in AppKit global coordinates: the saved
+    /// rect if it belongs to this screen, otherwise a centered 60% box on `screen`.
+    private func restoredAllInOneRect(
+        on screen: NSScreen,
+        restoredSelection: AllInOneRestoredSelection?
+    ) -> CGRect {
+        if let restored = restoredSelection,
+           screen.frame.contains(restored.rect) {
+            return restored.rect
+        }
+        return AllInOneSelectionRestore.defaultRect(in: screen.frame)
+    }
+
+    private func rememberReusableArea(_ rect: CGRect, on screen: NSScreen) {
+        lastCaptureRect = rect
+        guard AllInOneSelectionRestore.resolve(
+            candidates: [rect],
+            screenFrames: [screen.frame]
+        ) != nil else { return }
+        Settings.allInOneRect = rect
+    }
+
+    private func handleAllInOne(
+        action: AllInOneAction,
+        rect: CGRect,
+        on screen: NSScreen,
+        historyManager: HistoryManager,
+        intentID: UUID
+    ) {
+        guard ownsInteractiveCaptureIntent(intentID) else { return }
+        rememberReusableArea(rect, on: screen)
         switch action {
         case .capture:
-            Settings.allInOneRect = rect
-            lastCaptureRect = rect
-            Task { await captureRect(rect, on: screen, historyManager: historyManager) }
+            Task { [weak self] in
+                guard let self, self.ownsInteractiveCaptureIntent(intentID) else { return }
+                await self.captureRect(
+                    rect,
+                    on: screen,
+                    historyManager: historyManager,
+                    continuationIntentID: intentID
+                )
+            }
         case .record:
-            Settings.allInOneRect = rect
-            lastCaptureRect = rect
             guard recordingActionsEnabled else {
                 ToastWindow.show(message: "Finish or stop the current recording first")
                 return
@@ -263,58 +547,127 @@ final class CaptureEngine {
             // audio/camera before recording, same as the dedicated area path.
             showRecordingControls(rect: rect, on: screen, target: .area)
         case .ocr:
-            Settings.allInOneRect = rect
-            Task { await runOCR(on: rect, screen: screen,
-                                excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing) }
+            Task { [weak self] in
+                guard let self, self.ownsInteractiveCaptureIntent(intentID) else { return }
+                await self.runOCR(
+                    on: rect,
+                    screen: screen,
+                    excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing,
+                    intentID: intentID
+                )
+            }
         case .window:
-            Task { await startWindowCapture(historyManager: historyManager) }
+            Task { [weak self] in
+                guard let self, self.ownsInteractiveCaptureIntent(intentID) else { return }
+                await self.startWindowCapture(
+                    historyManager: historyManager,
+                    continuationIntentID: intentID
+                )
+            }
         case .fullscreen:
-            Task { await captureFullscreen(historyManager: historyManager) }
+            Task { [weak self] in
+                guard let self, self.ownsInteractiveCaptureIntent(intentID) else { return }
+                await self.captureFullscreen(
+                    historyManager: historyManager,
+                    continuationIntentID: intentID
+                )
+            }
         case .scrolling:
-            Task { await startScrollingCapture(historyManager: historyManager) }
+            Task { [weak self] in
+                guard let self, self.ownsInteractiveCaptureIntent(intentID) else { return }
+                await self.startScrollingCapture(
+                    historyManager: historyManager,
+                    continuationIntentID: intentID
+                )
+            }
         }
     }
 
     // MARK: - Window Capture
 
-    func startWindowCapture(historyManager: HistoryManager) async {
+    func startWindowCapture(
+        historyManager: HistoryManager,
+        followUp: ((CaptureDeliveryReceipt) -> Void)? = nil,
+        continuationIntentID: UUID? = nil
+    ) async {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard areaSelectionWindow == nil else { return }
+        guard let intentID = await acquireInteractiveCaptureIntent(
+            continuing: continuationIntentID
+        ) else { return }
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil else {
+            return
+        }
+        guard let attempt = beginCaptureAttempt(followUp: followUp) else { return }
         historyManager.prepareForCapture()
         // Desktop icons are hidden by excluding Finder from the picker's frozen
         // grab (Snapzy style, see prepareAndShow), not with a light cover window —
         // so the theme never flicks to white when the picker opens.
         areaSelectionWindow = AreaSelectionWindow(mode: .window) { [weak self] rect, screen, windowID in
             guard let self else { return }
+            guard self.ownsInteractiveCaptureIntent(intentID) else {
+                self.abandonCaptureAttempt(attempt, historyManager: historyManager)
+                return
+            }
             self.areaSelectionWindow = nil
             guard let rect else {
-                self.clearOnNextCaptureFinished()
-                self.snapAndPasteTarget = nil
+                self.abandonCaptureAttempt(attempt, historyManager: historyManager)
                 return
             }
             Task {
                 // Prefer the isolated-window grab (clean alpha corners, immune to
                 // overlapping windows); fall back to the rect crop on older macOS.
                 if #available(macOS 14.0, *), let windowID {
-                    await self.captureWindowIsolated(windowID: windowID, rect: rect, on: screen, historyManager: historyManager)
+                    await self.captureWindowIsolated(
+                        windowID: windowID,
+                        rect: rect,
+                        on: screen,
+                        historyManager: historyManager,
+                        attempt: attempt
+                    )
                 } else {
-                    await self.captureRect(rect, on: screen, historyManager: historyManager, isWindowCapture: true, excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
+                    await self.captureRect(
+                        rect,
+                        on: screen,
+                        historyManager: historyManager,
+                        isWindowCapture: true,
+                        excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing,
+                        attempt: attempt
+                    )
                 }
             }
         }
-        await areaSelectionWindow?.prepareAndShow(engine: self)
+        await areaSelectionWindow?.prepareAndShow(engine: self, canPresent: { [weak self] in
+            self?.ownsInteractiveCaptureIntent(intentID) == true
+        })
     }
 
     // MARK: - Fullscreen
 
-    func captureFullscreen(historyManager: HistoryManager) async {
+    func captureFullscreen(
+        historyManager: HistoryManager,
+        followUp: ((CaptureDeliveryReceipt) -> Void)? = nil,
+        continuationIntentID: UUID? = nil
+    ) async {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
+        guard let intentID = await acquireInteractiveCaptureIntent(
+            continuing: continuationIntentID
+        ) else { return }
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil else {
+            return
+        }
         let screens = NSScreen.screens
-        guard !screens.isEmpty else { return }
+        guard !screens.isEmpty else {
+            return
+        }
+        guard let attempt = beginCaptureAttempt(followUp: followUp) else { return }
         historyManager.prepareForCapture()
         // Capture the display under the cursor so the global hotkey targets the
         // screen the user is looking at on a multi-monitor setup (NSScreen.main is
@@ -326,7 +679,13 @@ final class CaptureEngine {
         let mouse = NSEvent.mouseLocation
         let screen = screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main ?? screens[0]
         let rect = screen.frame
-        await captureRect(rect, on: screen, historyManager: historyManager, excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
+        await captureRect(
+            rect,
+            on: screen,
+            historyManager: historyManager,
+            excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing,
+            attempt: attempt
+        )
     }
 
     // MARK: - Screen Recording
@@ -335,27 +694,42 @@ final class CaptureEngine {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard canBeginRecordingSetup() else { return }
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              canBeginRecordingSetup() else { return }
 
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
+            guard self.ownsInteractiveCaptureIntent(intentID) else { return }
             self.areaSelectionWindow = nil
             guard let rect else { return }
-            self.lastCaptureRect = rect
+            self.rememberReusableArea(rect, on: screen)
             self.showRecordingControls(rect: rect, on: screen, target: .area)
         }
-        await areaSelectionWindow?.prepareAndShow(engine: self)
+        await areaSelectionWindow?.prepareAndShow(engine: self, canPresent: { [weak self] in
+            self?.ownsInteractiveCaptureIntent(intentID) == true
+        })
     }
 
     func startWindowRecording() async {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard canBeginRecordingSetup() else { return }
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              canBeginRecordingSetup() else { return }
 
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-            let choices = await recordingWindowChoices(from: content.windows)
+            let snapshot = try await ScreenCaptureCatalog.shared.windows(.windowPicker)
+            guard ownsInteractiveCaptureIntent(intentID),
+                  allInOneController == nil,
+                  canBeginRecordingSetup() else { return }
+            let choices = await recordingWindowChoices(from: snapshot.windows)
+            guard ownsInteractiveCaptureIntent(intentID),
+                  allInOneController == nil,
+                  canBeginRecordingSetup() else { return }
             guard !choices.isEmpty else {
                 ToastWindow.show(message: "No recordable windows found")
                 return
@@ -380,6 +754,7 @@ final class CaptureEngine {
             recordingWindowChooserWindow = chooser
             chooser.show()
         } catch {
+            guard ownsInteractiveCaptureIntent(intentID) else { return }
             ToastWindow.show(message: "Could not list windows. Check permissions.")
             print("[KRIT] Window picker failed: \(error)")
         }
@@ -389,7 +764,10 @@ final class CaptureEngine {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard canBeginRecordingSetup() else { return }
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              canBeginRecordingSetup() else { return }
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return }
         guard screens.count > 1 else {
@@ -473,8 +851,15 @@ final class CaptureEngine {
     }
 
     private func windowPreviewImage(for window: SCWindow) async -> NSImage? {
-        if #available(macOS 14.0, *), let image = await screenCaptureKitWindowPreview(for: window) {
-            return image
+        if #available(macOS 14.0, *) {
+            if let image = await screenCaptureKitWindowPreview(for: window) {
+                return image
+            }
+            // A just-opened or recently-resized window can briefly miss the first
+            // SCK snapshot. Retry once, but never fall through to the obsolete
+            // CoreGraphics window capture path on modern macOS.
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            return await screenCaptureKitWindowPreview(for: window)
         }
         return fallbackWindowPreview(for: window)
     }
@@ -499,6 +884,7 @@ final class CaptureEngine {
     }
 
     private func fallbackWindowPreview(for window: SCWindow) -> NSImage? {
+        uiTestLegacyWindowPreviewFallbackCount += 1
         let options: CGWindowImageOption = [.bestResolution, .boundsIgnoreFraming]
         guard let cgImage = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(window.windowID), options) else { return nil }
         return Self.nsImage(from: cgImage, logicalSize: window.frame.size)
@@ -536,9 +922,17 @@ final class CaptureEngine {
         return !blockedFragments.contains { searchText.contains($0) }
     }
 
+    /// `SCWindow.frame` is in global CoreGraphics coordinates. Compare it with
+    /// `CGDisplayBounds`, never with `NSScreen.frame` (AppKit coordinates).
     private func screen(containing rect: CGRect) -> NSScreen? {
         NSScreen.screens.max { lhs, rhs in
-            lhs.frame.intersection(rect).width * lhs.frame.intersection(rect).height < rhs.frame.intersection(rect).width * rhs.frame.intersection(rect).height
+            let lhsID = ScreenCaptureCatalog.displayID(of: lhs) ?? CGMainDisplayID()
+            let rhsID = ScreenCaptureCatalog.displayID(of: rhs) ?? CGMainDisplayID()
+            let lhsIntersection = CGDisplayBounds(lhsID).intersection(rect)
+            let rhsIntersection = CGDisplayBounds(rhsID).intersection(rect)
+            let lhsArea = lhsIntersection.isNull ? 0 : lhsIntersection.width * lhsIntersection.height
+            let rhsArea = rhsIntersection.isNull ? 0 : rhsIntersection.width * rhsIntersection.height
+            return lhsArea < rhsArea
         }
     }
 
@@ -576,11 +970,51 @@ final class CaptureEngine {
     /// GUI test hook: live dim panel count while a recording runs.
     var uiTestDimPanelCount: Int { recordingEngine.uiTestDimPanelCount }
 
+    /// GUI test hook: whether scrolling owns a private selection or capture phase.
+    var uiTestScrollingCaptureActive: Bool { scrollingCapture?.isActive == true }
+
     /// The in-flight selection overlay (area / window / colorPick), if any.
     var uiTestActiveSelection: AreaSelectionWindow? { areaSelectionWindow }
 
+    /// Test-only bridge for the state committed by an accepted area selection.
+    func uiTestRememberReusableArea(_ rect: CGRect, on screen: NSScreen) {
+        rememberReusableArea(rect, on: screen)
+    }
+
+    /// Test-only state restoration so scenarios do not leak their synthetic
+    /// selection into whichever scenario runs next in the same harness.
+    func uiTestRestoreLastCaptureRect(_ rect: CGRect?) {
+        lastCaptureRect = rect
+    }
+
+    /// Tests the exact target screen and initial rect the production All-in-One
+    /// entry point would choose, without requiring a screen-capture permission.
+    func uiTestAllInOneStartPlan(cursor: CGPoint) -> (rect: CGRect, screenFrame: CGRect)? {
+        guard let plan = makeAllInOneStartPlan(screens: NSScreen.screens, cursor: cursor) else { return nil }
+        return (plan.initialRect, plan.screen.frame)
+    }
+
+    /// GUI test hooks for the actual engine-owned All-in-One path.
+    var uiTestAllInOneInitialRect: CGRect? { allInOneController?.uiTestInitialRect }
+    var uiTestAllInOneScreenFrame: CGRect? { allInOneController?.uiTestScreenFrame }
+    func uiTestCloseAllInOne() { allInOneController?.uiTestCancel() }
+
+    /// GUI test hook: reports the follow-up owned by the current capture attempt.
+    var uiTestHasPendingCaptureFollowUp: Bool { activeCaptureAttempt?.followUp != nil }
+
+    /// GUI test hook: lets replacement scenarios prove a newer selector owns a
+    /// fresh capture attempt instead of inheriting the previous request.
+    var uiTestActiveCaptureAttemptID: UUID? { activeCaptureAttempt?.id }
+
     /// GUI test hook: outcome of the last recording finish (saved/failed + reason).
     var uiTestRecordingOutcome: String { recordingEngine.uiTestLastFinishOutcome }
+
+    /// GUI test hook: pause/resume the real recording engine without routing
+    /// through a simulated button click.
+    func uiTestToggleRecordingPause() { recordingEngine.togglePause() }
+
+    var uiTestRecordingDuration: Double? { recordingEngine.uiTestLastRecordingDuration }
+    var uiTestRecordingPaused: Bool { recordingEngine.uiTestIsPaused }
 
     /// GUI test hook: raw domain/code of the last SCStream stop error.
     var uiTestStreamError: String { recordingEngine.uiTestLastStreamError }
@@ -615,14 +1049,22 @@ final class CaptureEngine {
     // MARK: - Previous Area
 
     func capturePreviousArea(historyManager: HistoryManager) async {
-        guard let rect = lastCaptureRect else {
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil else { return }
+        let screens = NSScreen.screens
+        guard let restored = restoredAllInOneSelection(in: screens),
+              screens.indices.contains(restored.screenIndex) else {
             await startAreaCapture(historyManager: historyManager)
             return
         }
-        guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(rect) }) ?? NSScreen.main else {
-            await startAreaCapture(historyManager: historyManager); return
-        }
-        await captureRect(rect, on: screen, historyManager: historyManager, excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
+        await captureRect(
+            restored.rect,
+            on: screens[restored.screenIndex],
+            historyManager: historyManager,
+            excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing
+        )
     }
 
     // MARK: - Snap and Paste
@@ -640,18 +1082,38 @@ final class CaptureEngine {
         }
         guard areaSelectionWindow == nil else { return }
 
-        // Grab the target BEFORE the overlay activates KRIT and steals focus.
-        snapAndPasteTarget = NSWorkspace.shared.frontmostApplication
-
-        onNextCaptureFinished = { [weak self] image, _ in
-            self?.completeSnapAndPaste(image: image)
+        // Grab the target before replacing All-in-One. Its panel makes KRIT
+        // frontmost, so Snap and Paste must prefer the app that originally opened
+        // that session instead of saving KRIT as its own paste target.
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let targetProcessIdentifier = InteractiveCaptureRoute.snapAndPasteTargetProcessIdentifier(
+            allInOneSourceProcessIdentifier: allInOneSourceProcessIdentifier,
+            frontmostProcessIdentifier: frontmost?.processIdentifier
+        )
+        let target = targetProcessIdentifier.flatMap { NSRunningApplication(processIdentifier: $0) }
+            ?? (allInOneSourceProcessIdentifier == nil ? frontmost : nil)
+        await startAreaCapture(historyManager: historyManager) { [weak self] receipt in
+            self?.completeSnapAndPaste(receipt: receipt, target: target)
         }
-        await startAreaCapture(historyManager: historyManager)
     }
 
-    private func completeSnapAndPaste(image: NSImage) {
-        ImageExporter.copyToClipboard(image: image)
+    private func completeSnapAndPaste(
+        receipt: CaptureDeliveryReceipt,
+        target: NSRunningApplication?
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let artifact = receipt.presentedArtifact,
+               let png = await artifact.encoded(as: .png)?.data {
+                ImageExporter.copyPNGToClipboard(png)
+            } else {
+                ImageExporter.copyToClipboard(image: receipt.presentedImage)
+            }
+            self.finishSnapAndPasteAfterCopy(target: target)
+        }
+    }
 
+    private func finishSnapAndPasteAfterCopy(target: NSRunningApplication?) {
         guard AXIsProcessTrusted() else {
             // Copy still works; tell the user how to unlock the auto-paste half.
             ToastWindow.show(message: "Grant Accessibility access to auto-paste (System Settings > Privacy & Security > Accessibility)")
@@ -661,12 +1123,9 @@ final class CaptureEngine {
                     NSWorkspace.shared.open(url)
                 }
             }
-            snapAndPasteTarget = nil
             return
         }
 
-        let target = snapAndPasteTarget
-        snapAndPasteTarget = nil
         target?.activate()
 
         // Give the reactivated app a beat to take key focus before the paste,
@@ -747,9 +1206,12 @@ final class CaptureEngine {
             width: topLeft.width,
             height: topLeft.height
         )
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(appKit) })
-            ?? NSScreen.screens.first(where: { $0.frame.intersects(appKit) }) else { return nil }
-        return (appKit, screen)
+        let screens = NSScreen.screens
+        guard let restored = AllInOneSelectionRestore.resolve(
+            candidates: [appKit],
+            screenFrames: screens.map(\.frame)
+        ), screens.indices.contains(restored.screenIndex) else { return nil }
+        return (appKit, screens[restored.screenIndex])
     }
 
     /// Opens the interactive area selection purely to DEFINE a rect (no capture).
@@ -762,14 +1224,20 @@ final class CaptureEngine {
             completion(nil)
             return
         }
-        guard areaSelectionWindow == nil else { completion(nil); return }
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil else { completion(nil); return }
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, _, _ in
             guard let self else { completion(nil); return }
+            guard self.ownsInteractiveCaptureIntent(intentID) else { return }
             self.areaSelectionWindow = nil
             guard let rect else { completion(nil); return }
             completion(self.topLeftRect(fromAppKit: rect))
         }
-        await areaSelectionWindow?.prepareAndShow(engine: self)
+        await areaSelectionWindow?.prepareAndShow(engine: self, canPresent: { [weak self] in
+            self?.ownsInteractiveCaptureIntent(intentID) == true
+        })
     }
 
     /// AppKit (bottom-left, primary-anchored) rect to global TOP-LEFT points.
@@ -787,14 +1255,34 @@ final class CaptureEngine {
 
     // MARK: - Scrolling Capture
 
-    func startScrollingCapture(historyManager: HistoryManager) async {
+    func startScrollingCapture(
+        historyManager: HistoryManager,
+        continuationIntentID: UUID? = nil
+    ) async {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard scrollingCapture?.isActive != true else { return }
-        scrollingCapture = ScrollingCaptureController()
-        await scrollingCapture?.start(historyManager: historyManager,
-                                      excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
+        guard let intentID = await acquireInteractiveCaptureIntent(
+            continuing: continuationIntentID
+        ) else { return }
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil,
+              scrollingCapture?.isActive != true else { return }
+        let controller = ScrollingCaptureController { [weak self] rect, screen in
+            self?.rememberReusableArea(rect, on: screen)
+        }
+        scrollingCapture = controller
+        await controller.start(
+            historyManager: historyManager,
+            excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing,
+            canPresent: { [weak self] in
+                self?.ownsInteractiveCaptureIntent(intentID) == true
+            }
+        )
+        if !ownsInteractiveCaptureIntent(intentID), scrollingCapture === controller {
+            scrollingCapture = nil
+        }
     }
 
     // MARK: - OCR Capture
@@ -803,24 +1291,39 @@ final class CaptureEngine {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard areaSelectionWindow == nil else { return }
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil else { return }
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
+            guard self.ownsInteractiveCaptureIntent(intentID) else { return }
             self.areaSelectionWindow = nil
             guard let rect else { return }
+            self.rememberReusableArea(rect, on: screen)
             Task {
                 await self.runOCR(on: rect, screen: screen,
-                                  excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing)
+                                  excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing,
+                                  intentID: intentID)
             }
         }
-        await areaSelectionWindow?.prepareAndShow(engine: self)
+        await areaSelectionWindow?.prepareAndShow(engine: self, canPresent: { [weak self] in
+            self?.ownsInteractiveCaptureIntent(intentID) == true
+        })
     }
 
     /// Grabs `rect`, recognizes its text, and copies it to the clipboard. Shared
     /// by the area OCR path and the All-in-One OCR option, which already has a rect.
-    func runOCR(on rect: CGRect, screen: NSScreen, excludeDesktopIcons: Bool = false) async {
+    func runOCR(
+        on rect: CGRect,
+        screen: NSScreen,
+        excludeDesktopIcons: Bool = false,
+        intentID: UUID? = nil
+    ) async {
         guard let image = await captureRectToImage(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons) else { return }
+        guard intentID.map({ ownsInteractiveCaptureIntent($0) }) ?? true else { return }
         let text = await OCREngine.recognizeText(in: image)
+        guard intentID.map({ ownsInteractiveCaptureIntent($0) }) ?? true else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         showOCRNotification(text: text)
@@ -832,18 +1335,25 @@ final class CaptureEngine {
         guard PermissionsManager.hasScreenRecordingPermission else {
             PermissionsManager.showPermissionDeniedAlert(); return
         }
-        guard areaSelectionWindow == nil else { return }
+        let intentID = await beginAllInOneReplacement()
+        guard ownsInteractiveCaptureIntent(intentID),
+              allInOneController == nil,
+              areaSelectionWindow == nil else { return }
         areaSelectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
+            guard self.ownsInteractiveCaptureIntent(intentID) else { return }
             self.areaSelectionWindow = nil
             guard let rect else { return }
+            self.rememberReusableArea(rect, on: screen)
             Task {
                 guard let image = await self.captureRectToImage(
                     rect, on: screen,
                     excludeDesktopIcons: Settings.hideDesktopIconsWhileCapturing
                 ) else { return }
+                guard self.ownsInteractiveCaptureIntent(intentID) else { return }
                 let results = await QRCodeEngine.detect(in: image)
                 await MainActor.run {
+                    guard self.ownsInteractiveCaptureIntent(intentID) else { return }
                     if results.isEmpty {
                         ToastWindow.show(message: "No QR code found in this selection")
                     } else {
@@ -852,26 +1362,60 @@ final class CaptureEngine {
                 }
             }
         }
-        await areaSelectionWindow?.prepareAndShow(engine: self)
+        await areaSelectionWindow?.prepareAndShow(engine: self, canPresent: { [weak self] in
+            self?.ownsInteractiveCaptureIntent(intentID) == true
+        })
     }
 
     // MARK: - Core capture
 
-    func captureRect(_ rect: CGRect, on screen: NSScreen, historyManager: HistoryManager, isWindowCapture: Bool = false, excludeDesktopIcons: Bool = false) async {
+    func captureRect(
+        _ rect: CGRect,
+        on screen: NSScreen,
+        historyManager: HistoryManager,
+        isWindowCapture: Bool = false,
+        excludeDesktopIcons: Bool = false,
+        continuationIntentID: UUID? = nil
+    ) async {
+        guard continuationIntentID.map({ ownsInteractiveCaptureIntent($0) }) ?? true else { return }
+        guard let attempt = beginCaptureAttempt() else { return }
+        await captureRect(
+            rect,
+            on: screen,
+            historyManager: historyManager,
+            isWindowCapture: isWindowCapture,
+            excludeDesktopIcons: excludeDesktopIcons,
+            attempt: attempt
+        )
+    }
+
+    private func captureRect(
+        _ rect: CGRect,
+        on screen: NSScreen,
+        historyManager: HistoryManager,
+        isWindowCapture: Bool = false,
+        excludeDesktopIcons: Bool = false,
+        attempt: CaptureAttempt
+    ) async {
         // D1 self-timer: count down on the captured display before grabbing.
         // Gating here covers all four screenshot modes (area/window/fullscreen/
         // previous) and leaves OCR/QR/automation untouched, they call
         // captureRectToImage directly. Esc aborts before any side effect fires.
         let countdown = Settings.captureCountdownSeconds
         if countdown > 0 {
-            guard !countdownActive else { return }   // ignore a new trigger while one is live
+            guard !countdownActive else {
+                abandonCaptureAttempt(attempt, historyManager: historyManager)
+                return
+            }
             let proceed = await runCountdown(countdown, on: screen)
-            guard proceed else { return }            // Esc cancels the whole capture
+            guard proceed else {
+                abandonCaptureAttempt(attempt, historyManager: historyManager)
+                return
+            }
         }
         captureMoment(rect: rect, on: screen)
         guard let image = await captureRectToImage(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons) else {
-            clearOnNextCaptureFinished()
-            snapAndPasteTarget = nil
+            abandonCaptureAttempt(attempt, historyManager: historyManager)
             if lastCaptureFailureWasPermission {
                 PermissionsManager.showPermissionDeniedAlert()
             } else {
@@ -879,7 +1423,14 @@ final class CaptureEngine {
             }
             return
         }
-        finishCapture(image: image, rect: rect, on: screen, historyManager: historyManager, isWindowCapture: isWindowCapture)
+        finishCapture(
+            image: image,
+            rect: rect,
+            on: screen,
+            historyManager: historyManager,
+            isWindowCapture: isWindowCapture,
+            attempt: attempt
+        )
     }
 
     /// The shutter "moment": sound + haptic + white blink, fired BEFORE the SCK
@@ -899,7 +1450,15 @@ final class CaptureEngine {
     /// isolated-window grab (captureWindowIsolated) funnel through here so the
     /// "capture moment" is identical regardless of how the image was produced.
     /// Sound/haptic/blink already fired at the gesture (captureMoment).
-    private func finishCapture(image: NSImage, rect: CGRect, on screen: NSScreen, historyManager: HistoryManager, isWindowCapture: Bool) {
+    private func finishCapture(
+        image: NSImage,
+        rect: CGRect,
+        on screen: NSScreen,
+        historyManager: HistoryManager,
+        isWindowCapture: Bool,
+        attempt: CaptureAttempt
+    ) {
+        guard let completedAttempt = takeCaptureAttempt(attempt) else { return }
         var presented = image
         // Diagnostic trail for the supersampled window-shot reports: one line per
         // capture with the exact point/pixel geometry each stage saw, so a bad
@@ -920,46 +1479,35 @@ final class CaptureEngine {
             presented = ScreenshotBackgroundComposer.composeIfNeeded(image, options: options)
         }
 
-        // History keeps the RAW shot in imagePath so the editor always re-edits
-        // from the original; the THUMBNAIL comes from the presented image so the
-        // history band shows the finished result the user actually saw.
-        let item = historyManager.add(image: image, rect: rect, isWindowCapture: isWindowCapture,
-                                      presentedImage: presented)
-
-        // The capture "moment", as ONE continuous motion: the card is born
-        // invisible at its real slot, the flash ghost flies INTO that exact slot,
-        // and the card fades in under the ghost's fade-out. (The old order, ghost
-        // flying to a hardcoded 240×150 corner guess on top of an already-sliding
-        // card, was the post-capture grow/shrink flicker.) Runs BEFORE the
-        // clipboard/autosave encodes below: a full-res PNG encode in front of
-        // the handoff read as the flash firing late.
-        if Settings.afterCaptureShowOverlay {
-            let slot = QuickAccessOverlay.show(
-                image: presented, historyItem: item, historyManager: historyManager,
-                screen: screen, entrance: .handoff
-            )
-            let flyTime = CaptureFlash.play(rect: rect, on: screen, image: presented,
-                                            landLeft: Settings.overlayOnLeft, target: slot,
-                                            includeBlink: false)
-            QuickAccessOverlay.revealPendingHandoff(after: max(flyTime - 0.15, 0))
-        }
-
-        // One-shot completion (krit:// then= on interactive flows, Snap & Paste).
-        // Fires with the PRESENTED image and clears itself so it can't bleed into
-        // a later capture.
-        fireOnNextCaptureFinished(image: presented, item: item)
-
-        // After-capture auto-actions (from Preferences)
+        var automaticActions: [CaptureAction] = []
         if Settings.afterCaptureCopyToClipboard {
-            ImageExporter.copyToClipboard(image: presented)
+            automaticActions.append(.copy)
         }
         if Settings.afterCaptureSaveAutomatically {
-            let dir = Settings.autoSaveLocation
-            let name = ImageExporter.timestampedName
-            let ext = Settings.screenshotFormat
-            let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name).\(ext)")
-            ImageExporter.save(image: presented, to: url)
+            automaticActions.append(.save)
         }
+        let ext = Settings.screenshotFormat
+        let actionRequest = automaticActions.isEmpty ? nil : CaptureActionRequest(
+            actions: automaticActions,
+            format: ext,
+            jpegQuality: Settings.jpegQuality,
+            saveURL: URL(fileURLWithPath: Settings.autoSaveLocation)
+                .appendingPathComponent("\(ImageExporter.timestampedName).\(ext)")
+        )
+
+        CaptureDelivery.submit(
+            .init(
+                rawImage: image,
+                presentedImage: presented,
+                rect: rect,
+                screen: screen,
+                isWindowCapture: isWindowCapture,
+                showOverlay: Settings.afterCaptureShowOverlay,
+                automaticActions: actionRequest
+            ),
+            historyManager: historyManager,
+            followUp: completedAttempt.followUp
+        )
     }
 
     /// Captures a single window in ISOLATION via ScreenCaptureKit's
@@ -970,12 +1518,24 @@ final class CaptureEngine {
     /// (sound/flash/overlay/history) match the common path exactly. Falls back to
     /// the rect crop when SCK is unavailable or the window can't be resolved.
     @available(macOS 14.0, *)
-    private func captureWindowIsolated(windowID: CGWindowID, rect: CGRect, on screen: NSScreen, historyManager: HistoryManager) async {
+    private func captureWindowIsolated(
+        windowID: CGWindowID,
+        rect: CGRect,
+        on screen: NSScreen,
+        historyManager: HistoryManager,
+        attempt: CaptureAttempt
+    ) async {
         let countdown = Settings.captureCountdownSeconds
         if countdown > 0 {
-            guard !countdownActive else { return }
+            guard !countdownActive else {
+                abandonCaptureAttempt(attempt, historyManager: historyManager)
+                return
+            }
             let proceed = await runCountdown(countdown, on: screen)
-            guard proceed else { return }
+            guard proceed else {
+                abandonCaptureAttempt(attempt, historyManager: historyManager)
+                return
+            }
         }
         captureMoment(rect: rect, on: screen)
 
@@ -996,6 +1556,7 @@ final class CaptureEngine {
             // legacy rect crop so a window capture never silently fails. The
             // countdown already ran above, so grab directly without re-gating.
             guard let cropped = await captureRectToImage(rect, on: screen) else {
+                abandonCaptureAttempt(attempt, historyManager: historyManager)
                 if lastCaptureFailureWasPermission {
                     PermissionsManager.showPermissionDeniedAlert()
                 } else {
@@ -1003,10 +1564,24 @@ final class CaptureEngine {
                 }
                 return
             }
-            finishCapture(image: cropped, rect: rect, on: screen, historyManager: historyManager, isWindowCapture: true)
+            finishCapture(
+                image: cropped,
+                rect: rect,
+                on: screen,
+                historyManager: historyManager,
+                isWindowCapture: true,
+                attempt: attempt
+            )
             return
         }
-        finishCapture(image: image, rect: rect, on: screen, historyManager: historyManager, isWindowCapture: true)
+        finishCapture(
+            image: image,
+            rect: rect,
+            on: screen,
+            historyManager: historyManager,
+            isWindowCapture: true,
+            attempt: attempt
+        )
     }
 
     /// Grabs `windowID` in isolation as an NSImage with the window's native pixel
@@ -1015,8 +1590,8 @@ final class CaptureEngine {
     private func isolatedWindowImage(windowID: CGWindowID) async -> NSImage? {
         lastCaptureFailureWasPermission = false
         do {
-            let content = try await Self.shareableContent(includeWindows: true)
-            guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+            let snapshot = try await ScreenCaptureCatalog.shared.windows(.visibleContent)
+            guard let window = snapshot.window(id: windowID) else {
                 Self.captureLog.error("isolatedWindowImage: window \(windowID) not in shareable content; falling back")
                 return nil
             }
@@ -1047,13 +1622,9 @@ final class CaptureEngine {
             // and leave the grab anchored in a half-empty buffer). SCWindow.frame
             // is in CoreGraphics coords (top-left origin); convert its center to
             // AppKit to find the host NSScreen.
-            let scale: CGFloat = {
-                let winFrame = window.frame
-                guard let primaryH = NSScreen.screens.first?.frame.height else { return 2 }
-                let centerAppKit = CGPoint(x: winFrame.midX, y: primaryH - winFrame.midY)
-                let host = NSScreen.screens.first { NSPointInRect(centerAppKit, $0.frame) }
-                return host?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-            }()
+            let scale = screen(containing: window.frame)?.backingScaleFactor
+                ?? NSScreen.main?.backingScaleFactor
+                ?? 2
             let config = SCStreamConfiguration()
             // Native pixel-exact grab: the buffer matches the window's on-screen
             // pixels. Screen content has no detail beyond the display's native
@@ -1097,13 +1668,30 @@ final class CaptureEngine {
         await isolatedWindowImage(windowID: windowID)
     }
 
+    /// Test-only: resolves the live SCWindow and runs the exact chooser-preview
+    /// path, including its bounded SCK retry and modern no-CoreGraphics rule.
+    @available(macOS 14.0, *)
+    func uiTestWindowPreviewImage(windowID: CGWindowID) async -> NSImage? {
+        guard let snapshot = try? await ScreenCaptureCatalog.shared.windows(.allContent),
+              let window = snapshot.window(id: windowID) else { return nil }
+        return await windowPreviewImage(for: window)
+    }
+
     /// Test-only: runs the FULL production window-shot flow (wallpaper refresh,
     /// isolated grab, finishCapture with compose + history add + overlay), so
     /// the harness can prove the presented PNG the user actually drags out, not
     /// just the individual links.
     @available(macOS 14.0, *)
     func uiTestFullWindowCapture(windowID: CGWindowID, rect: CGRect, on screen: NSScreen, historyManager: HistoryManager) async {
-        await captureWindowIsolated(windowID: windowID, rect: rect, on: screen, historyManager: historyManager)
+        guard let attempt = beginCaptureAttempt() else { return }
+        historyManager.prepareForCapture()
+        await captureWindowIsolated(
+            windowID: windowID,
+            rect: rect,
+            on: screen,
+            historyManager: historyManager,
+            attempt: attempt
+        )
     }
 
     /// Runs the countdown with the `countdownActive` latch guaranteed to clear on
@@ -1147,9 +1735,87 @@ final class CaptureEngine {
     /// only soften it.
     func captureRectToImage(_ rect: CGRect, on screen: NSScreen, excludeDesktopIcons: Bool = false) async -> NSImage? {
         willCaptureScreenHook?()
+        let screenshotManagerAvailable: Bool
         if #available(macOS 14.0, *) {
-            return await captureRectSCK(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons)
+            screenshotManagerAvailable = true
         } else {
+            screenshotManagerAvailable = false
+        }
+        let streamAvailable: Bool
+        if #available(macOS 13.0, *) {
+            streamAvailable = true
+        } else {
+            streamAvailable = false
+        }
+
+        switch ScreenImageCaptureBackend.resolve(
+            excludeDesktopIcons: excludeDesktopIcons,
+            screenshotManagerAvailable: screenshotManagerAvailable,
+            streamAvailable: streamAvailable
+        ) {
+        case .screenshotManager:
+            if #available(macOS 14.0, *) {
+                return await captureRectSCK(rect, on: screen, excludeDesktopIcons: excludeDesktopIcons)
+            }
+        case .oneFrameStream:
+            if #available(macOS 13.0, *) {
+                return await captureRectStreamExcludingDesktopIcons(rect, on: screen)
+            }
+        case .coreGraphics:
+            break
+        }
+        return fallbackCapture(rect: rect)
+    }
+
+    /// Ventura has ScreenCaptureKit streams and application filters, but not
+    /// `SCScreenshotManager`. Use a single stream frame when Finder must be
+    /// excluded so the Hide desktop icons preference is honored on macOS 13.
+    @available(macOS 13.0, *)
+    private func captureRectStreamExcludingDesktopIcons(_ rect: CGRect, on screen: NSScreen) async -> NSImage? {
+        lastCaptureFailureWasPermission = false
+        do {
+            guard let screenID = ScreenCaptureCatalog.displayID(of: screen) else {
+                Self.captureLog.error("captureRectStreamExcludingDesktopIcons: screen has no display ID; falling back")
+                return fallbackCapture(rect: rect)
+            }
+            let snapshot = try await ScreenCaptureCatalog.shared.windows(.visibleContent)
+            guard let display = snapshot.display(id: screenID) else {
+                Self.captureLog.error("captureRectStreamExcludingDesktopIcons: no display matches screen \(screenID); falling back")
+                return fallbackCapture(rect: rect)
+            }
+
+            let geometry = ScreenCaptureDisplayGeometry(
+                displayID: display.displayID,
+                appKitFrame: screen.frame,
+                coreGraphicsFrame: display.frame,
+                backingScale: max(screen.backingScaleFactor, 1)
+            )
+            let region = try geometry.sourceRegion(
+                for: rect,
+                evenPixelDimensions: false,
+                maxEdge: Self.maxCaptureEdge
+            )
+            let config = SCStreamConfiguration()
+            config.sourceRect = region.sourceRect
+            config.width = region.pixelWidth
+            config.height = region.pixelHeight
+            config.scalesToFit = false
+            config.showsCursor = false
+
+            let filter = Self.captureContentFilter(
+                display: display,
+                snapshot: snapshot,
+                excludeDesktopIcons: true
+            )
+            let cgImage = try await captureRectStream(filter: filter, configuration: config)
+            return Self.nsImage(from: cgImage, logicalSize: region.appKitRect.size)
+        } catch {
+            let nsError = error as NSError
+            Self.captureLog.error("captureRectStreamExcludingDesktopIcons failed: domain=\(nsError.domain) code=\(nsError.code) \(nsError.localizedDescription)")
+            if nsError.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" && nsError.code == -3801 {
+                lastCaptureFailureWasPermission = true
+                return nil
+            }
             return fallbackCapture(rect: rect)
         }
     }
@@ -1160,8 +1826,8 @@ final class CaptureEngine {
     /// windows via exceptingWindows. The wallpaper is drawn by the Dock/Wallpaper
     /// Agent, NOT Finder, so it survives at its REAL (dark) appearance — no cover
     /// window painting a light fallback still. With icons shown, nothing excluded.
-    @available(macOS 14.0, *)
-    private static func captureContentFilter(display: SCDisplay, content: SCShareableContent, excludeDesktopIcons: Bool) -> SCContentFilter {
+    @available(macOS 13.0, *)
+    private static func captureContentFilter(display: SCDisplay, snapshot: ScreenCaptureWindowSnapshot, excludeDesktopIcons: Bool) -> SCContentFilter {
         guard excludeDesktopIcons else {
             return SCContentFilter(display: display, excludingWindows: [])
         }
@@ -1172,13 +1838,13 @@ final class CaptureEngine {
         // (flash, HUD, overlay cards, selection UI) stays out of grabs through
         // sharingType .none on each window, same as in the default no-exclusion
         // path, so this filter needs no app-level carve-out for ourselves.
-        let excludedApps = content.applications.filter {
+        let excludedApps = snapshot.applications.filter {
             $0.bundleIdentifier == "com.apple.finder"
         }
         guard !excludedApps.isEmpty else {
             return SCContentFilter(display: display, excludingWindows: [])
         }
-        let keepFinderWindows = content.windows.filter {
+        let keepFinderWindows = snapshot.windows.filter {
             $0.owningApplication?.bundleIdentifier == "com.apple.finder" && $0.windowLayer == 0 && $0.isOnScreen
         }
         return SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: keepFinderWindows)
@@ -1188,50 +1854,57 @@ final class CaptureEngine {
     private func captureRectSCK(_ rect: CGRect, on screen: NSScreen, excludeDesktopIcons: Bool) async -> NSImage? {
         lastCaptureFailureWasPermission = false
         do {
-            // Enumerate windows only when hiding icons (the filter needs the app /
-            // window list); otherwise the display list alone is enough and cheaper.
-            let content = try await Self.shareableContent(includeWindows: excludeDesktopIcons)
-            // Casar por displayID, nunca por frame: rect está em coordenadas
-            // AppKit (y pra cima) e SCDisplay.frame em CoreGraphics (y pra
-            // baixo), a interseção só coincide no monitor principal; num
-            // segundo monitor casava o display errado.
-            let screenID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-            guard let display = content.displays.first(where: { $0.displayID == screenID })
-                ?? content.displays.first(where: { $0.frame.intersects(rect) }) else {
-                Self.captureLog.error("captureRectSCK: no display matches screen \(String(describing: screenID)); falling back")
+            // Display lookup is always by ID. Intersecting `SCDisplay.frame` with
+            // an AppKit rect compares opposite Y coordinate systems and can select
+            // the wrong monitor.
+            guard let screenID = ScreenCaptureCatalog.displayID(of: screen) else {
+                Self.captureLog.error("captureRectSCK: screen has no display ID; falling back")
                 return fallbackCapture(rect: rect)
             }
-            let filter = Self.captureContentFilter(display: display, content: content, excludeDesktopIcons: excludeDesktopIcons)
-            // Use the display's REAL backing scale, not filter.pointPixelScale: on
-            // a non-Retina external display SCK can report pointPixelScale 2 while
-            // the panel is genuinely 1x. That sized the buffer at 2x the content SCK
-            // actually delivers, leaving the grab anchored in a half-empty frame.
-            // backingScaleFactor matches the pixels SCK hands back, so the native
-            // buffer is exact (1:1) and the grab fills it.
-            let s: CGFloat = screen.backingScaleFactor
 
-            // Snap rect to integer pixel boundaries to avoid subpixel sampling.
-            // Fractional sourceRect coords cause SCK to interpolate between pixels,
-            // softening text and sharp edges.
-            let ox = floor((rect.origin.x - screen.frame.origin.x) * s) / s
-            let oy = floor((rect.origin.y - screen.frame.origin.y) * s) / s
-            let w  = ceil(rect.width * s) / s
-            let h  = ceil(rect.height * s) / s
+            let display: SCDisplay
+            let filter: SCContentFilter
+            if excludeDesktopIcons {
+                let snapshot = try await ScreenCaptureCatalog.shared.windows(.visibleContent)
+                guard let matched = snapshot.display(id: screenID) else {
+                    Self.captureLog.error("captureRectSCK: no display matches screen \(screenID); falling back")
+                    return fallbackCapture(rect: rect)
+                }
+                display = matched
+                filter = Self.captureContentFilter(
+                    display: matched,
+                    snapshot: snapshot,
+                    excludeDesktopIcons: true
+                )
+            } else {
+                let snapshot = try await ScreenCaptureCatalog.shared.displays()
+                guard let matched = snapshot.display(id: screenID) else {
+                    Self.captureLog.error("captureRectSCK: no display matches screen \(screenID); falling back")
+                    return fallbackCapture(rect: rect)
+                }
+                display = matched
+                filter = SCContentFilter(display: matched, excludingWindows: [])
+            }
 
-            // Convert from AppKit (bottom-left origin) to ScreenCaptureKit (top-left origin)
-            let screenHeight = screen.frame.height
-            let sckRect = CGRect(x: ox, y: screenHeight - oy - h, width: w, height: h)
-
-            // Native pixel-exact: the buffer matches the source rect's on-screen
-            // pixels. Screen content carries no detail past the display's native
-            // density, so we never upscale (only clamp to SCK's texture limit).
-            let pixelW = min(Int(w * s), Self.maxCaptureEdge)
-            let pixelH = min(Int(h * s), Self.maxCaptureEdge)
+            // Use the display's REAL backing scale, not filter.pointPixelScale.
+            // Shared geometry keeps screenshots and recordings on the same pixel
+            // grid, including 1x external displays and negative screen origins.
+            let geometry = ScreenCaptureDisplayGeometry(
+                displayID: display.displayID,
+                appKitFrame: screen.frame,
+                coreGraphicsFrame: display.frame,
+                backingScale: max(screen.backingScaleFactor, 1)
+            )
+            let region = try geometry.sourceRegion(
+                for: rect,
+                evenPixelDimensions: false,
+                maxEdge: Self.maxCaptureEdge
+            )
 
             let config = SCStreamConfiguration()
-            config.sourceRect = sckRect
-            config.width = pixelW
-            config.height = pixelH
+            config.sourceRect = region.sourceRect
+            config.width = region.pixelWidth
+            config.height = region.pixelHeight
             // Native buffer == sourceRect pixels, so no fitting needed.
             config.scalesToFit = false
             config.showsCursor = false
@@ -1240,8 +1913,8 @@ final class CaptureEngine {
             // calibrated ICC profile, preserving exact on-screen colors.
             // Forcing sRGB or Display P3 overrides the display calibration.
 
-            let logicalSize = NSSize(width: w, height: h)
-            Self.captureLog.info("captureRectSCK: rect=\(String(describing: rect)) scale=\(s) sckRect=\(String(describing: sckRect)) pixels=\(pixelW)x\(pixelH)")
+            let logicalSize = region.appKitRect.size
+            Self.captureLog.info("captureRectSCK: rect=\(String(describing: rect)) scale=\(geometry.backingScale) sckRect=\(String(describing: region.sourceRect)) pixels=\(region.pixelWidth)x\(region.pixelHeight)")
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
             if let flat = Self.uniformColorDescription(cgImage) {
                 // A flat frame (all-black OR all-white) usually means the
@@ -1268,7 +1941,7 @@ final class CaptureEngine {
         }
     }
 
-    @available(macOS 14.0, *)
+    @available(macOS 13.0, *)
     private func captureRectStream(filter: SCContentFilter, configuration: SCStreamConfiguration) async throws -> CGImage {
         try await SingleFrameImageCapture().capture(filter: filter, configuration: configuration)
     }
@@ -1344,7 +2017,7 @@ final class CaptureEngine {
     }
 }
 
-@available(macOS 14.0, *)
+@available(macOS 13.0, *)
 private final class SingleFrameImageCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private static let ciContext = CIContext(options: [.cacheIntermediates: false])
@@ -1540,6 +2213,7 @@ private final class RecordingWindowChooserWindow: NSWindow {
         isOpaque = false
         backgroundColor = .clear
         level = .floating
+        sharingType = .none
         hasShadow = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         acceptsMouseMovedEvents = true
@@ -1637,7 +2311,11 @@ private final class RecordingWindowChooserWindow: NSWindow {
         }
     }
 
-    private func closeChooser(notify: Bool = true) {
+    func closeChooser() {
+        closeChooser(notify: true)
+    }
+
+    private func closeChooser(notify: Bool) {
         guard !didClose else { return }
         didClose = true
         if let keyMonitor {
@@ -1896,6 +2574,7 @@ private final class RecordingScreenChooserWindow: NSWindow {
         isOpaque = false
         backgroundColor = .clear
         level = .floating
+        sharingType = .none
         hasShadow = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         acceptsMouseMovedEvents = true
@@ -2107,12 +2786,11 @@ private final class RecordingChooserCloseButton: NSButton {
 }
 
 @MainActor
-private final class RecordingControlsWindow: NSWindow {
+private final class RecordingControlsWindow: NSWindow, NSWindowDelegate {
 
     private static var openWindows: [RecordingControlsWindow] = []
-    private static let barHeight: CGFloat = 56
-    private static let expandedHeight: CGFloat = 92
-    private static let panelWidth: CGFloat = 728
+    private static let barHeight = RecordingPreflightLayout().shell.height
+    private static let panelWidth = RecordingPreflightLayout().shell.width
     private static let chromeInset: CGFloat = 8
 
     private let captureRect: CGRect
@@ -2125,20 +2803,42 @@ private final class RecordingControlsWindow: NSWindow {
     private var keyMonitor: Any?
     private var didClose = false
 
-    private let systemAudioButton = RecordingToggleButton(symbol: "speaker.wave.2.fill", title: "System audio")
-    private let microphoneButton = RecordingToggleButton(symbol: "mic.fill", title: "Microphone", activeTint: .systemGreen)
+    private let systemAudioButton = RecordingToggleButton(
+        symbol: "speaker.wave.2.fill",
+        title: "Audio",
+        accessibilityTitle: "System audio"
+    )
+    private let microphoneButton = RecordingToggleButton(
+        symbol: "mic.fill",
+        title: "Mic",
+        accessibilityTitle: "Microphone"
+    )
     private let cameraButton = RecordingToggleButton(symbol: "video.fill", title: "Camera")
     private let cursorButton = RecordingToggleButton(symbol: "cursorarrow.rays", title: "Cursor")
+    private let optionsButton = RecordingChromeButton(
+        symbol: "slider.horizontal.3",
+        title: "Recording options",
+        role: .neutral,
+        presentation: .horizontal
+    )
     private let qualityPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let fpsPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let microphonePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let microphoneContainer = NSView()
-    private let microphoneLevelMeter = RecordingAudioLevelMeter()
+    private let microphoneLevelMeter = RecordingLevelMeter()
     private let cameraPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let cameraContainer = NSView()
+    private let optionsPopover = NSPopover()
     private var microphoneMonitorSession: AVCaptureSession?
     private var microphoneMonitorOutput: AVCaptureAudioDataOutput?
     private var microphoneMonitorDelegate: MicrophoneLevelMonitor?
+    private var microphoneMonitorEpoch = MicrophoneMonitorEpoch()
+    private let microphoneMeterQueue = DispatchQueue(
+        label: "com.krit.recording.mic-meter",
+        qos: .userInteractive
+    )
+    private let microphoneMonitorSessionQueue = DispatchQueue(
+        label: "com.krit.recording.preflight-microphone-session",
+        qos: .userInitiated
+    )
 
     init(rect: CGRect, screen: NSScreen, target: RecordingTargetKind, selectedWindow: SCWindow?, startHandler: @escaping (CGRect, NSScreen, SCWindow?) -> Void, closeHandler: @escaping () -> Void) {
         self.captureRect = rect
@@ -2149,19 +2849,28 @@ private final class RecordingControlsWindow: NSWindow {
         self.closeHandler = closeHandler
 
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: Self.panelWidth + Self.chromeInset * 2, height: Self.windowHeight(expanded: Self.isExpanded)),
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: Self.panelWidth + Self.chromeInset * 2,
+                height: Self.barHeight + Self.chromeInset * 2
+            ),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
 
+        isReleasedWhenClosed = false
         isOpaque = false
         backgroundColor = .clear
         level = .floating
+        sharingType = .none
         hasShadow = false
         isMovableByWindowBackground = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         acceptsMouseMovedEvents = true
+        delegate = self
+        NSApp.addActivationPersistentWindow(self)
 
         buildContent()
         installKeyMonitor()
@@ -2175,10 +2884,14 @@ private final class RecordingControlsWindow: NSWindow {
         positionPanel()
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
-        animateSpringEntrance()
+        alphaValue = 1
+        orderFrontRegardless()
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(contentView)
     }
 
     private func buildContent() {
+        let layout = RecordingPreflightLayout()
         let screenScale = targetScreen.backingScaleFactor
         let root = RecordingPanelContentView(frame: NSRect(origin: .zero, size: frame.size))
         root.wantsLayer = true
@@ -2186,131 +2899,202 @@ private final class RecordingControlsWindow: NSWindow {
         root.layer?.contentsScale = screenScale
         contentView = root
 
-        // Device pickers live in the expanded zone under the bar. Mic on the left,
-        // camera on the right; each appears only when its toggle is on.
-        styleDeviceContainer(microphoneContainer, frame: NSRect(x: Self.chromeInset + 158, y: Self.chromeInset + 62, width: 270, height: 30))
-        root.addSubview(microphoneContainer)
-
-        microphonePopup.frame = NSRect(x: 12, y: 2, width: 246, height: 26)
-        microphonePopup.bezelStyle = .shadowlessSquare
-        microphonePopup.isBordered = false
-        microphonePopup.controlSize = .small
-        microphonePopup.target = self
-        microphonePopup.action = #selector(microphoneChanged)
-        microphoneContainer.addSubview(microphonePopup)
-
-        styleDeviceContainer(cameraContainer, frame: NSRect(x: Self.chromeInset + 438, y: Self.chromeInset + 62, width: 270, height: 30))
-        root.addSubview(cameraContainer)
-
-        cameraPopup.frame = NSRect(x: 12, y: 2, width: 246, height: 26)
-        cameraPopup.bezelStyle = .shadowlessSquare
-        cameraPopup.isBordered = false
-        cameraPopup.controlSize = .small
-        cameraPopup.target = self
-        cameraPopup.action = #selector(cameraDeviceChanged)
-        cameraContainer.addSubview(cameraPopup)
-
-        // The preflight bar is the dock-scale glass surface. The glass backing
-        // draws the fill and rim light (ChromeFactory adds a hairline only on the
-        // pre-26 fallback); the controls live on a transparent content view that
-        // sits flat above it. One glass view for the whole bar, flat controls on
-        // top: glass-on-glass is never used here.
-        let barFrame = NSRect(x: Self.chromeInset, y: Self.chromeInset, width: Self.panelWidth, height: Self.barHeight)
-        let barGlass = ChromeFactory.backing(frame: barFrame, cornerRadius: ChromeFactory.Radius.dock)
-        // The bar is anchored to the bottom inset; only the device row above it
-        // grows when pickers expand, so pin the glass to the bottom rather than
-        // letting it stretch with the window.
-        barGlass.autoresizingMask = [.maxYMargin]
-        // Shadow on a host layer behind the glass, glass owns its own rim light.
+        let barFrame = NSRect(
+            x: Self.chromeInset,
+            y: Self.chromeInset,
+            width: layout.shell.width,
+            height: layout.shell.height
+        )
+        let barGlass = ChromeFactory.backing(
+            frame: barFrame,
+            cornerRadius: RecordingChrome.preflightShellRadius,
+            variant: .regular
+        )
         let barShadowHost = NSView(frame: barFrame)
         barShadowHost.wantsLayer = true
-        barShadowHost.autoresizingMask = [.maxYMargin]
         barShadowHost.layer?.shadowColor = NSColor.black.cgColor
-        barShadowHost.layer?.shadowOpacity = 0.58
-        barShadowHost.layer?.shadowRadius = 24
-        barShadowHost.layer?.shadowOffset = CGSize(width: 0, height: -10)
-        barShadowHost.layer?.shadowPath = CGPath(roundedRect: barGlass.bounds, cornerWidth: ChromeFactory.Radius.dock, cornerHeight: ChromeFactory.Radius.dock, transform: nil)
+        barShadowHost.layer?.shadowOpacity = RecordingChrome.overlayShadow.opacity
+        barShadowHost.layer?.shadowRadius = RecordingChrome.overlayShadow.radius
+        barShadowHost.layer?.shadowOffset = RecordingChrome.overlayShadow.offset
+        barShadowHost.layer?.shadowPath = CGPath(
+            roundedRect: barGlass.bounds,
+            cornerWidth: RecordingChrome.preflightShellRadius,
+            cornerHeight: RecordingChrome.preflightShellRadius,
+            transform: nil
+        )
         root.addSubview(barShadowHost)
         root.addSubview(barGlass)
 
-        // Contrast floor: a dark scrim over the glass so the bar's controls and
-        // labels stay legible when recording over light content. The clear glass
-        // went light over a white document and the white labels/glyphs washed out
-        // (white-on-white). It sits under the controls view, which covers the same
-        // frame, so it never affects hit-testing or the window-background drag.
         let barScrim = NSView(frame: barFrame)
         barScrim.wantsLayer = true
-        barScrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.68).cgColor
-        barScrim.layer?.cornerRadius = ChromeFactory.Radius.dock
+        barScrim.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(RecordingChrome.effectiveContrastFloorAlpha)
+            .cgColor
+        barScrim.layer?.cornerRadius = RecordingChrome.preflightShellRadius
         barScrim.layer?.cornerCurve = .continuous
-        barScrim.autoresizingMask = [.maxYMargin]
         root.addSubview(barScrim)
 
         let bar = RecordingPanelContentView(frame: barFrame)
-        bar.autoresizingMask = [.maxYMargin]
         root.addSubview(bar)
 
-        let grip = label("⋮⋮", size: 15, weight: .bold, color: NSColor.white.withAlphaComponent(0.24))
-        grip.frame = NSRect(x: 10, y: 18, width: 20, height: 20)
-        bar.addSubview(grip)
-
         let sourcePill = pillLabel("\(target.title) · \(Int(captureRect.width)) × \(Int(captureRect.height))", symbol: target.symbol)
-        sourcePill.frame = NSRect(x: 32, y: 9, width: 190, height: 38)
+        sourcePill.frame = layout.source
+        sourcePill.identifier = NSUserInterfaceItemIdentifier("recording.preflight.source")
         bar.addSubview(sourcePill)
 
-        let audioGroup = segmentContainer(frame: NSRect(x: 234, y: 8, width: 222, height: 40))
-        bar.addSubview(audioGroup)
-        bar.addSubview(divider(x: 280, height: 22))
-        bar.addSubview(divider(x: 326, height: 22))
-        bar.addSubview(divider(x: 362, height: 22))
-        bar.addSubview(divider(x: 408, height: 22))
+        let sectionDividers: [(String, CGFloat)] = [
+            ("source", 188),
+            ("toggles", 404),
+            ("options", 548),
+        ]
+        for (name, x) in sectionDividers {
+            let divider = RecordingChrome.makeSectionDivider(
+                identifier: "recording.preflight.section-divider.\(name)"
+            )
+            divider.frame = NSRect(x: x - 0.5, y: 20, width: 1, height: 32)
+            bar.addSubview(divider)
+        }
 
-        systemAudioButton.frame = NSRect(x: 238, y: 9, width: 40, height: 38)
-        microphoneButton.frame = NSRect(x: 284, y: 9, width: 40, height: 38)
-        microphoneLevelMeter.frame = NSRect(x: 332, y: 16, width: 32, height: 24)
-        microphoneLevelMeter.isHidden = true
-        bar.addSubview(microphoneLevelMeter)
-        cursorButton.frame = NSRect(x: 366, y: 9, width: 40, height: 38)
-        cameraButton.frame = NSRect(x: 412, y: 9, width: 40, height: 38)
-        for button in [systemAudioButton, microphoneButton, cursorButton, cameraButton] {
+        let toggleRailFrame = layout.toggles.dropFirst().reduce(layout.toggles[0]) { partial, frame in
+            partial.union(frame)
+        }
+        let toggleRail = RecordingToggleRail(frame: toggleRailFrame)
+        toggleRail.identifier = NSUserInterfaceItemIdentifier("recording.preflight.toggle-rail")
+        toggleRail.wantsLayer = true
+        toggleRail.layer?.backgroundColor = NSColor.clear.cgColor
+        bar.addSubview(toggleRail)
+        for index in 1..<layout.toggles.count {
+            let divider = NSView(
+                frame: NSRect(
+                    x: layout.toggles[index].minX - toggleRailFrame.minX,
+                    y: 16,
+                    width: 1,
+                    height: 24
+                )
+            )
+            divider.identifier = NSUserInterfaceItemIdentifier("recording.preflight.toggle-divider.\(index)")
+            divider.wantsLayer = true
+            divider.layer?.backgroundColor = NSColor.white
+                .withAlphaComponent(RecordingChrome.sectionDividerAlpha)
+                .cgColor
+            toggleRail.addSubview(divider)
+        }
+
+        let toggleButtons = [systemAudioButton, microphoneButton, cursorButton, cameraButton]
+        let toggleIdentifiers = [
+            "recording.preflight.system-audio",
+            "recording.preflight.microphone",
+            "recording.preflight.cursor",
+            "recording.preflight.camera",
+        ]
+        for (index, button) in toggleButtons.enumerated() {
+            let identifier = toggleIdentifiers[index]
+            button.frame = layout.toggles[index]
+            button.identifier = NSUserInterfaceItemIdentifier(identifier)
+            button.setAccessibilityIdentifier(identifier)
             button.target = self
             button.action = #selector(toggleChanged(_:))
             bar.addSubview(button)
         }
 
-        let settingsGroup = segmentContainer(frame: NSRect(x: 464, y: 8, width: 166, height: 40))
-        bar.addSubview(settingsGroup)
-        bar.addSubview(divider(x: 548, height: 22))
+        microphoneLevelMeter.frame = NSRect(
+            x: layout.toggles[1].midX - 11,
+            y: layout.toggles[1].minY + 6,
+            width: 22,
+            height: 8
+        )
+        microphoneLevelMeter.isHidden = true
+        bar.addSubview(microphoneLevelMeter)
 
-        configurePopup(qualityPopup, items: [("Balanced", "balanced"), ("High", "high"), ("Max", "max")])
-        qualityPopup.frame = NSRect(x: 470, y: 14, width: 72, height: 28)
-        qualityPopup.target = self
-        qualityPopup.action = #selector(qualityChanged)
-        bar.addSubview(qualityPopup)
+        optionsButton.frame = layout.options
+        optionsButton.identifier = NSUserInterfaceItemIdentifier("recording.preflight.options")
+        optionsButton.setAccessibilityIdentifier("recording.preflight.options")
+        optionsButton.target = self
+        optionsButton.action = #selector(optionsTapped)
+        bar.addSubview(optionsButton)
 
-        configurePopup(fpsPopup, items: [("30 fps", "30"), ("60 fps", "60")])
-        fpsPopup.frame = NSRect(x: 556, y: 14, width: 68, height: 28)
-        fpsPopup.target = self
-        fpsPopup.action = #selector(fpsChanged)
-        bar.addSubview(fpsPopup)
-
-        let recordButton = RecordingActionButton(symbol: "record.circle", title: "Record", isPrimary: true)
-        recordButton.frame = NSRect(x: 648, y: 9, width: 38, height: 38)
+        let recordButton = RecordingChromeButton(
+            symbol: "record.circle",
+            title: "Record",
+            role: .primary,
+            presentation: .horizontal
+        )
+        recordButton.frame = layout.record
+        recordButton.identifier = NSUserInterfaceItemIdentifier("recording.preflight.record")
+        recordButton.setAccessibilityIdentifier("recording.preflight.record")
         recordButton.target = self
         recordButton.action = #selector(recordTapped)
         bar.addSubview(recordButton)
 
-        let cancelButton = RecordingActionButton(symbol: "xmark", title: "Cancel", tint: .secondaryLabelColor)
-        cancelButton.frame = NSRect(x: 688, y: 9, width: 32, height: 38)
+        let cancelButton = RecordingChromeButton(
+            symbol: "xmark",
+            title: "Cancel",
+            role: .neutral,
+            presentation: .glyph
+        )
+        cancelButton.frame = layout.cancel
+        cancelButton.identifier = NSUserInterfaceItemIdentifier("recording.preflight.cancel")
+        cancelButton.setAccessibilityIdentifier("recording.preflight.cancel")
         cancelButton.target = self
         cancelButton.action = #selector(cancelTapped)
         bar.addSubview(cancelButton)
 
-        let escHint = keyHint("esc")
-        escHint.frame = NSRect(x: 692, y: 3, width: 24, height: 12)
-        bar.addSubview(escHint)
-
+        buildOptionsPopover()
         syncFromSettings()
+    }
+
+    private func buildOptionsPopover() {
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 336, height: 216))
+        content.wantsLayer = true
+
+        let heading = NSTextField(labelWithString: "Recording Options")
+        heading.font = KritType.heading.nsFont
+        heading.frame = NSRect(x: 20, y: 176, width: 296, height: 22)
+        content.addSubview(heading)
+
+        configurePopup(qualityPopup, items: [("Balanced", "balanced"), ("High", "high"), ("Max", "max")])
+        configurePopup(fpsPopup, items: [("30 fps", "30"), ("60 fps", "60")])
+        configureDevicePopup(microphonePopup, accessibilityLabel: "Microphone device")
+        configureDevicePopup(cameraPopup, accessibilityLabel: "Camera device")
+
+        addOptionsRow(title: "Quality", control: qualityPopup, y: 136, to: content)
+        addOptionsRow(title: "Frame rate", control: fpsPopup, y: 96, to: content)
+        addOptionsRow(title: "Microphone", control: microphonePopup, y: 56, to: content)
+        addOptionsRow(title: "Camera", control: cameraPopup, y: 16, to: content)
+
+        qualityPopup.target = self
+        qualityPopup.action = #selector(qualityChanged)
+        fpsPopup.target = self
+        fpsPopup.action = #selector(fpsChanged)
+        microphonePopup.target = self
+        microphonePopup.action = #selector(microphoneChanged)
+        cameraPopup.target = self
+        cameraPopup.action = #selector(cameraDeviceChanged)
+
+        let controller = NSViewController()
+        controller.view = content
+        optionsPopover.contentViewController = controller
+        optionsPopover.behavior = .transient
+        optionsPopover.animates = !Motion.reduced
+    }
+
+    private func addOptionsRow(title: String, control: NSControl, y: CGFloat, to content: NSView) {
+        let field = NSTextField(labelWithString: title)
+        field.font = KritType.body.nsFont
+        field.textColor = .secondaryLabelColor
+        field.frame = NSRect(x: 20, y: y + 5, width: 96, height: 20)
+        content.addSubview(field)
+
+        control.frame = NSRect(x: 120, y: y, width: 196, height: 28)
+        control.setAccessibilityLabel(title)
+        content.addSubview(control)
+    }
+
+    private func configureDevicePopup(_ popup: NSPopUpButton, accessibilityLabel: String) {
+        popup.bezelStyle = .rounded
+        popup.controlSize = .small
+        popup.font = KritType.callout.nsFont
+        popup.setAccessibilityLabel(accessibilityLabel)
     }
 
     private func syncFromSettings() {
@@ -2320,9 +3104,8 @@ private final class RecordingControlsWindow: NSWindow {
         cursorButton.isOn = Settings.recordingShowsCursor
         selectItem(in: qualityPopup, representedObject: Settings.recordingQuality)
         selectItem(in: fpsPopup, representedObject: String(Settings.recordingFPS))
-        reloadMicrophones()
-        reloadCameras()
         updateDeviceVisibility()
+        updateOptionsSummary()
     }
 
     private func reloadMicrophones() {
@@ -2352,27 +3135,26 @@ private final class RecordingControlsWindow: NSWindow {
     }
 
     private func updateDeviceVisibility() {
-        microphoneContainer.isHidden = !Settings.recordingMicrophone
         microphoneLevelMeter.isHidden = !Settings.recordingMicrophone
+        microphonePopup.isEnabled = Settings.recordingMicrophone
         if Settings.recordingMicrophone {
             startMicrophoneMonitorIfNeeded()
         } else {
             stopMicrophoneMonitor()
             microphoneLevelMeter.setLevel(0)
         }
-        cameraContainer.isHidden = !Settings.recordingWebcam
-        resizeForDeviceState()
+        cameraPopup.isEnabled = Settings.recordingWebcam
     }
 
     private func startMicrophoneMonitorIfNeeded() {
-        guard microphoneMonitorSession == nil else { return }
+        guard !didClose, microphoneMonitorSession == nil else { return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             configureMicrophoneMonitor()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 Task { @MainActor in
-                    guard let self else { return }
+                    guard let self, !self.didClose else { return }
                     if granted, Settings.recordingMicrophone {
                         self.configureMicrophoneMonitor()
                     } else {
@@ -2393,7 +3175,8 @@ private final class RecordingControlsWindow: NSWindow {
     }
 
     private func configureMicrophoneMonitor() {
-        guard microphoneMonitorSession == nil,
+        guard !didClose,
+              microphoneMonitorSession == nil,
               let device = RecordingMicrophoneDeviceProvider.device(for: Settings.recordingMicrophoneDeviceID) else { return }
         do {
             let session = AVCaptureSession()
@@ -2404,18 +3187,22 @@ private final class RecordingControlsWindow: NSWindow {
             session.addInput(input)
 
             let output = AVCaptureAudioDataOutput()
-            let delegate = MicrophoneLevelMonitor { [weak self] level in
-                self?.microphoneLevelMeter.setLevel(level)
-            }
-            output.setSampleBufferDelegate(delegate, queue: DispatchQueue(label: "com.krit.recording.mic-meter", qos: .userInteractive))
             guard session.canAddOutput(output) else { throw RecordingControlsError.cannotMonitorMicrophone }
+            let token = microphoneMonitorEpoch.begin()
+            let delegate = MicrophoneLevelMonitor { [weak self] level in
+                guard let self,
+                      !self.didClose,
+                      self.microphoneMonitorEpoch.accepts(token) else { return }
+                self.microphoneLevelMeter.setLevel(level)
+            }
+            output.setSampleBufferDelegate(delegate, queue: microphoneMeterQueue)
             session.addOutput(output)
             session.commitConfiguration()
-            session.startRunning()
 
             microphoneMonitorSession = session
             microphoneMonitorOutput = output
             microphoneMonitorDelegate = delegate
+            runMicrophoneMonitorSession(session, start: true)
         } catch {
             microphoneLevelMeter.setLevel(0)
             print("[KRIT] Microphone meter failed: \(error)")
@@ -2423,40 +3210,44 @@ private final class RecordingControlsWindow: NSWindow {
     }
 
     private func stopMicrophoneMonitor() {
-        microphoneMonitorSession?.stopRunning()
+        microphoneMonitorEpoch.invalidate()
+        let output = microphoneMonitorOutput
+        let session = microphoneMonitorSession
+        output?.setSampleBufferDelegate(nil, queue: nil)
         microphoneMonitorSession = nil
         microphoneMonitorOutput = nil
         microphoneMonitorDelegate = nil
+        microphoneLevelMeter.setLevel(0)
+        if let session {
+            runMicrophoneMonitorSession(session, start: false)
+        }
+    }
+
+    private func runMicrophoneMonitorSession(_ session: AVCaptureSession, start: Bool) {
+        // AVFoundation predates Swift concurrency. This session is fully
+        // configured before it crosses into the one serial queue that owns its
+        // start/stop calls, so the non-Sendable bridge cannot race another
+        // session operation.
+        nonisolated(unsafe) let session = session
+        microphoneMonitorSessionQueue.async {
+            if start {
+                session.startRunning()
+            } else {
+                session.stopRunning()
+            }
+        }
     }
 
     private func configurePopup(_ popup: NSPopUpButton, items: [(String, String)]) {
         popup.removeAllItems()
-        popup.bezelStyle = .shadowlessSquare
-        popup.isBordered = false
+        popup.bezelStyle = .rounded
+        popup.isBordered = true
         popup.controlSize = .small
-        popup.font = .systemFont(ofSize: 12, weight: .semibold)
-        popup.contentTintColor = NSColor.white.withAlphaComponent(0.9)
+        popup.font = KritType.callout.nsFont
         for item in items {
             popup.addItem(withTitle: item.0)
             popup.lastItem?.representedObject = item.1
         }
-    }
-
-    private func resizeForDeviceState() {
-        let newHeight = Self.windowHeight(expanded: Self.isExpanded)
-        guard abs(frame.height - newHeight) > 0.5 else { return }
-        let oldFrame = frame
-        setFrame(NSRect(x: oldFrame.minX, y: oldFrame.maxY - newHeight, width: oldFrame.width, height: newHeight), display: true)
-    }
-
-    /// The expanded device-picker row shows when either the mic or the camera is
-    /// on, so the user can pick that device before recording.
-    private static var isExpanded: Bool {
-        Settings.recordingMicrophone || Settings.recordingWebcam
-    }
-
-    private static func windowHeight(expanded: Bool) -> CGFloat {
-        (expanded ? expandedHeight : barHeight) + chromeInset * 2
     }
 
     @discardableResult
@@ -2468,86 +3259,31 @@ private final class RecordingControlsWindow: NSWindow {
         return false
     }
 
-    private func label(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor) -> NSTextField {
-        let field = NSTextField(labelWithString: text)
-        field.font = .systemFont(ofSize: size, weight: weight)
-        field.textColor = color
-        return field
-    }
-
     private func pillLabel(_ text: String, symbol: String) -> NSView {
         let view = NSView(frame: .zero)
         view.wantsLayer = true
-        view.layer?.cornerRadius = 14
-        view.layer?.cornerCurve = .continuous
-        view.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.105).cgColor
-        view.layer?.borderWidth = 1
-        view.layer?.borderColor = NSColor.white.withAlphaComponent(0.06).cgColor
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+        view.setAccessibilityElement(true)
+        view.setAccessibilityRole(.group)
+        view.setAccessibilityLabel("Recording source: \(text)")
 
-        let icon = NSImageView(frame: NSRect(x: 12, y: 11, width: 16, height: 16))
+        let icon = NSImageView(frame: NSRect(x: 16, y: 20, width: 16, height: 16))
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         icon.contentTintColor = .white.withAlphaComponent(0.86)
         view.addSubview(icon)
 
-        let textField = label(text, size: 11, weight: .bold, color: NSColor.white.withAlphaComponent(0.86))
-        textField.frame = NSRect(x: 36, y: 11, width: 146, height: 16)
+        let textField = NSTextField(labelWithString: text)
+        textField.font = KritType.bodyEmphasis.nsFont
+        textField.textColor = NSColor.white.withAlphaComponent(0.9)
+        textField.frame = NSRect(x: 40, y: 19, width: 128, height: 18)
         textField.lineBreakMode = .byTruncatingTail
         view.addSubview(textField)
         return view
     }
 
-    private func keyHint(_ text: String) -> NSView {
-        let view = NSView(frame: .zero)
-        view.wantsLayer = true
-        view.layer?.cornerRadius = 5
-        view.layer?.cornerCurve = .continuous
-        view.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
-        view.layer?.borderWidth = 1
-        view.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
-
-        let field = label(text, size: 7.5, weight: .bold, color: NSColor.white.withAlphaComponent(0.42))
-        field.alignment = .center
-        field.frame = NSRect(x: 0, y: 1, width: 24, height: 9)
-        view.addSubview(field)
-        return view
-    }
-
-    /// A flat grouping chip that sits on the glass bar. It stays flat on purpose:
-    /// glass cannot sample glass, so nothing layered on the bar becomes glass too.
-    /// Its radius is concentric to the dock-scale bar (inset by the chip's vertical
-    /// inset) so the corners stay parallel.
-    private func segmentContainer(frame: NSRect) -> NSView {
-        let inset = (Self.barHeight - frame.height) / 2
-        let view = NSView(frame: frame)
-        view.wantsLayer = true
-        view.layer?.cornerRadius = ChromeFactory.concentricRadius(outer: ChromeFactory.Radius.dock, inset: inset)
-        view.layer?.cornerCurve = .continuous
-        view.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.075).cgColor
-        view.layer?.borderWidth = 1
-        view.layer?.borderColor = NSColor.white.withAlphaComponent(0.055).cgColor
-        return view
-    }
-
-    private func styleDeviceContainer(_ container: NSView, frame: NSRect) {
-        container.frame = frame
-        container.wantsLayer = true
-        container.layer?.cornerRadius = 12
-        container.layer?.cornerCurve = .continuous
-        container.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 0.98).cgColor
-        container.layer?.borderWidth = 1
-        container.layer?.borderColor = NSColor.white.withAlphaComponent(0.13).cgColor
-    }
-
-    private func divider(x: CGFloat, height: CGFloat) -> NSView {
-        let view = NSView(frame: NSRect(x: x, y: (Self.barHeight - height) / 2, width: 1, height: height))
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
-        return view
-    }
-
     private func positionPanel() {
         let visible = targetScreen.visibleFrame
-        let visibleHeight = Self.isExpanded ? Self.expandedHeight : Self.barHeight
+        let visibleHeight = Self.barHeight
         let x = visible.midX - Self.panelWidth / 2
         let y = min(visible.maxY - visibleHeight - 28, captureRect.maxY - visibleHeight - 14)
         let visibleOrigin = NSPoint(
@@ -2576,11 +3312,13 @@ private final class RecordingControlsWindow: NSWindow {
     private func closePanel() {
         guard !didClose else { return }
         didClose = true
+        optionsPopover.close()
         stopMicrophoneMonitor()
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
             self.keyMonitor = nil
         }
+        NSApp.removeActivationPersistentWindow(self)
         orderOut(nil)
         Self.openWindows.removeAll { $0 === self }
         closeHandler()
@@ -2593,18 +3331,21 @@ private final class RecordingControlsWindow: NSWindow {
         closePanel()
     }
 
+    func windowWillClose(_ notification: Notification) {
+        closePanel()
+    }
+
     @objc private func toggleChanged(_ sender: RecordingToggleButton) {
+        sender.commitControlState()
         switch sender {
         case systemAudioButton:
             Settings.recordingSystemAudio = sender.isOn
         case microphoneButton:
             Settings.recordingMicrophone = sender.isOn
-            if sender.isOn { reloadMicrophones() }
             updateDeviceVisibility()
         case cameraButton:
             Settings.recordingWebcam = sender.isOn
             if sender.isOn {
-                reloadCameras()
                 ensureCameraPermission()
             }
             updateDeviceVisibility()
@@ -2613,6 +3354,30 @@ private final class RecordingControlsWindow: NSWindow {
         default:
             break
         }
+        updateOptionsSummary()
+    }
+
+    @objc private func optionsTapped() {
+        if optionsPopover.isShown {
+            optionsPopover.close()
+            return
+        }
+
+        reloadMicrophones()
+        reloadCameras()
+        selectItem(in: microphonePopup, representedObject: Settings.recordingMicrophoneDeviceID)
+        selectItem(in: cameraPopup, representedObject: Settings.recordingWebcamDeviceID)
+        microphonePopup.isEnabled = Settings.recordingMicrophone
+        cameraPopup.isEnabled = Settings.recordingWebcam
+        optionsPopover.show(relativeTo: optionsButton.bounds, of: optionsButton, preferredEdge: .maxY)
+    }
+
+    private func updateOptionsSummary() {
+        let quality = Settings.recordingQuality.capitalized
+        let summary = "\(quality) · \(Settings.recordingFPS) fps"
+        optionsButton.title = summary
+        optionsButton.toolTip = "Recording options · \(summary)"
+        optionsButton.setAccessibilityLabel("Recording options: \(summary)")
     }
 
     private func ensureCameraPermission() {
@@ -2646,23 +3411,27 @@ private final class RecordingControlsWindow: NSWindow {
     }
 
     @objc private func cameraDeviceChanged() {
-        Settings.recordingWebcamDeviceID = cameraPopup.selectedItem?.representedObject as? String ?? ""
+        guard let selected = cameraPopup.selectedItem else { return }
+        Settings.recordingWebcamDeviceID = selected.representedObject as? String ?? ""
     }
 
     @objc private func qualityChanged() {
         if let value = qualityPopup.selectedItem?.representedObject as? String {
             Settings.recordingQuality = value
+            updateOptionsSummary()
         }
     }
 
     @objc private func fpsChanged() {
         if let value = fpsPopup.selectedItem?.representedObject as? String, let fps = Int(value) {
             Settings.recordingFPS = fps
+            updateOptionsSummary()
         }
     }
 
     @objc private func microphoneChanged() {
-        Settings.recordingMicrophoneDeviceID = microphonePopup.selectedItem?.representedObject as? String ?? ""
+        guard let selected = microphonePopup.selectedItem else { return }
+        Settings.recordingMicrophoneDeviceID = selected.representedObject as? String ?? ""
         if Settings.recordingMicrophone {
             stopMicrophoneMonitor()
             startMicrophoneMonitorIfNeeded()
@@ -2672,8 +3441,8 @@ private final class RecordingControlsWindow: NSWindow {
     @objc private func recordTapped() {
         qualityChanged()
         fpsChanged()
-        microphoneChanged()
-        cameraDeviceChanged()
+        if microphonePopup.selectedItem != nil { microphoneChanged() }
+        if cameraPopup.selectedItem != nil { cameraDeviceChanged() }
         Settings.recordingSystemAudio = systemAudioButton.isOn
         Settings.recordingMicrophone = microphoneButton.isOn
         Settings.recordingWebcam = cameraButton.isOn
@@ -2696,11 +3465,48 @@ private enum RecordingControlsError: Error {
     case cannotMonitorMicrophone
 }
 
+struct MicrophoneLevelDeliveryGate {
+    private let minimumInterval: TimeInterval
+    private var lastDelivery: TimeInterval?
+
+    init(maximumUpdatesPerSecond: Double = 30) {
+        precondition(maximumUpdatesPerSecond > 0)
+        minimumInterval = 1 / maximumUpdatesPerSecond
+    }
+
+    mutating func shouldDeliver(at now: TimeInterval) -> Bool {
+        guard let lastDelivery else {
+            self.lastDelivery = now
+            return true
+        }
+        guard now - lastDelivery >= minimumInterval else { return false }
+        self.lastDelivery = now
+        return true
+    }
+}
+
+struct MicrophoneMonitorEpoch {
+    private(set) var value: UInt64 = 0
+
+    mutating func begin() -> UInt64 {
+        value &+= 1
+        return value
+    }
+
+    mutating func invalidate() {
+        value &+= 1
+    }
+
+    func accepts(_ token: UInt64) -> Bool {
+        value == token
+    }
+}
+
 private enum RecordingMicrophoneDeviceProvider {
     static var options: [RecordingMicrophoneOption] {
         let deviceTypes: [AVCaptureDevice.DeviceType]
         if #available(macOS 14.0, *) {
-            deviceTypes = [.microphone, .externalUnknown]
+            deviceTypes = [.microphone, .external]
         } else {
             deviceTypes = [.builtInMicrophone, .externalUnknown]
         }
@@ -2738,155 +3544,85 @@ private enum RecordingCameraDeviceProvider {
 private final class RecordingPanelContentView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var acceptsFirstResponder: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { true }
 }
 
 @MainActor
-private final class RecordingToggleButton: NSButton {
+private final class RecordingToggleButton: RecordingChromeButton {
+
+    private let activeIndicator = NSView()
 
     var isOn: Bool = false {
-        didSet { updateAppearance() }
+        didSet {
+            let expectedState: NSControl.StateValue = isOn ? .on : .off
+            if state != expectedState {
+                state = expectedState
+            }
+            setToggleState(isOn)
+            updateActiveIndicator()
+        }
     }
 
-    private let symbol: String
-    private let label: String
-    private let activeTint: NSColor
-
-    init(symbol: String, title: String, activeTint: NSColor = KritColors.accent) {
-        self.symbol = symbol
-        self.label = title
-        self.activeTint = activeTint
-        super.init(frame: .zero)
-        isBordered = false
-        image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
-        imagePosition = .imageOnly
-        imageScaling = .scaleNone
-        self.title = ""
-        toolTip = label
-        contentTintColor = .secondaryLabelColor
-        wantsLayer = true
-        layer?.cornerRadius = 11
-        layer?.cornerCurve = .continuous
-        updateAppearance()
+    init(symbol: String, title: String, accessibilityTitle: String? = nil) {
+        super.init(
+            symbol: symbol,
+            title: title,
+            role: .neutral,
+            presentation: .vertical,
+            chromeStyle: .groupedToggle
+        )
+        if let accessibilityTitle {
+            setAccessibilityLabel(accessibilityTitle)
+            toolTip = accessibilityTitle
+        }
+        setButtonType(.toggle)
+        activeIndicator.wantsLayer = true
+        activeIndicator.layer?.cornerRadius = 1.5
+        activeIndicator.layer?.cornerCurve = .continuous
+        activeIndicator.layer?.backgroundColor = KritColors.accent.cgColor
+        addSubview(activeIndicator)
+        setToggleState(false)
+        updateActiveIndicator()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func mouseDown(with event: NSEvent) {
-        isOn.toggle()
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
-        if let action, let target {
-            NSApp.sendAction(action, to: target, from: self)
-        }
+    override func layout() {
+        super.layout()
+        activeIndicator.frame = NSRect(
+            x: (bounds.width - 14) / 2,
+            y: 5,
+            width: 14,
+            height: 3
+        )
     }
 
-    private func updateAppearance() {
-        layer?.backgroundColor = isOn
-            ? activeTint.withAlphaComponent(0.18).cgColor
-            : NSColor.white.withAlphaComponent(0.07).cgColor
-        contentTintColor = isOn ? activeTint : NSColor.white.withAlphaComponent(0.48)
-        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
-        image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?.withSymbolConfiguration(config)
+    func commitControlState() {
+        isOn = state == .on
+    }
+
+    private func updateActiveIndicator() {
+        activeIndicator.isHidden = !isOn
     }
 }
 
 @MainActor
-private final class RecordingActionButton: NSButton {
-
-    private let symbol: String
-    private let buttonTint: NSColor
-    private let isPrimary: Bool
-
-    /// `isPrimary` marks the single primary action (Record). Only it carries the
-    /// accent wash, keeping the tint reserved for one action per the glass rules;
-    /// secondary actions (Cancel) stay neutral.
-    init(symbol: String, title: String, tint: NSColor = KritColors.accent, isPrimary: Bool = false) {
-        self.symbol = symbol
-        self.buttonTint = tint
-        self.isPrimary = isPrimary
-        super.init(frame: .zero)
-        isBordered = false
-        imagePosition = .imageOnly
-        imageScaling = .scaleNone
-        self.title = ""
-        toolTip = title
-        wantsLayer = true
-        layer?.cornerRadius = 11
-        layer?.cornerCurve = .continuous
-        layer?.backgroundColor = idleBackground
-        contentTintColor = buttonTint
-        let config = NSImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
-        image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?.withSymbolConfiguration(config)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    private var idleBackground: CGColor {
-        isPrimary
-            ? buttonTint.withAlphaComponent(0.20).cgColor
-            : NSColor.white.withAlphaComponent(0.08).cgColor
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func mouseDown(with event: NSEvent) {
-        layer?.backgroundColor = buttonTint.withAlphaComponent(isPrimary ? 0.30 : 0.16).cgColor
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
-        super.mouseDown(with: event)
-        layer?.backgroundColor = idleBackground
-    }
-}
-
-@MainActor
-private final class RecordingAudioLevelMeter: NSView {
-
-    private let bars: [NSView]
-    private var smoothedLevel: CGFloat = 0
-
-    override init(frame frameRect: NSRect) {
-        bars = (0..<4).map { _ in NSView(frame: .zero) }
-        super.init(frame: frameRect)
-        wantsLayer = true
-        for bar in bars {
-            bar.wantsLayer = true
-            bar.layer?.cornerRadius = 1.5
-            bar.layer?.cornerCurve = .continuous
-            addSubview(bar)
-        }
-        setLevel(0)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    func setLevel(_ level: CGFloat) {
-        let clamped = max(0, min(1, level))
-        smoothedLevel = smoothedLevel * 0.62 + clamped * 0.38
-        let gap: CGFloat = 3
-        let barWidth: CGFloat = 3
-        let baseHeight: CGFloat = 4
-        for (index, bar) in bars.enumerated() {
-            let threshold = CGFloat(index) * 0.17
-            let response = max(0, min(1, (smoothedLevel - threshold) / 0.65))
-            let height = baseHeight + response * (bounds.height - baseHeight)
-            let x = CGFloat(index) * (barWidth + gap)
-            bar.frame = NSRect(x: x, y: (bounds.height - height) / 2, width: barWidth, height: height)
-            bar.layer?.backgroundColor = response > 0.08
-                ? NSColor.systemGreen.withAlphaComponent(0.58 + response * 0.42).cgColor
-                : NSColor.white.withAlphaComponent(0.18).cgColor
-        }
-    }
+private final class RecordingToggleRail: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 private final class MicrophoneLevelMonitor: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     private let levelHandler: @MainActor (CGFloat) -> Void
+    private var deliveryGate = MicrophoneLevelDeliveryGate()
 
     init(levelHandler: @escaping @MainActor (CGFloat) -> Void) {
         self.levelHandler = levelHandler
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard deliveryGate.shouldDeliver(at: now) else { return }
         let level = Self.level(from: sampleBuffer)
         Task { @MainActor [levelHandler] in
             levelHandler(level)

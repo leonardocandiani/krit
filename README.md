@@ -80,15 +80,12 @@ curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/main/install.
 
 1. Go to [Releases](https://github.com/leonardocandiani/krit/releases) and download `KRIT-v<version>-macOS.dmg`.
 2. Open the DMG and drag **KRIT** to Applications.
-3. Clear the quarantine flag so Gatekeeper lets it run:
+3. Launch KRIT normally from Applications or Spotlight.
 
-   ```bash
-   xattr -dr com.apple.quarantine /Applications/KRIT.app
-   ```
-
-KRIT is not notarized yet (no paid Apple Developer account), so macOS quarantines
-it on first open. The `xattr` step above removes that flag. Without it, macOS
-shows an "unidentified developer" warning and refuses to launch.
+Public releases are signed with Developer ID and notarized by Apple. Keep the
+download quarantine intact so Gatekeeper can verify both the signature and the
+stapled notarization ticket. If macOS rejects a release, stop and report the
+artifact instead of bypassing Gatekeeper.
 
 ## Shortcuts
 
@@ -201,8 +198,10 @@ swift build -c release --product krit            # the CLI / MCP binary (host ar
 - **Accessibility** (optional): needed for Snap & Paste (it synthesizes the paste keystroke) and for the click and keystroke overlay during recording.
 - **Microphone / Camera** (optional): only when you enable microphone audio or the camera bubble for a recording.
 
-KRIT runs without the App Sandbox, sends no telemetry, and makes no network
-requests of its own. Everything stays on disk in `~/Pictures/KRIT`.
+KRIT runs without the App Sandbox and sends no telemetry. Captures and history
+stay on disk in `~/Pictures/KRIT`. The optional Sparkle updater checks its
+configured release feed for updates, so the app does make that network request
+when automatic update checks are enabled.
 
 ## Acknowledgments
 

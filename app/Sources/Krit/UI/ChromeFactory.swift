@@ -87,7 +87,7 @@ enum ChromeFactory {
     /// container. On the fallback path there is no clustering to do.
     @MainActor
     static func makeCluster(content: NSView, spacing: CGFloat) -> NSView {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), !forceFallback {
             let container = NSGlassEffectContainerView()
             container.contentView = content
             container.spacing = spacing
@@ -102,13 +102,25 @@ enum ChromeFactory {
         max(outer - inset, 2)
     }
 
+    /// A clear backing that sits over rich content in the same window must blur
+    /// that content, not the desktop behind the window. Regular floating chrome
+    /// remains a behind-window material.
+    static func fallbackBlendingMode(for variant: Variant) -> NSVisualEffectView.BlendingMode {
+        switch variant {
+        case .regular:
+            .behindWindow
+        case .clear:
+            .withinWindow
+        }
+    }
+
     // MARK: - Fallback (pre-macOS 26)
 
     @MainActor
     private static func makeBlur(cornerRadius: CGFloat, variant: Variant, tint: NSColor?) -> NSVisualEffectView {
         let blur = NSVisualEffectView()
         blur.material = variant == .clear ? .fullScreenUI : .hudWindow
-        blur.blendingMode = .behindWindow
+        blur.blendingMode = fallbackBlendingMode(for: variant)
         blur.state = .active
         blur.wantsLayer = true
         blur.translatesAutoresizingMaskIntoConstraints = false

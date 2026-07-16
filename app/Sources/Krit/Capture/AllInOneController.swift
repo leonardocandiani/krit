@@ -4,13 +4,60 @@ import AppKit
 /// only reports intent plus the final adjusted rect; the engine owns the real
 /// capture/record routing.
 @MainActor
-enum AllInOneAction {
+enum AllInOneAction: CaseIterable, Equatable {
     case capture
     case record
     case window
     case fullscreen
     case scrolling
     case ocr
+
+    var accessibilityIdentifier: String {
+        "all-in-one.\(rawValue)"
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .capture: "Capture"
+        case .record: "Record"
+        case .window: "Window"
+        case .fullscreen: "Fullscreen"
+        case .scrolling: "Scrolling"
+        case .ocr: "OCR"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .capture: "camera.viewfinder"
+        case .record: "record.circle"
+        case .window: "macwindow"
+        case .fullscreen: "rectangle.on.rectangle"
+        case .scrolling: "scroll"
+        case .ocr: "text.viewfinder"
+        }
+    }
+
+    /// The default receives the first keyboard focus, so its visual hierarchy
+    /// must make the result of pressing Return or Space obvious.
+    var isPrimary: Bool { self == .capture }
+
+    /// The dock groups capture output, target selection, and specialized tools.
+    /// A boundary follows the second action in the first two groups.
+    var endsDockGroup: Bool {
+        self == .record || self == .fullscreen
+    }
+
+    private var rawValue: String {
+        switch self {
+        case .capture: "capture"
+        case .record: "record"
+        case .window: "window"
+        case .fullscreen: "fullscreen"
+        case .scrolling: "scrolling"
+        case .ocr: "ocr"
+        }
+    }
 }
 
 /// CleanShot-style All-in-One: a single overlay on the target screen shows the
@@ -36,6 +83,9 @@ final class AllInOneController: NSObject {
     private var panelWindow: AllInOnePanelWindow?
     private var keyMonitor: Any?
     private var didFinish = false
+    private var isInvalidated = false
+    private var didInvokeAction = false
+    private var pendingAction: DispatchWorkItem?
 
     /// `initialRect` is in AppKit global screen coordinates, already validated by
     /// the caller to sit inside `screen`.
@@ -51,6 +101,10 @@ final class AllInOneController: NSObject {
         // area path: the grab must catch the live dark desktop, never a paused
         // wallpaper still nor our own overlay.
         let image = await engine.captureRectToImage(screen.frame, on: screen)
+        // A newer capture command can dismiss this controller while the async
+        // backdrop grab is in flight. Do not recreate its windows once that newer
+        // intent owns the screen.
+        guard !isInvalidated else { return }
         var imgRect = NSRect(origin: .zero, size: screen.frame.size)
         let frozen = image?.cgImage(forProposedRect: &imgRect, context: nil, hints: nil)
 
@@ -69,6 +123,7 @@ final class AllInOneController: NSObject {
         let overlay = AllInOneOverlayWindow(screen: screen, initialRect: localRect, frozenImage: frozen)
         overlay.onRectChanged = { [weak self] rect in self?.repositionPanel(localRect: rect) }
         overlay.onCancel = { [weak self] in self?.cancel() }
+        overlay.onEditingFinished = { [weak self] in self?.focusPanel() }
         overlay.show()
         overlayWindow = overlay
 
@@ -78,9 +133,9 @@ final class AllInOneController: NSObject {
         panelWindow = panel
         panel.showAnchored(below: localRect, on: screen)
 
-        focusOverlay()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.focusOverlay() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.focusOverlay() }
+        focusPanel()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.focusPanel() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.focusPanel() }
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.keyCode == 53 { self?.cancel(); return nil }   // Escape
@@ -88,12 +143,10 @@ final class AllInOneController: NSObject {
         }
     }
 
-    private func focusOverlay() {
-        guard let overlay = overlayWindow, overlay.isVisible else { return }
+    private func focusPanel() {
+        guard let panel = panelWindow, panel.isVisible else { return }
         NSApp.activate(ignoringOtherApps: true)
-        overlay.makeKeyAndOrderFront(nil)
-        overlay.makeMain()
-        overlay.focusContent()
+        panel.focusFirstOption()
     }
 
     private func repositionPanel(localRect: CGRect) {
@@ -117,21 +170,27 @@ final class AllInOneController: NSObject {
     }
 
     private func finish(action: AllInOneAction) {
-        guard !didFinish else { return }
+        guard !didFinish, !isInvalidated else { return }
         didFinish = true
         let rect = currentGlobalRect
         tearDown()
         // Small delay mirrors AreaSelectionWindow.finish so the overlay is gone
         // before the capture/record path runs (no overlay pixels in the grab).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            guard let self else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.isInvalidated else { return }
+            self.pendingAction = nil
+            self.didInvokeAction = true
             self.onAction(action, rect, self.screen)
         }
+        pendingAction = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: workItem)
     }
 
     private func cancel() {
-        guard !didFinish else { return }
-        didFinish = true
+        guard !isInvalidated, !didInvokeAction else { return }
+        isInvalidated = true
+        pendingAction?.cancel()
+        pendingAction = nil
         tearDown()
         onCancel()
     }
@@ -139,7 +198,13 @@ final class AllInOneController: NSObject {
     /// GUI test hooks: the floating panel window (for glass snapshots) and a
     /// cancel path so the harness can close the surface without key events.
     var uiTestPanelWindow: NSWindow? { panelWindow }
+    var uiTestInitialRect: CGRect { initialRect }
+    var uiTestScreenFrame: CGRect { screen.frame }
     func uiTestCancel() { cancel() }
+
+    /// A newer capture intent owns the screen. Dismiss this interactive session
+    /// synchronously so its frozen overlay cannot leak into the replacement.
+    func dismissForReplacement() { cancel() }
 
     private func tearDown() {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
@@ -158,6 +223,7 @@ private final class AllInOneOverlayWindow: NSWindow {
 
     var onRectChanged: ((CGRect) -> Void)?
     var onCancel: (() -> Void)?
+    var onEditingFinished: (() -> Void)?
 
     private let overlayView: AllInOneOverlayView
 
@@ -178,6 +244,7 @@ private final class AllInOneOverlayWindow: NSWindow {
         isOpaque = hasFrozenBackdrop
         backgroundColor = hasFrozenBackdrop ? .black : .clear
         level = .screenSaver
+        sharingType = .none
         ignoresMouseEvents = false
         acceptsMouseMovedEvents = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -185,6 +252,7 @@ private final class AllInOneOverlayWindow: NSWindow {
         overlayView.frame = NSRect(origin: .zero, size: screen.frame.size)
         overlayView.onRectChanged = { [weak self] rect in self?.onRectChanged?(rect) }
         overlayView.onCancel = { [weak self] in self?.onCancel?() }
+        overlayView.onEditingFinished = { [weak self] in self?.onEditingFinished?() }
     }
 
     override var canBecomeKey: Bool { true }
@@ -198,7 +266,6 @@ private final class AllInOneOverlayWindow: NSWindow {
         overlayView.displayIfNeeded()
         orderFrontRegardless()
     }
-    func focusContent() { makeFirstResponder(overlayView) }
 }
 
 // MARK: - Overlay view (editable rect with handles)
@@ -208,6 +275,7 @@ private final class AllInOneOverlayView: NSView {
 
     var onRectChanged: ((CGRect) -> Void)?
     var onCancel: (() -> Void)?
+    var onEditingFinished: (() -> Void)?
 
     private(set) var selectionRect: CGRect
     private let frozenImage: CGImage?
@@ -415,6 +483,7 @@ private final class AllInOneOverlayView: NSView {
         dragMode = .none
         needsDisplay = true
         onRectChanged?(selectionRect)
+        onEditingFinished?()
     }
 
     override func keyDown(with event: NSEvent) {
@@ -425,34 +494,27 @@ private final class AllInOneOverlayView: NSView {
 // MARK: - Options panel
 
 @MainActor
-private final class AllInOnePanelWindow: NSWindow {
+final class AllInOnePanelWindow: NSPanel {
 
     private static let buttonWidth: CGFloat = 76
     private static let buttonHeight: CGFloat = 60
-    private static let spacing: CGFloat = 6
+    private static let intraGroupSpacing: CGFloat = 2
+    private static let groupGap: CGFloat = 18
     private static let inset: CGFloat = 10
     private static let gapBelowSelection: CGFloat = 14
 
     private let onPick: (AllInOneAction) -> Void
-
-    private struct Option {
-        let action: AllInOneAction
-        let title: String
-        let symbol: String
-    }
-
-    private let options: [Option] = [
-        Option(action: .capture, title: "Capture", symbol: "camera.viewfinder"),
-        Option(action: .record, title: "Record", symbol: "record.circle"),
-        Option(action: .window, title: "Window", symbol: "macwindow"),
-        Option(action: .fullscreen, title: "Fullscreen", symbol: "rectangle.on.rectangle"),
-        Option(action: .scrolling, title: "Scrolling", symbol: "scroll"),
-        Option(action: .ocr, title: "OCR", symbol: "text.viewfinder"),
-    ]
+    private let options = AllInOneAction.allCases
+    private(set) var optionButtons: [NSButton] = []
 
     init(onPick: @escaping (AllInOneAction) -> Void) {
         self.onPick = onPick
-        let width = Self.inset * 2 + CGFloat(6) * Self.buttonWidth + CGFloat(5) * Self.spacing
+        let boundaryCount = AllInOneAction.allCases.filter { $0.endsDockGroup }.count
+        let regularGapCount = AllInOneAction.allCases.count - 1 - boundaryCount
+        let width = Self.inset * 2
+            + CGFloat(AllInOneAction.allCases.count) * Self.buttonWidth
+            + CGFloat(regularGapCount) * Self.intraGroupSpacing
+            + CGFloat(boundaryCount) * Self.groupGap
         let height = Self.inset * 2 + Self.buttonHeight
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -463,12 +525,15 @@ private final class AllInOnePanelWindow: NSWindow {
         isOpaque = false
         backgroundColor = .clear
         level = .screenSaver + 1   // sits above the overlay
+        sharingType = .none
         hasShadow = true
+        becomesKeyOnlyIfNeeded = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         buildContent()
     }
 
-    override var canBecomeKey: Bool { false }
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
 
     private func buildContent() {
         let root = NSView(frame: NSRect(origin: .zero, size: frame.size))
@@ -481,31 +546,71 @@ private final class AllInOnePanelWindow: NSWindow {
         root.layer?.shadowOffset = CGSize(width: 0, height: -10)
         contentView = root
 
-        // Each option is its own glass shape grouped in one glass cluster, so on
-        // macOS 26 the six shapes merge into a single panel when it appears and the
-        // hovered shape lifts/morphs out of the group. The cluster (one merged
-        // glass system) is the single glass surface for this window. Inner radius
-        // is concentric with the dock: 18 outer, inset 10 -> 8. There is no backing
-        // under them (glass over glass is forbidden); on the pre-26 fallback each
-        // button carries its own blur and the cluster is a plain passthrough.
-        let buttonRadius = ChromeFactory.concentricRadius(outer: ChromeFactory.Radius.dock, inset: Self.inset)
-        let clusterContent = NSView(frame: root.bounds)
+        // The panel is one dock, not six competing cards. Individual actions stay
+        // transparent at rest; the single shell owns the glass/fallback treatment.
+        let dockContent = NSView(frame: root.bounds)
 
         var x = Self.inset
-        for option in options {
-            let button = AllInOneOptionButton(symbol: option.symbol, title: option.title)
-            button.onClick = { [weak self] in self?.onPick(option.action) }
-            let shape = ChromeFactory.make(content: button, cornerRadius: buttonRadius)
-            shape.frame = NSRect(x: x, y: Self.inset, width: Self.buttonWidth, height: Self.buttonHeight)
-            button.glassShape = shape
-            clusterContent.addSubview(shape)
-            x += Self.buttonWidth + Self.spacing
+        for (index, action) in options.enumerated() {
+            let button = AllInOneOptionButton(
+                action: action,
+                symbol: action.symbol,
+                isPrimary: action.isPrimary
+            )
+            button.onClick = { [weak self] in self?.onPick(action) }
+            button.frame = NSRect(x: x, y: Self.inset, width: Self.buttonWidth, height: Self.buttonHeight)
+            dockContent.addSubview(button)
+            optionButtons.append(button)
+
+            guard index < options.count - 1 else { continue }
+            if action.endsDockGroup {
+                let divider = NSView(frame: NSRect(
+                    x: x + Self.buttonWidth + (Self.groupGap - 1) / 2,
+                    y: 18,
+                    width: 1,
+                    height: frame.height - 36
+                ))
+                divider.wantsLayer = true
+                divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+                dockContent.addSubview(divider)
+            }
+            x += Self.buttonWidth + (action.endsDockGroup ? Self.groupGap : Self.intraGroupSpacing)
         }
 
-        let cluster = ChromeFactory.makeCluster(content: clusterContent, spacing: Self.spacing)
-        cluster.frame = root.bounds
-        cluster.autoresizingMask = [.width, .height]
-        root.addSubview(cluster)
+        let dock: NSView
+        if #available(macOS 26.0, *), !ChromeFactory.forceFallback {
+            dock = ChromeFactory.make(content: dockContent, cornerRadius: ChromeFactory.Radius.dock)
+        } else {
+            dock = Self.makeFallbackDock(content: dockContent)
+        }
+        dock.frame = root.bounds
+        dock.autoresizingMask = [.width, .height]
+        root.addSubview(dock)
+
+        connectKeyViewLoop()
+        initialFirstResponder = optionButtons.first
+    }
+
+    /// The panel floats over a separate full-screen selection window. A
+    /// behind-window visual effect can resolve to black in that arrangement, so
+    /// the fallback is one stable translucent shell rather than six fragile blurs.
+    private static func makeFallbackDock(content: NSView) -> NSView {
+        content.translatesAutoresizingMaskIntoConstraints = false
+        let dock = NSView()
+        dock.wantsLayer = true
+        dock.layer?.cornerRadius = ChromeFactory.Radius.dock
+        dock.layer?.cornerCurve = .continuous
+        dock.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        dock.layer?.borderWidth = 1
+        dock.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        dock.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: dock.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: dock.trailingAnchor),
+            content.topAnchor.constraint(equalTo: dock.topAnchor),
+            content.bottomAnchor.constraint(equalTo: dock.bottomAnchor),
+        ])
+        return dock
     }
 
     /// Anchors the panel under `localRect` (overlay-local coords) on `screen`,
@@ -513,6 +618,20 @@ private final class AllInOnePanelWindow: NSWindow {
     func showAnchored(below localRect: CGRect, on screen: NSScreen) {
         reanchor(below: localRect, on: screen)
         orderFrontRegardless()
+        focusFirstOption()
+    }
+
+    func focusFirstOption() {
+        guard let first = optionButtons.first else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(first)
+    }
+
+    func moveFocus(from button: NSButton, backwards: Bool) {
+        guard let currentIndex = optionButtons.firstIndex(where: { $0 === button }) else { return }
+        let offset = backwards ? optionButtons.count - 1 : 1
+        makeFirstResponder(optionButtons[(currentIndex + offset) % optionButtons.count])
     }
 
     func reanchor(below localRect: CGRect, on screen: NSScreen) {
@@ -539,38 +658,58 @@ private final class AllInOnePanelWindow: NSWindow {
         _ = globalRectMinX
         setFrameOrigin(NSPoint(x: x, y: y))
     }
+
+    private func connectKeyViewLoop() {
+        guard !optionButtons.isEmpty else { return }
+        for index in optionButtons.indices {
+            optionButtons[index].nextKeyView = optionButtons[(index + 1) % optionButtons.count]
+        }
+    }
 }
 
-/// One option as the content of a glass shape. The shape (its `glassShape`
-/// wrapper) is the visible glass; this view draws the icon + label and toggles
-/// the shape's accent tint to mark the moment's primary action on hover/press.
+/// One action inside the unified dock. It is a real `NSButton`, so AppKit gives
+/// it key-loop and VoiceOver activation semantics while the custom subviews keep
+/// the compact icon-over-label presentation used by the capture flow.
 @MainActor
-private final class AllInOneOptionButton: NSView {
+private final class AllInOneOptionButton: NSButton {
 
     var onClick: (() -> Void)?
-    /// The glass wrapper the controller hands back after `ChromeFactory.make`.
-    /// Hover/press tint it; on the fallback path tinting falls back to a wash.
-    weak var glassShape: NSView?
-
+    private let icon: NSImageView
+    private let label: NSTextField
+    private let isPrimary: Bool
     private var trackingArea: NSTrackingArea?
-    /// Pre-26 accent wash, lazily added on first hover (real glass tints itself).
-    private var fallbackWash: CALayer?
+    private var pointerIsInside = false
 
-    init(symbol: String, title: String) {
+    init(action: AllInOneAction, symbol: String, isPrimary: Bool) {
+        icon = NSImageView()
+        label = NSTextField(labelWithString: action.accessibilityLabel)
+        self.isPrimary = isPrimary
         super.init(frame: .zero)
-        translatesAutoresizingMaskIntoConstraints = false
+        // The dock positions its direct actions with explicit frames. Letting
+        // NSGlassEffectView derive constraints here collapses them to intrinsic
+        // label width and zero height after its first layout pass.
+        translatesAutoresizingMaskIntoConstraints = true
+        isBordered = false
+        title = ""
+        focusRingType = .exterior
+        wantsLayer = true
+        layer?.cornerRadius = ChromeFactory.Radius.control
+        layer?.cornerCurve = .continuous
+        target = self
+        self.action = #selector(activate)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityIdentifier(action.accessibilityIdentifier)
+        setAccessibilityLabel(action.accessibilityLabel)
+        toolTip = action.accessibilityLabel
 
         let iconConfig = NSImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
-        let icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?.withSymbolConfiguration(iconConfig)
-        icon.contentTintColor = KritColors.accent
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: action.accessibilityLabel)?.withSymbolConfiguration(iconConfig)
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.translatesAutoresizingMaskIntoConstraints = false
         addSubview(icon)
 
-        let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 10.5, weight: .semibold)
-        label.textColor = NSColor.white.withAlphaComponent(0.86)
         label.alignment = .center
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
@@ -584,6 +723,7 @@ private final class AllInOneOptionButton: NSView {
             label.trailingAnchor.constraint(equalTo: trailingAnchor),
             label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
         ])
+        applyInteraction(.idle)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -596,39 +736,119 @@ private final class AllInOneOptionButton: NSView {
         trackingArea = area
     }
 
-    override func mouseEntered(with event: NSEvent) { applyTint(KritColors.accent.withAlphaComponent(0.55), washAlpha: 0.16) }
-    override func mouseExited(with event: NSEvent) { applyTint(nil, washAlpha: 0) }
+    override func mouseEntered(with event: NSEvent) {
+        pointerIsInside = true
+        refreshInteraction()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerIsInside = false
+        refreshInteraction()
+    }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { refreshInteraction() }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted {
+            applyInteraction(pointerIsInside ? .hovered : .idle)
+        }
+        return accepted
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard isEnabled else { return false }
+        performClick(nil)
+        return true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 48: // Tab
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard modifiers.isEmpty || modifiers == .shift else { break }
+            if let panel = window as? AllInOnePanelWindow {
+                panel.moveFocus(from: self, backwards: modifiers.contains(.shift))
+                return
+            }
+        case 36, 49, 76: // Return, Space, keypad Enter
+            performClick(nil)
+            return
+        default:
+            break
+        }
+        super.keyDown(with: event)
+    }
 
     override func mouseDown(with event: NSEvent) {
-        applyTint(KritColors.accent, washAlpha: 0.30)
+        applyInteraction(.pressed)
         NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+        super.mouseDown(with: event)
+        refreshInteraction()
     }
 
-    override func mouseUp(with event: NSEvent) {
-        applyTint(nil, washAlpha: 0)
-        if bounds.contains(convert(event.locationInWindow, from: nil)) {
-            onClick?()
+    @objc private func activate() {
+        onClick?()
+    }
+
+    private enum Interaction {
+        case idle
+        case focused
+        case hovered
+        case pressed
+    }
+
+    private func refreshInteraction() {
+        if pointerIsInside {
+            applyInteraction(.hovered)
+        } else if window?.firstResponder === self {
+            applyInteraction(.focused)
+        } else {
+            applyInteraction(.idle)
         }
     }
 
-    /// Real glass takes the live tint; the pre-26 blur gets an accent wash over
-    /// the content so the hovered/pressed shape still reads as the primary action.
-    private func applyTint(_ tint: NSColor?, washAlpha: CGFloat) {
-        if #available(macOS 26.0, *), let glass = glassShape as? NSGlassEffectView {
-            glass.tintColor = tint
-            return
+    private func applyInteraction(_ interaction: Interaction) {
+        let washAlpha: CGFloat
+        let borderAlpha: CGFloat
+        let isPressed: Bool
+        switch interaction {
+        case .idle:
+            icon.contentTintColor = isPrimary ? KritColors.accent : NSColor.white.withAlphaComponent(0.82)
+            label.textColor = isPrimary ? KritColors.accent.withAlphaComponent(0.92) : NSColor.white.withAlphaComponent(0.80)
+            washAlpha = isPrimary ? 0.10 : 0
+            borderAlpha = isPrimary ? 0.16 : 0
+            isPressed = false
+        case .focused:
+            icon.contentTintColor = KritColors.accent
+            label.textColor = .white
+            washAlpha = 0.18
+            borderAlpha = 0.58
+            isPressed = false
+        case .hovered:
+            icon.contentTintColor = KritColors.accent
+            label.textColor = .white
+            washAlpha = 0.16
+            borderAlpha = 0
+            isPressed = false
+        case .pressed:
+            icon.contentTintColor = KritColors.accent
+            label.textColor = .white
+            washAlpha = 0.30
+            borderAlpha = 0.72
+            isPressed = true
         }
-        wantsLayer = true
-        if fallbackWash == nil {
-            let wash = CALayer()
-            wash.frame = bounds
-            wash.cornerCurve = .continuous
-            wash.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-            layer?.insertSublayer(wash, at: 0)
-            fallbackWash = wash
-        }
-        fallbackWash?.backgroundColor = (tint ?? .clear).withAlphaComponent(washAlpha).cgColor
+        layer?.backgroundColor = KritColors.accent.withAlphaComponent(washAlpha).cgColor
+        layer?.borderWidth = borderAlpha > 0 ? 1 : 0
+        layer?.borderColor = KritColors.accent.withAlphaComponent(borderAlpha).cgColor
+        layer?.transform = isPressed ? CATransform3DMakeScale(0.98, 0.98, 1) : CATransform3DIdentity
     }
 }

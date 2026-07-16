@@ -17,7 +17,7 @@ final class TextRegionDetector {
     /// One detected text line, in Vision's normalized image space (bottom-left
     /// origin, [0,1]). The canvas converts these into view rects at draw/drag
     /// time so the snapped highlight lands exactly over the writing.
-    struct TextLine {
+    struct TextLine: Sendable {
         /// Normalized bounding box, origin bottom-left, relative to the image.
         let normalizedBox: CGRect
         /// The recognized string for this line (top Vision candidate), used by
@@ -91,20 +91,20 @@ final class TextRegionDetector {
     }
 
     private static func recognizeLines(in cgImage: CGImage) async -> [TextLine] {
-        await withCheckedContinuation { continuation in
-            var didResume = false
+        // `VNImageRequestHandler.perform` is synchronous. Running it on the
+        // main actor stalled Smart Redact and highlighter preparation on large
+        // screenshots, so only the immutable Vision request moves to a worker.
+        return await VisionRequestExecutor.perform {
+            var recognized: [TextLine] = []
             let request = VNRecognizeTextRequest { request, error in
-                guard !didResume else { return }
-                didResume = true
-                if error != nil { continuation.resume(returning: []); return }
+                guard error == nil else { return }
                 let observations = request.results as? [VNRecognizedTextObservation] ?? []
-                let lines = observations.map {
+                recognized = observations.map {
                     TextLine(
                         normalizedBox: $0.boundingBox,
                         text: $0.topCandidates(1).first?.string ?? ""
                     )
                 }
-                continuation.resume(returning: lines)
             }
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
@@ -114,10 +114,9 @@ final class TextRegionDetector {
             do {
                 try handler.perform([request])
             } catch {
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume(returning: [])
+                return []
             }
+            return recognized
         }
     }
 }

@@ -10,118 +10,297 @@ final class RecordingResultWindow: NSWindow, NSWindowDelegate {
 
     private let url: URL
     private let durationSeconds: Double
+    private weak var anchorScreen: NSScreen?
     private weak var actions: RecordingResultActions?
+    private let posterImageView = NSImageView()
+    private var keyMonitor: Any?
+    private var thumbnailTask: Task<Void, Never>?
 
     /// Shows the result panel for a finished `url`. `actions` is the engine, which
     /// runs the GIF export / trim. `duration` bounds the trim range.
-    static func show(url: URL, duration: Double, actions: RecordingResultActions) {
+    static func show(
+        url: URL,
+        duration: Double,
+        actions: RecordingResultActions,
+        on screen: NSScreen? = nil
+    ) {
         current?.close()
-        let window = RecordingResultWindow(url: url, duration: duration, actions: actions)
+        let window = RecordingResultWindow(
+            url: url,
+            duration: duration,
+            actions: actions,
+            screen: screen
+        )
         current = window
         window.present()
     }
 
-    private init(url: URL, duration: Double, actions: RecordingResultActions) {
+    static func uiTestMake(
+        url: URL,
+        duration: Double,
+        actions: RecordingResultActions
+    ) -> RecordingResultWindow {
+        RecordingResultWindow(url: url, duration: duration, actions: actions, screen: nil)
+    }
+
+    private init(
+        url: URL,
+        duration: Double,
+        actions: RecordingResultActions,
+        screen: NSScreen?
+    ) {
         self.url = url
         self.durationSeconds = max(duration, 0)
         self.actions = actions
+        anchorScreen = screen
 
-        let width: CGFloat = 420
-        let height: CGFloat = 168
+        let layout = RecordingResultLayout()
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
-            styleMask: [.titled, .closable, .fullSizeContentView],
+            contentRect: layout.shell,
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
-        titleVisibility = .hidden
-        titlebarAppearsTransparent = true
         isReleasedWhenClosed = false
         isOpaque = false
         backgroundColor = .clear
         level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        sharingType = .none
         delegate = self
-        center()
-        buildContent(width: width, height: height)
+        // A borderless result panel is still a user-facing surface. It must keep
+        // the accessory app active when another persistent window closes.
+        NSApp.addActivationPersistentWindow(self)
+        buildContent(layout: layout)
+        installKeyMonitor()
+        loadThumbnail()
     }
 
-    private func buildContent(width: CGFloat, height: CGFloat) {
-        let background = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    override var canBecomeKey: Bool { true }
+
+    private func buildContent(layout: RecordingResultLayout) {
+        let background = RecordingResultContentView(frame: layout.shell)
         background.wantsLayer = true
+        background.layer?.cornerRadius = RecordingChrome.resultShellRadius
+        background.layer?.cornerCurve = .continuous
+        background.layer?.shadowColor = NSColor.black.cgColor
+        background.layer?.shadowOpacity = RecordingChrome.overlayShadow.opacity
+        background.layer?.shadowRadius = RecordingChrome.overlayShadow.radius
+        background.layer?.shadowOffset = RecordingChrome.overlayShadow.offset
         contentView = background
+        isMovableByWindowBackground = true
 
         let glass = ChromeFactory.backing(
-            frame: NSRect(x: 0, y: 0, width: width, height: height),
-            cornerRadius: ChromeFactory.Radius.panel
+            frame: layout.shell,
+            cornerRadius: RecordingChrome.resultShellRadius
         )
         background.addSubview(glass)
 
-        let iconWrap = NSView(frame: NSRect(x: 24, y: height - 76, width: 42, height: 42))
-        iconWrap.wantsLayer = true
-        iconWrap.layer?.cornerRadius = 13
-        iconWrap.layer?.cornerCurve = .continuous
-        iconWrap.layer?.backgroundColor = KritColors.accent.withAlphaComponent(0.12).cgColor
-        iconWrap.layer?.borderWidth = 1
-        iconWrap.layer?.borderColor = KritColors.accent.withAlphaComponent(0.28).cgColor
-        background.addSubview(iconWrap)
+        let contrastFloor = RecordingResultScrim(frame: layout.shell)
+        contrastFloor.wantsLayer = true
+        contrastFloor.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(RecordingChrome.effectiveContrastFloorAlpha * 0.78)
+            .cgColor
+        contrastFloor.layer?.cornerRadius = RecordingChrome.resultShellRadius
+        contrastFloor.layer?.cornerCurve = .continuous
+        background.addSubview(contrastFloor)
 
-        let icon = NSImageView(frame: NSRect(x: 9, y: 9, width: 24, height: 24))
-        icon.image = NSImage(systemSymbolName: "record.circle", accessibilityDescription: nil)
-        icon.contentTintColor = KritColors.accent
-        iconWrap.addSubview(icon)
+        let posterContainer = NSView(frame: layout.thumbnail)
+        posterContainer.identifier = NSUserInterfaceItemIdentifier("recording.result.thumbnail")
+        posterContainer.wantsLayer = true
+        posterContainer.layer?.cornerRadius = ChromeFactory.Radius.card
+        posterContainer.layer?.cornerCurve = .continuous
+        posterContainer.layer?.masksToBounds = true
+        posterContainer.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.24).cgColor
+        posterContainer.layer?.borderWidth = 1
+        posterContainer.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        background.addSubview(posterContainer)
+
+        posterImageView.frame = posterContainer.bounds.insetBy(dx: 4, dy: 4)
+        posterImageView.autoresizingMask = [.width, .height]
+        posterImageView.imageScaling = .scaleProportionallyUpOrDown
+        posterImageView.image = NSImage(systemSymbolName: "film", accessibilityDescription: "Recording preview")
+        posterImageView.contentTintColor = NSColor.white.withAlphaComponent(0.5)
+        posterContainer.addSubview(posterImageView)
+        addDurationBadge(to: posterContainer)
+
+        let metadata = NSView(frame: layout.metadata)
+        metadata.identifier = NSUserInterfaceItemIdentifier("recording.result.metadata")
+        metadata.setAccessibilityElement(true)
+        metadata.setAccessibilityRole(.group)
+        metadata.setAccessibilityLabel("Recording saved: \(url.lastPathComponent), \(formattedDuration)")
+        background.addSubview(metadata)
+
+        let divider = NSView(frame: NSRect(x: 0, y: 8, width: 1, height: 72))
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        metadata.addSubview(divider)
+
+        let check = NSImageView(frame: NSRect(x: 20, y: 54, width: 20, height: 20))
+        check.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 17, weight: .bold))
+        check.contentTintColor = KritColors.accent
+        metadata.addSubview(check)
 
         let titleLabel = NSTextField(labelWithString: "Recording saved")
-        titleLabel.font = .boldSystemFont(ofSize: 18)
-        titleLabel.frame = NSRect(x: 78, y: height - 62, width: width - 102, height: 24)
-        background.addSubview(titleLabel)
+        titleLabel.font = KritType.heading.nsFont
+        titleLabel.textColor = NSColor.white.withAlphaComponent(0.94)
+        titleLabel.frame = NSRect(x: 52, y: 54, width: 156, height: 22)
+        metadata.addSubview(titleLabel)
 
-        let detailLabel = NSTextField(labelWithString: url.lastPathComponent)
-        detailLabel.font = .systemFont(ofSize: 12)
-        detailLabel.textColor = .secondaryLabelColor
-        detailLabel.lineBreakMode = .byTruncatingMiddle
-        detailLabel.frame = NSRect(x: 78, y: height - 84, width: width - 102, height: 18)
-        background.addSubview(detailLabel)
+        let fileLabel = NSTextField(labelWithString: url.lastPathComponent)
+        fileLabel.font = KritType.caption.nsFont
+        fileLabel.textColor = NSColor.white.withAlphaComponent(0.62)
+        fileLabel.lineBreakMode = .byTruncatingMiddle
+        fileLabel.frame = NSRect(x: 20, y: 32, width: 180, height: 18)
+        metadata.addSubview(fileLabel)
 
-        let buttonY: CGFloat = 20
-        var x: CGFloat = 24
-        let gap: CGFloat = 8
+        let clock = NSImageView(frame: NSRect(x: 20, y: 12, width: 16, height: 16))
+        clock.image = NSImage(systemSymbolName: "clock", accessibilityDescription: nil)
+        clock.contentTintColor = NSColor.white.withAlphaComponent(0.52)
+        metadata.addSubview(clock)
 
-        let gifButton = NSButton(title: "Export GIF", target: self, action: #selector(exportGIFTapped))
-        gifButton.bezelStyle = .rounded
-        gifButton.frame = NSRect(x: x, y: buttonY, width: 100, height: 32)
-        background.addSubview(gifButton)
-        x += 100 + gap
+        let durationLabel = NSTextField(labelWithString: formattedDuration)
+        durationLabel.font = KritType.caption.nsFont
+        durationLabel.textColor = NSColor.white.withAlphaComponent(0.62)
+        durationLabel.frame = NSRect(x: 44, y: 11, width: 72, height: 18)
+        metadata.addSubview(durationLabel)
 
-        let trimButton = NSButton(title: "Trim\u{2026}", target: self, action: #selector(trimTapped))
-        trimButton.bezelStyle = .rounded
-        trimButton.frame = NSRect(x: x, y: buttonY, width: 70, height: 32)
-        background.addSubview(trimButton)
-        x += 70 + gap
-
-        let editButton = NSButton(title: "Edit\u{2026}", target: self, action: #selector(editTapped))
-        editButton.bezelStyle = .rounded
-        editButton.frame = NSRect(x: x, y: buttonY, width: 64, height: 32)
+        let editButton = RecordingChromeButton(
+            symbol: "pencil.and.outline",
+            title: "Edit Recording",
+            role: .primary,
+            presentation: .horizontal
+        )
+        editButton.identifier = NSUserInterfaceItemIdentifier("recording.result.edit")
+        editButton.frame = layout.editRecording
+        editButton.target = self
+        editButton.action = #selector(editTapped)
+        editButton.keyEquivalent = "\r"
         background.addSubview(editButton)
 
-        let revealButton = NSButton(title: "Reveal", target: self, action: #selector(revealTapped))
-        revealButton.bezelStyle = .rounded
-        revealButton.frame = NSRect(x: width - 188, y: buttonY, width: 80, height: 32)
+        let revealButton = RecordingChromeButton(
+            symbol: "folder",
+            title: "Reveal",
+            role: .neutral,
+            presentation: .horizontal
+        )
+        revealButton.identifier = NSUserInterfaceItemIdentifier("recording.result.reveal")
+        revealButton.frame = layout.reveal
+        revealButton.target = self
+        revealButton.action = #selector(revealTapped)
         background.addSubview(revealButton)
 
-        let doneButton = NSButton(title: "Done", target: self, action: #selector(doneTapped))
-        doneButton.bezelStyle = .rounded
-        doneButton.keyEquivalent = "\r"
-        // Primary action of this window: pin the default-button bezel to the brand
-        // coral so the chrome stays on one accent (QRCodeResultWindow pattern).
-        doneButton.bezelColor = KritColors.accent
-        doneButton.frame = NSRect(x: width - 100, y: buttonY, width: 76, height: 32)
-        background.addSubview(doneButton)
+        let overflowButton = RecordingChromeButton(
+            symbol: "ellipsis",
+            title: "More",
+            role: .neutral,
+            presentation: .glyph
+        )
+        overflowButton.identifier = NSUserInterfaceItemIdentifier("recording.result.overflow")
+        overflowButton.setAccessibilityLabel("More recording actions")
+        overflowButton.frame = layout.overflow
+        overflowButton.target = self
+        overflowButton.action = #selector(overflowTapped(_:))
+        background.addSubview(overflowButton)
+    }
+
+    private var formattedDuration: String {
+        let seconds = Int(durationSeconds.rounded())
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private func addDurationBadge(to poster: NSView) {
+        let label = NSTextField(labelWithString: formattedDuration)
+        label.font = KritType.caption.nsFont
+        label.textColor = .white
+        label.alignment = .center
+        label.wantsLayer = true
+        label.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.68).cgColor
+        label.layer?.cornerRadius = ChromeFactory.Radius.pill
+        label.layer?.cornerCurve = .continuous
+        label.frame = NSRect(x: poster.bounds.width - 58, y: 8, width: 48, height: 22)
+        poster.addSubview(label)
+    }
+
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.isVisible else { return event }
+            if event.keyCode == 53 {
+                self.close()
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func loadThumbnail() {
+        let url = url
+        thumbnailTask = Task { [weak self] in
+            let image = await RecordingThumbnailProvider.thumbnail(for: url)
+            guard !Task.isCancelled, let self else { return }
+            posterImageView.contentTintColor = nil
+            posterImageView.image = image
+        }
     }
 
     private func present() {
+        positionAtAnchor()
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
-        makeKeyAndOrderFront(nil)
+        let transition = RecordingMotionPolicy.entrance(
+            for: .result,
+            trigger: .stateTransition,
+            reduceMotion: Motion.reduced
+        )
+        switch transition {
+        case .instant:
+            alphaValue = 1
+            makeKeyAndOrderFront(nil)
+        case .fade(let duration):
+            alphaValue = 0
+            makeKeyAndOrderFront(nil)
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = duration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().alphaValue = 1
+            }
+        case .fadeAndScale(let duration, let initialScale):
+            alphaValue = 0
+            makeKeyAndOrderFront(nil)
+            if let layer = contentView?.layer {
+                let scale = CABasicAnimation(keyPath: "transform.scale")
+                scale.fromValue = initialScale
+                scale.toValue = 1
+                scale.duration = duration
+                scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(scale, forKey: "recordingResultEntranceScale")
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = duration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().alphaValue = 1
+            }
+        }
+    }
+
+    private func positionAtAnchor() {
+        guard let screen = anchorScreen ?? NSScreen.main ?? NSScreen.screens.first else {
+            center()
+            return
+        }
+        let visible = screen.visibleFrame
+        let scale = screen.backingScaleFactor
+        let origin = NSPoint(
+            x: visible.midX - frame.width / 2,
+            y: visible.maxY - frame.height - 18
+        )
+        setFrameOrigin(
+            NSPoint(
+                x: (origin.x * scale).rounded() / scale,
+                y: (origin.y * scale).rounded() / scale
+            )
+        )
     }
 
     @objc private func exportGIFTapped() {
@@ -147,12 +326,65 @@ final class RecordingResultWindow: NSWindow, NSWindowDelegate {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    @objc private func overflowTapped(_ sender: NSButton) {
+        let menu = NSMenu()
+
+        let exportGIF = NSMenuItem(
+            title: "Export GIF",
+            action: #selector(exportGIFTapped),
+            keyEquivalent: ""
+        )
+        exportGIF.image = NSImage(systemSymbolName: "photo.on.rectangle", accessibilityDescription: nil)
+        exportGIF.target = self
+        menu.addItem(exportGIF)
+
+        let trim = NSMenuItem(title: "Trim", action: #selector(trimTapped), keyEquivalent: "")
+        trim.image = NSImage(systemSymbolName: "scissors", accessibilityDescription: nil)
+        trim.target = self
+        menu.addItem(trim)
+
+        menu.addItem(.separator())
+        let copyPath = NSMenuItem(
+            title: "Copy Path",
+            action: #selector(copyPathTapped),
+            keyEquivalent: ""
+        )
+        copyPath.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+        copyPath.target = self
+        menu.addItem(copyPath)
+
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+    }
+
+    @objc private func copyPathTapped() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.path, forType: .string)
+    }
+
     @objc private func doneTapped() {
         close()
     }
 
     func windowWillClose(_ notification: Notification) {
+        NSApp.removeActivationPersistentWindow(self)
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
         if Self.current === self { Self.current = nil }
         NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded(excluding: self)
     }
+}
+
+@MainActor
+private final class RecordingResultContentView: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { true }
+}
+
+@MainActor
+private final class RecordingResultScrim: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }

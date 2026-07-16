@@ -59,22 +59,22 @@ final class HotkeyManager {
             guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
             self.dropOverlays()
             AreaSelectionDiag.mark("hotkeyFired")
-            Task { await e.startAreaCapture(historyManager: h) }
+            e.enqueueInteractiveRequest { await e.startAreaCapture(historyManager: h) }
         }
         KeyboardShortcuts.onKeyDown(for: .captureWindow) { [weak self] in
             guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
             self.dropOverlays()
-            Task { await e.startWindowCapture(historyManager: h) }
+            e.enqueueInteractiveRequest { await e.startWindowCapture(historyManager: h) }
         }
         KeyboardShortcuts.onKeyDown(for: .captureFullscreen) { [weak self] in
             guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
             self.dropOverlays()
-            Task { await e.captureFullscreen(historyManager: h) }
+            e.enqueueInteractiveRequest { await e.captureFullscreen(historyManager: h) }
         }
         KeyboardShortcuts.onKeyDown(for: .capturePreviousArea) { [weak self] in
             guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
             self.dropOverlays()
-            Task { await e.capturePreviousArea(historyManager: h) }
+            e.enqueueInteractiveRequest { await e.capturePreviousArea(historyManager: h) }
         }
     }
 
@@ -85,17 +85,17 @@ final class HotkeyManager {
         KeyboardShortcuts.onKeyDown(for: .allInOne) { [weak self] in
             guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
             self.dropOverlays()
-            Task { await e.startAllInOne(historyManager: h) }
+            e.enqueueInteractiveRequest { await e.startAllInOne(historyManager: h) }
         }
         KeyboardShortcuts.onKeyDown(for: .snapAndPaste) { [weak self] in
             guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
             self.dropOverlays()
-            Task { await e.startSnapAndPaste(historyManager: h) }
+            e.enqueueInteractiveRequest { await e.startSnapAndPaste(historyManager: h) }
         }
         KeyboardShortcuts.onKeyDown(for: .scrollingCapture) { [weak self] in
             guard let self, let e = self.captureEngine, let h = self.historyManager else { return }
             self.dropOverlays()
-            Task { await e.startScrollingCapture(historyManager: h) }
+            e.enqueueInteractiveRequest { await e.startScrollingCapture(historyManager: h) }
         }
     }
 
@@ -110,18 +110,18 @@ final class HotkeyManager {
                 e.stopRecording()
             } else {
                 self.dropOverlays()
-                Task { await e.startAreaRecording() }
+                e.enqueueInteractiveRequest { await e.startAreaRecording() }
             }
         }
         KeyboardShortcuts.onKeyDown(for: .ocrCapture) { [weak self] in
             guard let self, let e = self.captureEngine else { return }
             self.dropOverlays()
-            Task { await e.startOCRCapture() }
+            e.enqueueInteractiveRequest { await e.startOCRCapture() }
         }
         KeyboardShortcuts.onKeyDown(for: .pickColor) { [weak self] in
             guard let self, let e = self.captureEngine else { return }
             self.dropOverlays()
-            Task { await e.startColorPick() }
+            e.enqueueInteractiveRequest { await e.startColorPick() }
         }
     }
 

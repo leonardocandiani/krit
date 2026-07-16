@@ -140,6 +140,9 @@ final class LiveAnnotationController {
         } else if clearing {
             persistedObjects = []
         }
+        if let overlayWindow {
+            NSApp.removeActivationPersistentWindow(overlayWindow)
+        }
         releaseKey()
         overlayWindow?.orderOut(nil)
         overlayWindow = nil
@@ -147,6 +150,7 @@ final class LiveAnnotationController {
         toolbarWindow = nil
         anchorScreen = nil
         mode = .off
+        NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded()
     }
 
     // MARK: - Engage / transitions
@@ -174,8 +178,12 @@ final class LiveAnnotationController {
         // Passive is a chrome-free viewing state (spec: "toolbar hides"); the
         // ink stays, the controls go.
         toolbarWindow?.orderOut(nil)
-        releaseKey()
         mode = .passive
+        if let overlayWindow {
+            NSApp.removeActivationPersistentWindow(overlayWindow)
+        }
+        releaseKey()
+        NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded()
     }
 
     private func enterDrawing() {
@@ -196,6 +204,9 @@ final class LiveAnnotationController {
 
     private func grabKeyAndMouse() {
         overlayWindow?.ignoresMouseEvents = false
+        if let overlayWindow {
+            NSApp.addActivationPersistentWindow(overlayWindow)
+        }
         grabKey()
         overlayWindow?.makeKeyAndOrderFront(nil)
         if let view = overlayWindow?.surfaceView {

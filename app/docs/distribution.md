@@ -1,31 +1,34 @@
 # KRIT — Distribuição e Release
 
-Cobre o ciclo completo: build local, DMG, notarização, Homebrew, CI, e o plano
-de auto-update (Sparkle — G3, ainda não implementado).
+Cobre o ciclo completo: build local, DMG, notarização, Homebrew, CI de build e
+auto-update via Sparkle.
 
 ---
 
-## 1. Versionamento
+## 1. Versionamento e release pública
 
-Antes de cada release:
+O fluxo oficial é `scripts/release/release.sh`. Ele recebe a versão semver,
+altera `CFBundleShortVersionString`, gera um build stamp para
+`CFBundleVersion`, atualiza `WhatsNew.md`, changelog, appcast e cask, cria a tag
+e só então publica o GitHub Release.
 
-1. Edite `Info.plist`:
-   - `CFBundleShortVersionString` — versão pública (ex: `0.15.5`)
-   - `CFBundleVersion` — build number incremental (ex: `24`)
-2. Commite a mudança na `main`.
-3. Crie e empurre a tag:
-   ```bash
-   git tag v0.15.5
-   git push origin v0.15.5
-   ```
-   O push da tag dispara o workflow de CI automaticamente.
+```bash
+scripts/release/release.sh 0.29.0 notas-0.29.0.md
+```
+
+O script exige árvore limpa, `main` sincronizada, testes verdes, chave EdDSA do
+Sparkle, certificado `Developer ID Application`, credenciais de notarização e
+DMG com ticket stapled. Ele recusa assinatura ad-hoc para qualquer release
+pública e monta o bundle de release em `/tmp`, sem substituir o KRIT já
+instalado em `/Applications`.
 
 ---
 
 ## 2. Cadeia de release local (manual)
 
-Quatro comandos na ordem correta. Cada script lê `.env.local` automaticamente
-se o arquivo existir (copie `.env.example` e preencha).
+Os comandos abaixo servem para desenvolvimento e RC local. Cada script lê
+`.env.local` automaticamente se o arquivo existir (copie `.env.example` e
+preencha). Eles não substituem `scripts/release/release.sh` para publicação.
 
 ```bash
 # 1. Compila e instala em /Applications/KRIT.app
@@ -34,19 +37,19 @@ bash build-app.sh
 # 2. Gera KRIT-v<versão>-macOS.dmg no diretório raiz do projeto
 bash make-dmg.sh
 
-# 3. (Opcional) Notariza, staple e valida — requer Developer ID
+# 3. Notariza, staple e valida para distribuição externa
 bash notarize-dmg.sh ./KRIT-v0.15.5-macOS.dmg
-
-# 4. Faça upload do DMG para o release no GitHub
-#    (o CI faz isso automaticamente via softprops/action-gh-release)
 ```
+
+Use essa cadeia para depuração e inspeção. A publicação é feita somente pelo
+script oficial, depois de todos os gates acima.
 
 ### Variáveis de ambiente lidas por cada script
 
 | Variável | Script(s) | Valor padrão | Descrição |
 |---|---|---|---|
 | `KRIT_CODESIGN_IDENTITY` | build-app.sh, make-dmg.sh | `-` (ad-hoc) | Identidade de assinatura do codesign |
-| `KRIT_CODESIGN_TIMESTAMP` | build-app.sh | `auto` | Modo de timestamp do codesign |
+| `KRIT_DISABLE_SWIFTPM_SANDBOX` | build-app.sh | `0` | Use `1` apenas dentro de outra sandbox que impeça o SwiftPM de criar a própria |
 | `KRIT_APP_PATH` | make-dmg.sh | `/Applications/KRIT.app` | Caminho do bundle já compilado |
 | `KRIT_NOTARY_PROFILE` | notarize-dmg.sh | — | Nome do perfil no Keychain |
 | `KRIT_DMG_PATH` | notarize-dmg.sh | — | Caminho do DMG (alternativa ao arg posicional) |
@@ -77,7 +80,7 @@ Necessário para distribuição pública sem prompt do Gatekeeper. O caminho com
    KRIT_CODESIGN_IDENTITY="Developer ID Application: Seu Nome (TEAMID)"
    KRIT_NOTARY_PROFILE="KritNotaryProfile"
    ```
-4. Execute os três scripts na ordem acima.
+4. Execute `scripts/release/release.sh <versão> <notas>` para a publicação.
 
 ### Por que o staple importa
 
@@ -94,46 +97,20 @@ apenas com conexão à internet ativa.
 
 ---
 
-## 4. CI — `.github/workflows/release.yml`
+## 4. CI de build
 
-Dispara em qualquer push de tag `v*`. Job único em `macos-14` (Apple Silicon).
+O repositório possui somente `.github/workflows/build-check.yml`. Ele roda em
+pull requests relevantes e em disparo manual, compila o app universal e confere
+as fatias `arm64` e `x86_64` dos binários entregues.
 
-### Segredos que o workflow usa
-
-Configure em Settings → Secrets → Actions do repositório:
-
-| Segredo | Quando necessário | Descrição |
-|---|---|---|
-| `DEVELOPER_ID_CERT_P12` | Assinatura com Developer ID | Certificado em base64 (`base64 -i cert.p12`) |
-| `DEVELOPER_ID_CERT_PASSWORD` | Assinatura com Developer ID | Senha do arquivo .p12 |
-| `KEYCHAIN_PASSWORD` | Assinatura com Developer ID | Senha para o keychain temporário do runner |
-| `NOTARY_APPLE_ID` | Notarização | Apple ID da conta de desenvolvedor |
-| `NOTARY_PASSWORD` | Notarização | Senha específica de app (nunca a senha principal) |
-| `NOTARY_TEAM_ID` | Notarização | Team ID da conta Apple Developer |
-
-**Quando nenhum segredo está configurado**, o workflow ainda funciona: compila
-com ad-hoc, gera o DMG e publica o artefato no release — apenas sem notarização.
-
-### Diferença entre local e CI para notarização
-
-- **Local**: `notarize-dmg.sh` usa `--keychain-profile` (perfil armazenado interativamente).
-- **CI**: O workflow armazena o perfil de forma não interativa antes de chamar o script:
-  ```bash
-  xcrun notarytool store-credentials "KritNotaryProfile" \
-    --apple-id "$NOTARY_APPLE_ID" \
-    --password "$NOTARY_PASSWORD" \
-    --team-id "$NOTARY_TEAM_ID"
-  ```
-  Depois chama `notarize-dmg.sh` normalmente — o mesmo script serve para ambos os cenários.
-
-### Artefato produzido
-
-O CI imprime o sha256 do DMG no resumo do job. Copie esse valor para
-`Casks/krit.rb` (campo `sha256`) antes de publicar o tap.
+Não existe workflow de publicação. O release público roda na máquina do
+maintainer pelo script oficial, porque ele depende do certificado Developer ID,
+do perfil de notarização e da chave privada EdDSA do Sparkle. Não configure um
+workflow que publique artefato ad-hoc como substituto desse fluxo.
 
 ---
 
-## 5. Homebrew — `Casks/krit.rb`
+## 5. Homebrew: `Casks/krit.rb`
 
 ### Publicando o tap
 
@@ -153,82 +130,32 @@ O nome do artefato deve ser **idêntico** em três lugares:
 |---|---|
 | `make-dmg.sh` (variável `DMG_NAME`) | `KRIT-v$VERSION-macOS` |
 | `Casks/krit.rb` (campo `url`) | `KRIT-v#{version}-macOS.dmg` |
-| CI upload (`release.yml`, campo `files`) | `KRIT-v*-macOS.dmg` (glob) |
+| `scripts/release/release.sh` | `KRIT-v$VERSION-macOS.dmg` |
 
 Qualquer divergência faz o `brew install` baixar uma URL 404.
 
 ### sha256
 
-Após cada release:
-1. Copie o sha256 do resumo do job de CI.
-2. Atualize `sha256` em `Casks/krit.rb`.
-3. Commite e empurre no repositório do tap.
+O script oficial calcula o SHA-256 do DMG notarizado e atualiza
+`Casks/krit.rb` no commit de release. O tap externo, se usado, deve receber a
+mesma alteração depois que a tag e o asset público existirem.
 
 ### Nota sobre Gatekeeper
 
-O cask funciona sem prompt apenas com DMG notarizada. Antes de G1 estar em
-produção, usuários que instalarem via tap receberão o aviso "desenvolvedor
-não identificado" e precisarão contorná-lo manualmente.
+O cask e `install.sh` preservam o atributo de quarantine para que o Gatekeeper
+valide a assinatura e o ticket stapled. Por isso, distribuição pública só pode
+apontar para um DMG notarizado.
 
 ---
 
-## 6. G3 — Sparkle auto-update (TODO, não implementado)
+## 6. Sparkle auto-update
 
-> **Não adicione esta dependência agora.** A adição do Sparkle ao `Package.swift`
-> afeta o build SPM de todos os clusters. Implemente apenas quando o ciclo de
-> parity estiver estável.
+Sparkle já está integrado no pacote, no `Info.plist`, no menu de atualizações e
+no appcast. A chave pública EdDSA fica no bundle; a chave privada permanece no
+Keychain do maintainer.
 
-### Plano de implementação
-
-**Dependência SPM** (adicionar em `Package.swift` quando G3 for implementado):
-
-```swift
-.package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
-// adicionar "Sparkle" ao target de dependências do app
-```
-
-**Wiring em AppDelegate** (`Sources/Krit/App/AppDelegate.swift`):
-
-```swift
-import Sparkle
-
-// Propriedade no AppDelegate:
-private let updaterController = SPUStandardUpdaterController(
-    startingUpdater: true,
-    updaterDelegate: nil,
-    userDriverDelegate: nil
-)
-
-// Item de menu "Verificar atualizações…":
-@IBAction func checkForUpdates(_ sender: Any) {
-    updaterController.checkForUpdates(sender)
-}
-```
-
-**Chaves em `Info.plist`** (adicionar quando G3 for implementado):
-
-| Chave | Valor exemplo | Descrição |
-|---|---|---|
-| `SUFeedURL` | `https://leonardocandiani.github.io/krit/appcast.xml` | URL do appcast |
-| `SUPublicEDKey` | `<chave pública EdDSA>` | Verificação de assinatura das atualizações |
-| `SUEnableAutomaticChecks` | `YES` | Checagem automática na inicialização |
-
-**Chaves em `Settings.swift`** (scaffold a adicionar junto com G3):
-
-```swift
-// Padrão enum de Settings.swift já existente no projeto:
-case automaticallyChecksForUpdates  // Bool, default true
-case lastUpdateCheckDate             // Date?, default nil
-```
-
-**CI — appcast.xml** (adicionar ao `release.yml` quando G3 for implementado):
-
-```bash
-# Gera e assina o appcast após cada release
-generate_appcast --ed-key-file sparkle_private_key .
-# Publica appcast.xml no GitHub Pages ou junto ao release
-```
-
-O Sparkle verifica a assinatura EdDSA de cada delta/full package antes de
-instalar — a chave privada fica apenas em `.env.local` (nunca no repositório)
-e a chave pública entra no `Info.plist`.
+Em cada release, `scripts/release/release.sh` assina o DMG com `sign_update`,
+atualiza `appcast.xml` com versão, build stamp, tamanho, URL e assinatura, e só
+envia o appcast para `main` depois que o asset da GitHub Release está público.
+Essa ordem impede que o app anuncie uma atualização cujo download ainda não
+existe.

@@ -12,8 +12,32 @@ import AppKit
 // Standalone component. The host embeds it and wires `onChange`.
 final class BackgroundSidebar: NSView {
 
+    struct BlurSelectionRequestGate {
+        typealias Token = UInt
+
+        private var generation: UInt = 0
+
+        mutating func begin() -> Token {
+            generation &+= 1
+            return generation
+        }
+
+        mutating func externalOptionsAssigned() {
+            generation &+= 1
+        }
+
+        mutating func commitIntent() {
+            generation &+= 1
+        }
+
+        func accepts(_ token: Token) -> Bool {
+            token == generation
+        }
+    }
+
     var options: ScreenshotBackgroundOptions {
         didSet {
+            blurSelectionRequestGate.externalOptionsAssigned()
             guard options != oldValue else { return }
             syncControls()
         }
@@ -22,6 +46,32 @@ final class BackgroundSidebar: NSView {
     var onChange: ((ScreenshotBackgroundOptions) -> Void)?
 
     static let preferredWidth: CGFloat = 264
+
+    /// Only the never-touched editor state gets a branded seed in the blur grid.
+    /// Any user choice, including a same-palette enabled gradient, owns its source.
+    static func shouldSeedDefaultBlurWallpaper(for options: ScreenshotBackgroundOptions) -> Bool {
+        options == .editorDefault
+    }
+
+    static func blurSelectionOptions(
+        from options: ScreenshotBackgroundOptions,
+        level: CGFloat,
+        defaultWallpaperData: Data?
+    ) -> ScreenshotBackgroundOptions {
+        var selected = options
+        if shouldSeedDefaultBlurWallpaper(for: options),
+           let defaultWallpaperData,
+           NSImage(data: defaultWallpaperData) != nil {
+            selected.presetName = SystemWallpaperSource.defaultBlurWallpaperName
+            selected.customImageName = SystemWallpaperSource.defaultBlurWallpaperName
+            selected.customImageData = defaultWallpaperData
+            selected.tracksDesktopWallpaper = nil
+        }
+        selected.isEnabled = true
+        selected.style = .blurredImage
+        selected.blurIntensity = level
+        return selected
+    }
 
     // MARK: Style tokens
 
@@ -82,6 +132,7 @@ final class BackgroundSidebar: NSView {
     // background at light/medium/strong gaussian levels.
     private let blurLevels: [CGFloat] = [10, 22, 40]
     private var blurPreviewCache: [String: NSImage] = [:]
+    private var blurSelectionRequestGate = BlurSelectionRequestGate()
     /// Identity of the background the blur tiles currently preview; when it
     /// changes the three thumbs re-render.
     private var lastBlurIdentity: String?
@@ -1026,11 +1077,7 @@ final class BackgroundSidebar: NSView {
     /// became the three Blurred thumbs, so a performClick on the invisible
     /// button applies the medium level, same effect as clicking thumb #1.
     @objc private func blurToggled(_ sender: NSButton) {
-        var next = options
-        next.isEnabled = true
-        next.style = .blurredImage
-        next.blurIntensity = blurLevels[1]
-        commit(next)
+        selectBlur(level: blurLevels[1])
     }
 
     /// Clicking a Blurred thumb keeps the current image/gradient source and
@@ -1039,11 +1086,25 @@ final class BackgroundSidebar: NSView {
     /// which set the style back to .image/.gradient.
     @objc private func selectBlurLevel(_ sender: NSControl) {
         let level = blurLevels[min(sender.tag, blurLevels.count - 1)]
-        var next = options
-        next.isEnabled = true
-        next.style = .blurredImage
-        next.blurIntensity = level
-        commit(next)
+        selectBlur(level: level)
+    }
+
+    private func selectBlur(level: CGFloat) {
+        let requestToken = blurSelectionRequestGate.begin()
+        let snapshot = options
+        guard Self.shouldSeedDefaultBlurWallpaper(for: snapshot) else {
+            commit(Self.blurSelectionOptions(from: snapshot, level: level, defaultWallpaperData: nil))
+            return
+        }
+
+        let identity = Self.blurPreviewIdentity(for: snapshot)
+        SystemWallpaperSource.defaultBlurBackgroundData { [weak self] data in
+            guard let self,
+                  self.blurSelectionRequestGate.accepts(requestToken),
+                  self.options == snapshot,
+                  Self.blurPreviewIdentity(for: self.options) == identity else { return }
+            self.commit(Self.blurSelectionOptions(from: snapshot, level: level, defaultWallpaperData: data))
+        }
     }
 
     @objc private func importWallpapersTapped() {
@@ -1140,6 +1201,7 @@ final class BackgroundSidebar: NSView {
     }
 
     private func commit(_ next: ScreenshotBackgroundOptions) {
+        blurSelectionRequestGate.commitIntent()
         guard next != options else { return }
         options = next
         onChange?(next)
@@ -1332,18 +1394,25 @@ final class BackgroundSidebar: NSView {
     /// Identity of the blur tiles' SOURCE background. Switching between a sharp
     /// background and its own blurred version keeps the same identity (the tiles
     /// preview the same source), so only a genuine background change re-renders.
-    private func blurIdentity(for opts: ScreenshotBackgroundOptions) -> String {
+    static func blurPreviewIdentity(for opts: ScreenshotBackgroundOptions) -> String {
+        let sourceMode = shouldSeedDefaultBlurWallpaper(for: opts) ? "seed-default" : "selected"
         let style = opts.style == .blurredImage ? ScreenshotBackgroundOptions.Style.image.rawValue : opts.style.rawValue
-        let custom = opts.customImageName ?? (opts.customImageData.map { "data-\($0.count)" } ?? "none")
-        return [style, opts.presetName, opts.colorHex, opts.gradientStartHex, opts.gradientEndHex, custom]
-            .joined(separator: "|")
+        let customName = opts.customImageName ?? "none"
+        let customData = opts.customImageData.map { "\($0.count)-\($0.hashValue)" } ?? "none"
+        let accents = opts.accentHexes.joined(separator: ",")
+        let desktopTracking = opts.tracksDesktopWallpaper.map { $0 ? "tracking" : "fixed" } ?? "unspecified"
+        return [
+            sourceMode, style, opts.presetName, opts.colorHex,
+            opts.gradientStartHex, opts.gradientEndHex, accents,
+            customName, customData, desktopTracking,
+        ].joined(separator: "|")
     }
 
     /// Re-renders the three Blurred tiles when the selected background changes.
     /// Renders are cached per (background identity, level); wallpaper data
     /// decodes off the main thread, same pattern as the wallpaper grid.
     private func refreshBlurPreviewsIfNeeded() {
-        let identity = blurIdentity(for: options)
+        let identity = Self.blurPreviewIdentity(for: options)
         guard identity != lastBlurIdentity else { return }
         lastBlurIdentity = identity
         // Unbounded growth guard: identities embed wallpaper names, so a long
@@ -1352,6 +1421,26 @@ final class BackgroundSidebar: NSView {
 
         let snapshot = options
         let size = NSSize(width: Style.thumbSize, height: Style.thumbSize)
+        if Self.shouldSeedDefaultBlurWallpaper(for: snapshot) {
+            SystemWallpaperSource.defaultBlurBackgroundData(maxPixel: Style.thumbSize * 6) { [weak self] data in
+                guard let self, self.lastBlurIdentity == identity else { return }
+                var previewSnapshot = snapshot
+                if let data, NSImage(data: data) != nil {
+                    previewSnapshot.style = .image
+                    previewSnapshot.presetName = SystemWallpaperSource.defaultBlurWallpaperName
+                    previewSnapshot.customImageData = data
+                    previewSnapshot.customImageName = SystemWallpaperSource.defaultBlurWallpaperName
+                    previewSnapshot.tracksDesktopWallpaper = nil
+                }
+                self.renderBlurPreviews(snapshot: previewSnapshot, identity: identity, size: size)
+            }
+            return
+        }
+
+        renderBlurPreviews(snapshot: snapshot, identity: identity, size: size)
+    }
+
+    private func renderBlurPreviews(snapshot: ScreenshotBackgroundOptions, identity: String, size: NSSize) {
         for button in thumbnailButtons where button.action == #selector(selectBlurLevel(_:)) {
             guard let level = blurLevels[safe: button.tag] else { continue }
             let key = "\(identity)|\(level)"

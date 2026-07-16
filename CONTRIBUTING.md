@@ -1,60 +1,68 @@
 # Contributing to KRIT
 
-Thanks for looking. KRIT is early and the surface area is small, so a good PR
-goes a long way.
+KRIT is a native macOS application written in Swift. It uses SwiftPM and AppKit,
+with ScreenCaptureKit for capture and recording. The shipped app has no Tauri,
+Rust, React or TypeScript layer.
 
-## The one rule
+## Ground rules
 
-**Original code and assets only.** KRIT reimplements features that other tools
-have — that's fair game. Copying code, icons, sounds, or branding from CleanShot
-X, Cap, or anything else is not. Respect the licenses of dependencies you add.
+Submit original code and assets, and respect the licenses of every dependency.
+Keep product-facing text and identifiers in English. Comments may follow the
+language already used in their surrounding file.
 
 ## Layout
 
 ```
-apps/
-  helper/      Swift agent — hotkeys, freeze, overlay, capture (the hot path)
-  shell/       Tauri 2 + React — Konva editor, tray, export
-packages/
-  tokens/      Style Dictionary — one JSON -> CSS vars + Swift
-  sounds/      procedural sound generator (Python stdlib)
-assets/        brand marks, sound pack
-docs/          architecture notes, screenshots
+app/
+  Sources/Krit/       AppKit app modules, resources and shared UI
+  Sources/KritApp/    KRIT.app executable entry point
+  Sources/KritCLI/    Bundled CLI and MCP entry point
+  Tests/KritKitTests/ SwiftPM regression tests
+  build-app.sh        Bundle assembly and local installation
+docs/                 Architecture and project decisions
+scripts/              Release and packaging helpers
 ```
 
-See [docs/architecture.md](docs/architecture.md) for why it's split this way.
+See [docs/architecture.md](docs/architecture.md) before changing a cross-cutting
+flow such as capture, automation, recording or activation policy.
 
 ## Setup
 
-You need Xcode 15+, Rust, and [Bun](https://bun.sh).
+Use a full Xcode installation with the macOS SDK required by the current
+release. The project does not need Bun, Cargo or a separate web development
+server.
 
-```sh
-# tokens
-cd packages/tokens && bun install && bun run build && cd -
+```bash
+git clone https://github.com/leonardocandiani/krit.git
+cd krit/app
 
-# helper (debug is fine for development)
-cd apps/helper
-swift build --build-path /tmp/krit-build
-./scripts/make-app.sh /tmp/krit-build
-cd -
+# Fast source and test verification. Keep this flag: the index store is large.
+swift build --disable-index-store
+swift test --disable-index-store
 
-# app — dev mode with hot reload
-cd apps/shell && bun install && bun run tauri dev
+# Assemble and install a host architecture app for runtime verification.
+KRIT_ARCHS="" ./build-app.sh
 ```
 
-The editor also runs in a plain browser (`bun run dev`) without the native
-shell, which is handy for working on the Konva canvas and onboarding. Capture
-and clipboard fall back to no-ops or browser APIs there.
+`build-app.sh` installs `/Applications/KRIT.app`. Do not validate a runtime
+change against an older installed bundle. Runtime scenarios require a separate
+local harness build: `KRIT_ARCHS="" ./build-app.sh --ui-test-harness`, launched
+with `KRIT_UI_TEST=1`. A normal bundle ignores that environment variable, and
+`make-dmg.sh` refuses to package a bundle marked as a harness build.
 
-## Before you open a PR
+## Before opening a pull request
 
-- `bun run build` passes in `apps/shell` (tsc has no errors).
-- `cargo check` passes in `apps/shell/src-tauri`.
-- `swift build` passes in `apps/helper`.
-- Product-facing text is English. Code identifiers are English; comments may be
-  Portuguese where the surrounding file already is.
+- Run `swift build --disable-index-store` and `swift test --disable-index-store`.
+- Exercise the changed flow in the installed app when it touches AppKit,
+  ScreenCaptureKit, permissions, automation or packaging.
+- Preserve the automation opt-in boundary. New public commands must not bypass
+  `AutomationGate`.
+- Give new custom controls an accessibility role, label, keyboard behavior and
+  a deliberate `mouseDownCanMoveWindow` decision when placed in movable chrome.
+- Use `ChromeFactory`, `KritType`, `KritSpacing` and `Motion` instead of adding
+  duplicate visual constants.
 
 ## Commits
 
-[Conventional Commits](https://www.conventionalcommits.org): `feat:`, `fix:`,
-`refactor:`, `docs:`, `chore:`. Keep the subject in the imperative.
+Use Conventional Commits: `feat:`, `fix:`, `refactor:`, `docs:` and `chore:`.
+Keep the subject imperative and scoped to the intentional change.

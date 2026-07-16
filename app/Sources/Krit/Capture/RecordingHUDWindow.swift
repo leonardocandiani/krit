@@ -6,22 +6,34 @@ final class RecordingHUDWindow: NSWindow {
     var stopHandler: (() -> Void)?
     /// Fired when the pause button toggles; argument is the new paused state.
     var togglePauseHandler: ((Bool) -> Void)?
-    /// Fired when restart is tapped. Optional: the button is present to match the
-    /// CleanShot HUD; setting a handler enables it, otherwise it stays disabled
-    /// (dimmed, no hit) rather than faking an action the engine does not expose.
-    var restartHandler: (() -> Void)? { didSet { restartButton.isEnabled = restartHandler != nil } }
-    /// Fired when discard (trash) is tapped. Same wired-but-optional contract as
-    /// `restartHandler`.
-    var discardHandler: (() -> Void)? { didSet { trashButton.isEnabled = discardHandler != nil } }
+    /// Restart and discard live in More so Stop remains the one dominant action.
+    /// Items stay visible but disabled until their matching engine action exists.
+    var restartHandler: (() -> Void)?
+    var discardHandler: (() -> Void)?
 
-    private let timeLabel = NSTextField(labelWithString: "0:00")
-    private let detailLabel = NSTextField(labelWithString: "Recording")
-    private let microphoneLevelMeter = RecordingHUDLevelMeter()
-    private let stopButton = RecordingHUDStopButton()
+    private let timeLabel = NSTextField(labelWithString: "00:00")
+    private let stateLabel = NSTextField(labelWithString: "Recording")
+    private let liveCluster = NSView()
+    private let liveDot = NSView()
+    private let microphoneCluster = NSView()
+    private let microphoneLevelMeter = RecordingLevelMeter()
+    private let microphoneLabel = NSTextField(labelWithString: "Mic")
+    private let sectionDividers = (0..<4).map {
+        RecordingChrome.makeSectionDivider(identifier: "recording.hud.section-divider.\($0)")
+    }
+    private let stopButton = RecordingChromeButton(
+        symbol: "stop.fill",
+        title: "Stop",
+        role: .live,
+        presentation: .horizontal
+    )
     private let pauseButton = RecordingHUDPauseButton()
-    private let restartButton = RecordingHUDGlyphButton(symbol: "arrow.counterclockwise", tint: .white)
-    private let trashButton = RecordingHUDGlyphButton(symbol: "trash", tint: .white)
-    private let divider = NSView()
+    private let overflowButton = RecordingChromeButton(
+        symbol: "ellipsis",
+        title: "More",
+        role: .neutral,
+        presentation: .glyph
+    )
     private var startedAt = Date()
     private var timer: Timer?
     private var isPaused = false
@@ -35,8 +47,9 @@ final class RecordingHUDWindow: NSWindow {
     private static let liveRed = NSColor.systemRed
 
     init() {
+        let layout = RecordingHUDLayout(showsMeter: false)
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 244, height: 44),
+            contentRect: layout.shell,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -50,92 +63,100 @@ final class RecordingHUDWindow: NSWindow {
         hidesOnDeactivate = false
         sharingType = .none
 
-        let hudRadius = ChromeFactory.Radius.panel
         let root = RecordingHUDContentView(frame: NSRect(origin: .zero, size: frame.size))
         root.wantsLayer = true
-        root.layer?.cornerRadius = hudRadius
+        root.layer?.cornerRadius = RecordingChrome.hudShellRadius
         root.layer?.cornerCurve = .continuous
-        // Shadow lives on the outer host layer; glass handles its own rim light.
         root.layer?.shadowColor = NSColor.black.cgColor
-        root.layer?.shadowOpacity = 0.72
-        root.layer?.shadowRadius = 30
-        root.layer?.shadowOffset = CGSize(width: 0, height: -12)
+        root.layer?.shadowOpacity = RecordingChrome.overlayShadow.opacity
+        root.layer?.shadowRadius = RecordingChrome.overlayShadow.radius
+        root.layer?.shadowOffset = RecordingChrome.overlayShadow.offset
         contentView = root
 
-        // Single glass backing at the HUD's corner radius (panel scale). The
-        // controls stack flat above it: flat-on-one-glass is the correct pattern,
-        // glass-on-glass is not.
-        let glassBacking = ChromeFactory.backing(frame: root.bounds, cornerRadius: hudRadius)
+        let glassBacking = ChromeFactory.backing(
+            frame: root.bounds,
+            cornerRadius: RecordingChrome.hudShellRadius,
+            variant: .regular
+        )
         root.addSubview(glassBacking)
 
-        // Contrast floor: a dark scrim over the glass so the white glyphs and the
-        // red indicator stay legible no matter what's behind the HUD. Recording a
-        // white document turned the clear glass light and the white controls
-        // vanished (white-on-white). The scrim is a non-interactive pass-through, so
-        // the controls above and the window-background drag keep working.
         let scrim = RecordingHUDScrim(frame: root.bounds)
         scrim.wantsLayer = true
-        scrim.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.68).cgColor
-        scrim.layer?.cornerRadius = hudRadius
+        scrim.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(RecordingChrome.effectiveContrastFloorAlpha)
+            .cgColor
+        scrim.layer?.cornerRadius = RecordingChrome.hudShellRadius
         scrim.layer?.cornerCurve = .continuous
         scrim.autoresizingMask = [.width, .height]
         root.addSubview(scrim)
 
-        // Left group: red stop square + red timer (the recording indicator).
-        stopButton.title = ""
-        stopButton.target = self
-        stopButton.action = #selector(stopTapped)
-        stopButton.toolTip = "Stop recording"
-        stopButton.setAccessibilityLabel("Stop recording")
-        stopButton.frame = NSRect(x: 8, y: 7, width: 30, height: 30)
-        root.addSubview(stopButton)
+        liveCluster.frame = layout.liveCluster
+        liveCluster.identifier = NSUserInterfaceItemIdentifier("recording.hud.live")
+        liveCluster.wantsLayer = true
+        liveCluster.layer?.cornerRadius = ChromeFactory.Radius.card
+        liveCluster.layer?.cornerCurve = .continuous
+        liveCluster.layer?.backgroundColor = NSColor.clear.cgColor
+        liveCluster.setAccessibilityElement(true)
+        liveCluster.setAccessibilityRole(.group)
+        liveCluster.setAccessibilityLabel("Recording 00:00")
+        root.addSubview(liveCluster)
 
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+        liveDot.frame = NSRect(x: 16, y: 20, width: 16, height: 16)
+        liveDot.wantsLayer = true
+        liveDot.layer?.cornerRadius = 8
+        liveDot.layer?.backgroundColor = Self.liveRed.cgColor
+        liveCluster.addSubview(liveDot)
+
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: KritType.title.size, weight: .semibold)
         timeLabel.textColor = Self.liveRed
-        timeLabel.frame = NSRect(x: 42, y: 13, width: 42, height: 18)
-        timeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        root.addSubview(timeLabel)
+        timeLabel.frame = NSRect(x: 44, y: 24, width: 80, height: 22)
+        liveCluster.addSubview(timeLabel)
 
-        // Mic level meter sits right after the timer when a microphone is armed;
-        // hidden otherwise so the HUD stays as lean as r63 for silent captures.
-        microphoneLevelMeter.frame = NSRect(x: 86, y: 11, width: 22, height: 22)
-        microphoneLevelMeter.isHidden = true
-        root.addSubview(microphoneLevelMeter)
+        stateLabel.font = KritType.footnote.nsFont
+        stateLabel.textColor = NSColor.white.withAlphaComponent(0.58)
+        stateLabel.frame = NSRect(x: 44, y: 8, width: 80, height: 14)
+        liveCluster.addSubview(stateLabel)
 
-        // Hidden carrier for the audio/fps summary; surfaced as the stop button's
-        // tooltip via configure(), not as visible chrome (keeps the pill clean).
-        detailLabel.isHidden = true
-        root.addSubview(detailLabel)
+        microphoneCluster.wantsLayer = true
+        microphoneCluster.layer?.cornerRadius = ChromeFactory.Radius.card
+        microphoneCluster.layer?.cornerCurve = .continuous
+        microphoneCluster.layer?.backgroundColor = NSColor.clear.cgColor
+        microphoneCluster.identifier = NSUserInterfaceItemIdentifier("recording.hud.microphone-meter")
+        microphoneCluster.setAccessibilityElement(true)
+        microphoneCluster.setAccessibilityRole(.group)
+        microphoneCluster.setAccessibilityLabel("Microphone input")
+        root.addSubview(microphoneCluster)
 
-        // Vertical divider between the indicator group and the control group.
-        divider.frame = NSRect(x: 92, y: 12, width: 1, height: 20)
-        divider.wantsLayer = true
-        divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
-        root.addSubview(divider)
+        microphoneLevelMeter.frame = NSRect(x: 16, y: 18, width: 48, height: 20)
+        microphoneCluster.addSubview(microphoneLevelMeter)
+        microphoneLabel.font = KritType.caption.nsFont
+        microphoneLabel.textColor = NSColor.white.withAlphaComponent(0.78)
+        microphoneLabel.frame = NSRect(x: 72, y: 19, width: 28, height: 18)
+        microphoneCluster.addSubview(microphoneLabel)
+        microphoneCluster.isHidden = true
 
-        // Right group: pause · restart · trash.
-        pauseButton.title = ""
+        pauseButton.identifier = NSUserInterfaceItemIdentifier("recording.hud.pause")
         pauseButton.target = self
         pauseButton.action = #selector(pauseTapped)
-        pauseButton.toolTip = "Pause recording"
-        pauseButton.frame = NSRect(x: 104, y: 7, width: 30, height: 30)
         root.addSubview(pauseButton)
 
-        restartButton.target = self
-        restartButton.action = #selector(restartTapped)
-        restartButton.toolTip = "Restart recording"
-        restartButton.setAccessibilityLabel("Restart recording")
-        restartButton.isEnabled = false
-        restartButton.frame = NSRect(x: 140, y: 7, width: 30, height: 30)
-        root.addSubview(restartButton)
+        stopButton.identifier = NSUserInterfaceItemIdentifier("recording.hud.stop")
+        stopButton.setAccessibilityLabel("Stop recording")
+        stopButton.target = self
+        stopButton.action = #selector(stopTapped)
+        root.addSubview(stopButton)
 
-        trashButton.target = self
-        trashButton.action = #selector(discardTapped)
-        trashButton.toolTip = "Discard recording"
-        trashButton.setAccessibilityLabel("Discard recording")
-        trashButton.isEnabled = false
-        trashButton.frame = NSRect(x: 176, y: 7, width: 30, height: 30)
-        root.addSubview(trashButton)
+        overflowButton.identifier = NSUserInterfaceItemIdentifier("recording.hud.overflow")
+        overflowButton.setAccessibilityLabel("More recording actions")
+        overflowButton.target = self
+        overflowButton.action = #selector(overflowTapped)
+        root.addSubview(overflowButton)
+
+        for divider in sectionDividers {
+            root.addSubview(divider)
+        }
+
+        apply(layout: layout)
     }
 
     override var canBecomeKey: Bool { false }
@@ -150,33 +171,57 @@ final class RecordingHUDWindow: NSWindow {
         } else {
             "no audio"
         }
-        detailLabel.stringValue = "\(audio) · \(fps) fps"
-        // The audio/fps/quality summary rides as the stop button's tooltip so the
-        // pill stays clean while the info is still discoverable on hover.
         stopButton.toolTip = "Stop recording · \(quality.capitalized) quality · \(audio) · \(fps) fps"
-        microphoneLevelMeter.isHidden = !microphone
+        microphoneCluster.isHidden = !microphone
         layoutControls(showsMeter: microphone)
     }
 
-    /// Slides the divider and the control group right when the mic meter is shown,
-    /// so the meter has room without overlapping the controls. Resizes the window
-    /// to keep it centered on screen.
     private func layoutControls(showsMeter: Bool) {
-        let controlsStartX: CGFloat = showsMeter ? 116 : 104
-        let dividerX: CGFloat = showsMeter ? 112 : 92
-        divider.frame.origin.x = dividerX
-        let gap: CGFloat = 36
-        pauseButton.frame.origin.x = controlsStartX
-        restartButton.frame.origin.x = controlsStartX + gap
-        trashButton.frame.origin.x = controlsStartX + gap * 2
-        let newWidth = trashButton.frame.maxX + 8
-        if abs(frame.width - newWidth) > 0.5 {
+        let layout = RecordingHUDLayout(showsMeter: showsMeter)
+        if abs(frame.width - layout.shell.width) > 0.5 {
             let center = NSPoint(x: frame.midX, y: frame.midY)
             var newFrame = frame
-            newFrame.size.width = newWidth
-            newFrame.origin.x = center.x - newWidth / 2
+            newFrame.size = layout.shell.size
+            newFrame.origin.x = center.x - layout.shell.width / 2
+            newFrame.origin.y = center.y - layout.shell.height / 2
             setFrame(newFrame, display: true)
-            contentView?.frame = NSRect(origin: .zero, size: newFrame.size)
+        }
+        apply(layout: layout)
+    }
+
+    private func apply(layout: RecordingHUDLayout) {
+        liveCluster.frame = layout.liveCluster
+        microphoneCluster.frame = layout.microphoneMeter ?? .zero
+        let hasMeter = layout.microphoneMeter != nil
+        microphoneLevelMeter.frame = NSRect(
+            x: hasMeter ? 16 : 12,
+            y: 18,
+            width: hasMeter ? 48 : 24,
+            height: 20
+        )
+        microphoneLabel.frame = NSRect(
+            x: hasMeter ? 72 : 44,
+            y: 19,
+            width: 28,
+            height: 18
+        )
+        pauseButton.frame = layout.pause
+        stopButton.frame = layout.stop
+        overflowButton.frame = layout.overflow
+
+        var regions = [layout.liveCluster]
+        if let microphoneMeter = layout.microphoneMeter {
+            regions.append(microphoneMeter)
+        }
+        regions += [layout.pause, layout.stop, layout.overflow]
+        for (index, divider) in sectionDividers.enumerated() {
+            guard index < regions.count - 1 else {
+                divider.isHidden = true
+                continue
+            }
+            let x = (regions[index].maxX + regions[index + 1].minX) / 2
+            divider.frame = NSRect(x: x - 0.5, y: 20, width: 1, height: 32)
+            divider.isHidden = false
         }
     }
 
@@ -195,9 +240,13 @@ final class RecordingHUDWindow: NSWindow {
         let visibleFrame = screen.visibleFrame
         let origin = NSPoint(x: visibleFrame.midX - frame.width / 2, y: visibleFrame.maxY - frame.height - 18)
         setFrameOrigin(pixelAligned(origin, scale: screen.backingScaleFactor))
-        // Spring+fade in like the other recording surfaces, but never take key: the
-        // HUD is a passive readout and must not steal focus mid-recording.
-        animateSpringEntrance(takesKey: false)
+        present(
+            transition: RecordingMotionPolicy.entrance(
+                for: .hud,
+                trigger: .stateTransition,
+                reduceMotion: Motion.reduced
+            )
+        )
     }
 
     private func pixelAligned(_ point: NSPoint, scale: CGFloat) -> NSPoint {
@@ -208,10 +257,15 @@ final class RecordingHUDWindow: NSWindow {
         timer?.invalidate()
         timer = nil
         microphoneLevelMeter.setLevel(0)
-        guard !Motion.reduced else { orderOut(nil); return }
+        let transition = RecordingMotionPolicy.exit(for: .hud, reduceMotion: Motion.reduced)
+        guard case .fade(let duration) = transition else {
+            orderOut(nil)
+            alphaValue = 1
+            return
+        }
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.15
-            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             self?.orderOut(nil)
@@ -219,17 +273,45 @@ final class RecordingHUDWindow: NSWindow {
         })
     }
 
+    private func present(transition: RecordingTransition) {
+        orderFrontRegardless()
+        switch transition {
+        case .instant:
+            alphaValue = 1
+        case .fade(let duration):
+            alphaValue = 0
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = duration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().alphaValue = 1
+            }
+        case .fadeAndScale(let duration, let initialScale):
+            alphaValue = 0
+            if let layer = contentView?.layer {
+                let scale = CABasicAnimation(keyPath: "transform.scale")
+                scale.fromValue = initialScale
+                scale.toValue = 1
+                scale.duration = duration
+                scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(scale, forKey: "recordingHUDEntranceScale")
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = duration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().alphaValue = 1
+            }
+        }
+    }
+
     private func updateTime() {
         // Subtract accumulated paused time plus any currently-open pause so the
         // displayed timer matches the recorded (gated) duration.
         let openPause = pauseStartedAt.map { Date().timeIntervalSince($0) } ?? 0
         let elapsed = max(0, Int(Date().timeIntervalSince(startedAt) - pausedAccumulator - openPause))
-        // m:ss like the r63 reference (single-digit minutes, no leading zero).
-        timeLabel.stringValue = String(format: "%d:%02d", elapsed / 60, elapsed % 60)
+        timeLabel.stringValue = String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
+        liveCluster.setAccessibilityLabel("\(stateLabel.stringValue) \(timeLabel.stringValue)")
     }
 
-    /// Reflects the paused state in the chrome: swaps the button glyph, dims the
-    /// timer and stop square so the pause is unmistakable.
     func setPaused(_ paused: Bool) {
         guard paused != isPaused else { return }
         isPaused = paused
@@ -239,11 +321,25 @@ final class RecordingHUDWindow: NSWindow {
             pausedAccumulator += Date().timeIntervalSince(started)
             pauseStartedAt = nil
         }
+        let appearance = RecordingHUDStateAppearance(paused: paused)
         pauseButton.setPaused(paused)
-        pauseButton.toolTip = paused ? "Resume recording" : "Pause recording"
-        timeLabel.alphaValue = paused ? 0.45 : 1
-        stopButton.alphaValue = paused ? 0.6 : 1
+        pauseButton.toolTip = appearance.pauseAccessibilityLabel
+        stateLabel.stringValue = appearance.stateLabel
+        stopButton.alphaValue = appearance.stopAlpha
+        timeLabel.textColor = paused ? NSColor.white.withAlphaComponent(0.72) : Self.liveRed
+        liveCluster.layer?.borderWidth = paused ? 1 : 0
+        liveCluster.layer?.borderColor = NSColor.white
+            .withAlphaComponent(paused ? 0.20 : 0)
+            .cgColor
+        liveDot.layer?.backgroundColor = paused
+            ? NSColor.white.withAlphaComponent(0.36).cgColor
+            : Self.liveRed.cgColor
         updateTime()
+        // A paused transition changes multiple layer-backed controls at once.
+        // Commit one complete paint before returning so the WindowServer never
+        // presents a partial HUD frame while the recording remains paused.
+        contentView?.needsDisplay = true
+        displayIfNeeded()
     }
 
     @objc private func pauseTapped() {
@@ -256,6 +352,36 @@ final class RecordingHUDWindow: NSWindow {
 
     @objc private func restartTapped() {
         restartHandler?()
+    }
+
+    @objc private func overflowTapped() {
+        let menu = makeOverflowMenu()
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: overflowButton.bounds.height), in: overflowButton)
+    }
+
+    func makeOverflowMenu() -> NSMenu {
+        let menu = NSMenu()
+        let restart = NSMenuItem(
+            title: "Restart Recording",
+            action: #selector(restartTapped),
+            keyEquivalent: ""
+        )
+        restart.image = NSImage(systemSymbolName: "arrow.counterclockwise", accessibilityDescription: nil)
+        restart.target = self
+        restart.isEnabled = restartHandler != nil
+        menu.addItem(restart)
+        menu.addItem(.separator())
+
+        let discard = NSMenuItem(
+            title: "Discard Recording",
+            action: #selector(discardTapped),
+            keyEquivalent: ""
+        )
+        discard.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
+        discard.target = self
+        discard.isEnabled = discardHandler != nil
+        menu.addItem(discard)
+        return menu
     }
 
     @objc private func discardTapped() {
@@ -277,22 +403,16 @@ private final class RecordingHUDScrim: NSView {
 }
 
 @MainActor
-private final class RecordingHUDPauseButton: NSButton {
-    override var mouseDownCanMoveWindow: Bool { false }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+private final class RecordingHUDPauseButton: RecordingChromeButton {
+    private let pauseConfig = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
 
-    private let pauseConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        isBordered = false
-        imagePosition = .imageOnly
-        imageScaling = .scaleNone
-        wantsLayer = true
-        layer?.cornerRadius = 9
-        layer?.cornerCurve = .continuous
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
-        contentTintColor = .white
+    init() {
+        super.init(
+            symbol: "pause.fill",
+            title: "Pause",
+            role: .neutral,
+            presentation: .horizontal
+        )
         setPaused(false)
     }
 
@@ -300,126 +420,10 @@ private final class RecordingHUDPauseButton: NSButton {
 
     func setPaused(_ paused: Bool) {
         let name = paused ? "play.fill" : "pause.fill"
+        title = paused ? "Resume" : "Pause"
         image = NSImage(systemSymbolName: name, accessibilityDescription: paused ? "Resume" : "Pause")?
             .withSymbolConfiguration(pauseConfig)
         setAccessibilityLabel(paused ? "Resume recording" : "Pause recording")
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.20).cgColor
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
-        super.mouseDown(with: event)
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
-    }
-}
-
-/// A flat glyph control for the HUD's restart / trash actions: a borderless SF
-/// Symbol with a subtle hover pad, no fill at rest, matching the bare icons in
-/// the r63 reference. Disabled (dimmed, no hit) until a handler is wired.
-@MainActor
-private final class RecordingHUDGlyphButton: NSButton {
-    override var mouseDownCanMoveWindow: Bool { false }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    init(symbol: String, tint: NSColor) {
-        super.init(frame: .zero)
-        isBordered = false
-        imagePosition = .imageOnly
-        imageScaling = .scaleNone
-        wantsLayer = true
-        layer?.cornerRadius = 9
-        layer?.cornerCurve = .continuous
-        layer?.backgroundColor = NSColor.clear.cgColor
-        contentTintColor = tint
-        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
-        image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)?.withSymbolConfiguration(config)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func updateLayer() {
-        super.updateLayer()
-        alphaValue = isEnabled ? 1 : 0.4
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard isEnabled else { return }
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.16).cgColor
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
-        super.mouseDown(with: event)
-        layer?.backgroundColor = NSColor.clear.cgColor
-    }
-}
-
-@MainActor
-private final class RecordingHUDStopButton: NSButton {
-    override var mouseDownCanMoveWindow: Bool { false }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        isBordered = false
-        imagePosition = .imageOnly
-        imageScaling = .scaleNone
-        wantsLayer = true
-        layer?.cornerRadius = 9
-        layer?.cornerCurve = .continuous
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
-        // Red filled stop square: the live recording indicator in r63.
-        contentTintColor = .systemRed
-        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .bold)
-        image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Stop recording")?.withSymbolConfiguration(config)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func mouseDown(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.20).cgColor
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
-        super.mouseDown(with: event)
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
-    }
-}
-
-@MainActor
-private final class RecordingHUDLevelMeter: NSView {
-
-    private let bars: [NSView]
-    private var smoothedLevel: CGFloat = 0
-
-    override init(frame frameRect: NSRect) {
-        bars = (0..<4).map { _ in NSView(frame: .zero) }
-        super.init(frame: frameRect)
-        wantsLayer = true
-        for bar in bars {
-            bar.wantsLayer = true
-            bar.layer?.cornerRadius = 1.4
-            bar.layer?.cornerCurve = .continuous
-            addSubview(bar)
-        }
-        setAccessibilityElement(true)
-        setAccessibilityRole(.levelIndicator)
-        setAccessibilityLabel("Microphone input level")
-        setLevel(0)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    func setLevel(_ level: CGFloat) {
-        let clamped = max(0, min(1, level))
-        smoothedLevel = smoothedLevel * 0.64 + clamped * 0.36
-        let gap: CGFloat = 3
-        let barWidth: CGFloat = 3
-        let baseHeight: CGFloat = 4
-        for (index, bar) in bars.enumerated() {
-            let threshold = CGFloat(index) * 0.16
-            let response = max(0, min(1, (smoothedLevel - threshold) / 0.66))
-            let height = baseHeight + response * (bounds.height - baseHeight)
-            let x = CGFloat(index) * (barWidth + gap)
-            bar.frame = NSRect(x: x, y: (bounds.height - height) / 2, width: barWidth, height: height)
-            bar.layer?.backgroundColor = response > 0.08
-                ? NSColor.systemGreen.withAlphaComponent(0.58 + response * 0.42).cgColor
-                : NSColor.white.withAlphaComponent(0.16).cgColor
-        }
+        toolTip = paused ? "Resume recording" : "Pause recording"
     }
 }

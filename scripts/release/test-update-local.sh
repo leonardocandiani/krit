@@ -26,10 +26,12 @@ TEST_DIR="/tmp/krit-update-test"
 PORT=8089
 V1="99.0.0"
 V2="99.0.1"
-# The appcast advertises a build number far above any real build stamp
-# (YYYYMMDD.HHMM) so the offered update is always "newer" than the installed
-# throwaway build, regardless of the order the two test builds were produced.
-APPCAST_BUILD="99990101.0000"
+# Sparkle compares CFBundleVersion. The update payload, appcast, and installed
+# baseline must use coherent values even though this script packages v2 before
+# it builds v1. Fixed stamps remove wall-clock ordering from the test.
+V1_BUILD="99990100.0000"
+V2_BUILD="99990101.0000"
+APPCAST_BUILD="$V2_BUILD"
 DMG_NAME="KRIT-v$V2-macOS.dmg"
 RESULT_JSON="/tmp/krit-update-check.json"
 
@@ -37,21 +39,84 @@ info() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
+bundleBuildVersion() {
+    /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$1/Contents/Info.plist"
+}
+
+buildStampIsGreater() {
+    awk -F. -v previous="$1" -v candidate="$2" '
+        BEGIN {
+            split(previous, oldParts, ".")
+            split(candidate, newParts, ".")
+            for (part = 1; part <= 3; part++) {
+                oldPart = (part in oldParts) ? oldParts[part] + 0 : 0
+                newPart = (part in newParts) ? newParts[part] + 0 : 0
+                if (newPart > oldPart) exit 0
+                if (newPart < oldPart) exit 1
+            }
+            exit 1
+        }
+    '
+}
+
+normalBundleIsInstalled() {
+    local bundle="/Applications/KRIT.app"
+    [ -d "$bundle" ] || return 1
+    local harnessMarker
+    harnessMarker="$(/usr/libexec/PlistBuddy -c "Print :KritUIHarnessBuild" "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+    [ "$harnessMarker" != "true" ]
+}
+
+requestGracefulKritQuit() {
+    pgrep -x KRIT >/dev/null || return 0
+    osascript -e 'tell application id "com.krit.app" to quit' >/dev/null 2>&1 || return 1
+    for _ in $(seq 1 20); do
+        pgrep -x KRIT >/dev/null || return 0
+        sleep 1
+    done
+    return 1
+}
+
 SERVER_PID=""
+NEEDS_NORMAL_RESTORE=0
 cleanup() {
+    local originalStatus=$?
+    local cleanupFailed=0
+    trap - EXIT
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
     defaults delete com.krit.app KritFeedURLOverride 2>/dev/null || true
     defaults delete com.krit.app SUAutomaticallyUpdate 2>/dev/null || true
+    rm -f "$RESULT_JSON"
     # Restore the real Info.plist if the backup still exists (failure mid-run).
     if [ -f "$TEST_DIR/Info.plist.bak" ]; then
-        cp "$TEST_DIR/Info.plist.bak" "$INFO_PLIST"
+        if ! cp "$TEST_DIR/Info.plist.bak" "$INFO_PLIST"; then
+            printf '[x] could not restore %s\n' "$INFO_PLIST" >&2
+            cleanupFailed=1
+        fi
     fi
+    if [ "$NEEDS_NORMAL_RESTORE" = "1" ]; then
+        pkill -x KRIT 2>/dev/null || true
+        if ! bash "$APP_DIR/build-app.sh"; then
+            printf '[x] could not restore the normal KRIT bundle\n' >&2
+            cleanupFailed=1
+        elif ! normalBundleIsInstalled; then
+            printf '[x] normal restore left a missing or harness-marked bundle in /Applications\n' >&2
+            cleanupFailed=1
+        fi
+    fi
+    if [ "$cleanupFailed" = "1" ]; then
+        exit 1
+    fi
+    exit "$originalStatus"
 }
 trap cleanup EXIT
 
 rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 cp "$INFO_PLIST" "$TEST_DIR/Info.plist.bak"
+if ! buildStampIsGreater "$V1_BUILD" "$V2_BUILD"; then
+    fail "Update build $V2_BUILD must be newer than baseline $V1_BUILD"
+fi
 
 # ---------------------------------------------------------------------------
 # Build v2 (the update) and package its DMG
@@ -59,7 +124,10 @@ cp "$INFO_PLIST" "$TEST_DIR/Info.plist.bak"
 
 info "Building v$V2 (update payload)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $V2" "$INFO_PLIST"
-bash "$APP_DIR/build-app.sh" >/dev/null
+NEEDS_NORMAL_RESTORE=1
+bash "$APP_DIR/build-app.sh" --build-stamp "$V2_BUILD" >/dev/null
+PAYLOAD_BUILD="$(bundleBuildVersion /Applications/KRIT.app)"
+[ "$PAYLOAD_BUILD" = "$V2_BUILD" ] || fail "Expected v$V2 payload build $V2_BUILD, found $PAYLOAD_BUILD"
 bash "$APP_DIR/make-dmg.sh" >/dev/null
 [ -f "$APP_DIR/$DMG_NAME" ] || fail "DMG not produced: $APP_DIR/$DMG_NAME"
 mv "$APP_DIR/$DMG_NAME" "$TEST_DIR/"
@@ -72,11 +140,14 @@ ok "v$V2 packaged: $TEST_DIR/$DMG_NAME"
 
 info "Building v$V1 (installed baseline)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $V1" "$INFO_PLIST"
-bash "$APP_DIR/build-app.sh" >/dev/null
+NEEDS_NORMAL_RESTORE=1
+bash "$APP_DIR/build-app.sh" --ui-test-harness --build-stamp "$V1_BUILD" >/dev/null
 cp "$TEST_DIR/Info.plist.bak" "$INFO_PLIST"
 INSTALLED="$(defaults read /Applications/KRIT.app/Contents/Info CFBundleShortVersionString)"
 [ "$INSTALLED" = "$V1" ] || fail "Expected v$V1 installed, found $INSTALLED"
-ok "v$V1 deployed to /Applications"
+INSTALLED_BUILD="$(bundleBuildVersion /Applications/KRIT.app)"
+[ "$INSTALLED_BUILD" = "$V1_BUILD" ] || fail "Expected v$V1 baseline build $V1_BUILD, found $INSTALLED_BUILD"
+ok "v$V1 deployed to /Applications with build $V1_BUILD"
 
 # ---------------------------------------------------------------------------
 # Sign the DMG and write the local appcast
@@ -133,7 +204,7 @@ defaults write com.krit.app SUAutomaticallyUpdate -bool YES
 # ---------------------------------------------------------------------------
 
 info "Launching v$V1 and triggering the update check"
-pkill -x KRIT 2>/dev/null || true
+requestGracefulKritQuit || fail "KRIT did not terminate before the local update test"
 sleep 1
 open -n --env KRIT_UI_TEST=1 /Applications/KRIT.app
 sleep 4
@@ -159,13 +230,14 @@ sleep 25
 # ---------------------------------------------------------------------------
 
 info "Quitting the app (Sparkle installs on exit)"
-pkill -x KRIT 2>/dev/null || true
+requestGracefulKritQuit || fail "KRIT did not terminate through the normal AppKit quit path"
 
 SWAPPED=""
 for _ in $(seq 1 30); do
     sleep 2
     CUR="$(defaults read /Applications/KRIT.app/Contents/Info CFBundleShortVersionString 2>/dev/null || true)"
-    if [ "$CUR" = "$V2" ]; then SWAPPED=1; break; fi
+    CUR_BUILD="$(bundleBuildVersion /Applications/KRIT.app 2>/dev/null || true)"
+    if [ "$CUR" = "$V2" ] && [ "$CUR_BUILD" = "$V2_BUILD" ]; then SWAPPED=1; break; fi
 done
 
 # ---------------------------------------------------------------------------
@@ -173,12 +245,14 @@ done
 # ---------------------------------------------------------------------------
 
 info "Restoring the real build in /Applications"
-pkill -x KRIT 2>/dev/null || true
+requestGracefulKritQuit || fail "KRIT did not terminate before the normal restore"
 bash "$APP_DIR/build-app.sh" >/dev/null
+normalBundleIsInstalled || fail "Normal restore did not replace the harness bundle"
+NEEDS_NORMAL_RESTORE=0
 ok "Restored $(defaults read /Applications/KRIT.app/Contents/Info CFBundleShortVersionString)"
 
 if [ -n "$SWAPPED" ]; then
-    ok "PASS: Sparkle updated /Applications/KRIT.app from v$V1 to v$V2"
+    ok "PASS: Sparkle updated /Applications/KRIT.app from v$V1 ($V1_BUILD) to v$V2 ($V2_BUILD)"
 else
-    fail "FAIL: bundle still at ${CUR:-unknown} after quit (expected $V2)"
+    fail "FAIL: bundle is ${CUR:-unknown} (${CUR_BUILD:-unknown}) after quit (expected $V2, $V2_BUILD)"
 fi

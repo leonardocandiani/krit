@@ -123,6 +123,9 @@ private final class HistoryBandWindow: NSWindow {
 
         buildContent(width: vf.width)
         reloadItems()
+        historyManager.whenLoaded { [weak self] in
+            self?.reloadItems()
+        }
     }
 
     override var canBecomeKey: Bool { true }
@@ -217,6 +220,9 @@ private final class HistoryBandWindow: NSWindow {
         items = historyManager.items.filter { activeFilter.matches($0) }
         collectionView.reloadData()
         emptyLabel.isHidden = !items.isEmpty
+        emptyLabel.stringValue = historyManager.isLoading
+            ? "Loading captures…"
+            : "No captures yet. Press ⌘⇧4 to take one."
         updateFilterVisibility()
     }
 
@@ -290,18 +296,19 @@ private final class HistoryBandWindow: NSWindow {
         removeMonitors()
 
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let finish: () -> Void = { [weak self] in
-            guard let self else { return }
-            self.orderOut(nil)
-            self.onClose()
-            NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded(excluding: self)
-        }
 
         if reduceMotion {
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.12
                 self.animator().alphaValue = 0
-            }, completionHandler: finish)
+            }, completionHandler: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.orderOut(nil)
+                    self.onClose()
+                    NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded(excluding: self)
+                }
+            })
         } else {
             // Slide the content up (clipped to the band) and fade out together. The
             // window frame stays put, so nothing ever crosses onto another monitor.
@@ -311,7 +318,14 @@ private final class HistoryBandWindow: NSWindow {
                 self.animator().alphaValue = 0
                 self.slideContent(translateY: Self.slideDistance, animated: true, duration: 0.22,
                                   timing: CAMediaTimingFunction(name: .easeIn))
-            }, completionHandler: finish)
+            }, completionHandler: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.orderOut(nil)
+                    self.onClose()
+                    NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded(excluding: self)
+                }
+            })
         }
     }
 
@@ -681,12 +695,12 @@ private final class HistoryCardItem: NSCollectionViewItem {
 
     @objc private func menuCopy() {
         guard let item = historyItem else { return }
-        ImageExporter.copyToClipboard(image: item.fullImage)
+        ImageExporter.copyToClipboard(image: item.presentedImage)
     }
 
     @objc private func menuShowInFinder() {
         guard let item = historyItem else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.imagePath)])
+        NSWorkspace.shared.activateFileViewerSelecting([item.presentedFileURL])
     }
 
     @objc private func menuDelete() { onDelete?() }

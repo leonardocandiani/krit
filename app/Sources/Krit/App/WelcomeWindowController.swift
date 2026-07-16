@@ -14,7 +14,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     private var onClose: (() -> Void)?
 
     // Paging
-    private var pages: [NSView] = []
+    private var pages: [NSView?] = Array(repeating: nil, count: 4)
     private var pageIndex = 0
     private var pageContainer: NSView!
     private var dotLayers: [CALayer] = []
@@ -88,7 +88,14 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         pageContainer.wantsLayer = true
         container.addSubview(pageContainer)
 
-        pages = [makeWelcomePage(), makePermissionPage(), makeShortcutsPage(), makeAgentPage()]
+        // Build only the visible page. The first launch should not construct all
+        // four AppKit trees, SF Symbols and glass surfaces before showing the
+        // welcome screen; later pages are materialized when navigation reaches
+        // them and then cached for Back navigation.
+        pages = Array(repeating: nil, count: pages.count)
+        permissionStatusDot = nil
+        permissionStatusLabel = nil
+        permissionGrantButton = nil
     }
 
     private func buildFooter(in container: NSView) {
@@ -102,7 +109,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         skipButton.bezelStyle = .inline
         skipButton.isBordered = false
         skipButton.font = .systemFont(ofSize: 12)
-        skipButton.contentTintColor = .tertiaryLabelColor
+        skipButton.contentTintColor = .secondaryLabelColor
         skipButton.frame = NSRect(x: 24, y: (footerHeight - 28) / 2, width: 60, height: 28)
         container.addSubview(skipButton)
 
@@ -137,7 +144,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
     private func showPage(_ index: Int, animated: Bool, forward: Bool = true) {
         guard index >= 0, index < pages.count else { return }
-        let incoming = pages[index]
+        let incoming = page(at: index)
         let outgoing = pageContainer.subviews.first
         pageIndex = index
 
@@ -169,6 +176,20 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
         refreshChrome()
         if index == 1 { startPermissionPolling() } else { stopPermissionPolling() }
+    }
+
+    private func page(at index: Int) -> NSView {
+        if let page = pages[index] { return page }
+
+        let page: NSView
+        switch index {
+        case 0: page = makeWelcomePage()
+        case 1: page = makePermissionPage()
+        case 2: page = makeShortcutsPage()
+        default: page = makeAgentPage()
+        }
+        pages[index] = page
+        return page
     }
 
     /// Footer state for the current page: dots, Back visibility, CTA label.
@@ -267,7 +288,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
         y = addHero(symbol: "lock.shield", title: "Allow Screen Recording", to: page, topY: y)
 
-        let desc = NSTextField(wrappingLabelWithString: "KRIT needs the macOS Screen Recording permission to capture screenshots, record your screen, read text with OCR, and scan QR codes. Nothing ever leaves your Mac.")
+        let desc = NSTextField(wrappingLabelWithString: "KRIT needs the macOS Screen Recording permission to capture screenshots, record your screen, read text with OCR, and scan QR codes. Captures stay on your Mac unless you choose to share them.")
         desc.font = .systemFont(ofSize: 12.5)
         desc.textColor = .secondaryLabelColor
         desc.alignment = .center
@@ -306,7 +327,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
         let note = NSTextField(wrappingLabelWithString: "macOS may ask you to reopen KRIT after enabling it in System Settings.")
         note.font = .systemFont(ofSize: 11)
-        note.textColor = .tertiaryLabelColor
+        note.textColor = .secondaryLabelColor
         note.alignment = .center
         note.frame = NSRect(x: 84, y: y - 28, width: w - 168, height: 28)
         page.addSubview(note)
@@ -360,7 +381,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
         let note = NSTextField(wrappingLabelWithString: "KRIT uses the shortcuts you already know. After this, it offers to take over the overlapping macOS ones so captures never double-trigger.")
         note.font = .systemFont(ofSize: 11)
-        note.textColor = .tertiaryLabelColor
+        note.textColor = .secondaryLabelColor
         note.alignment = .center
         note.frame = NSRect(x: 84, y: y - 30, width: w - 168, height: 30)
         page.addSubview(note)
@@ -453,7 +474,8 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     /// Welcome icon springs in on first show; skipped under Reduce Motion.
     private func animateHeroEntrance() {
         guard !reduceMotion,
-              let icon = pages.first?.subviews.first(where: {
+              let firstPage = pages.first ?? nil,
+              let icon = firstPage.subviews.first(where: {
                   $0.identifier?.rawValue == "onboarding-hero-icon"
               }) else { return }
         icon.wantsLayer = true
@@ -589,6 +611,7 @@ extension WelcomeWindowController {
     func uiTestForceShow() { showWindow() }
 
     var uiTestPageCount: Int { pages.count }
+    var uiTestBuiltPageCount: Int { pages.compactMap(\.self).count }
     var uiTestContinueTitle: String { continueButton?.title ?? "" }
     var uiTestWindow: NSWindow? { window }
 

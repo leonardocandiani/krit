@@ -18,15 +18,6 @@ cask "krit" do
 
   app "KRIT.app"
 
-  # KRIT is ad-hoc signed, not notarized, so macOS quarantines the download.
-  # Strip the quarantine flag after install so the app launches without a
-  # Gatekeeper block. Remove this once the DMG is notarized.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-rd", "com.apple.quarantine", "#{appdir}/KRIT.app"],
-                   sudo: false
-  end
-
   zap trash: [
     "~/Library/Preferences/com.krit.app.plist",
     "~/Library/Caches/com.krit.app",
@@ -34,10 +25,6 @@ cask "krit" do
   ]
 
   caveats <<~EOS
-    KRIT is not signed with an Apple Developer ID certificate or notarized.
-    If macOS blocks the app on first launch, run:
-      xattr -rd com.apple.quarantine /Applications/KRIT.app
-
     On first launch, grant Screen Recording permission when prompted
     (System Settings -> Privacy & Security -> Screen Recording).
   EOS

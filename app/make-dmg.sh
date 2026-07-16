@@ -6,9 +6,6 @@ APP_NAME="KRIT"
 # build-app.sh installs the bundle to /Applications; accept an override via
 # KRIT_APP_PATH so CI and local both work without copying into the source tree.
 APP_PATH="${KRIT_APP_PATH:-/Applications/$APP_NAME.app}"
-VERSION=$(defaults read "$APP_PATH/Contents/Info.plist" CFBundleShortVersionString)
-DMG_NAME="$APP_NAME-v$VERSION-macOS"
-DMG_PATH="$SCRIPT_DIR/$DMG_NAME.dmg"
 
 if [ -f "$SCRIPT_DIR/.env.local" ]; then
     set -a
@@ -22,6 +19,16 @@ if [ ! -d "$APP_PATH" ]; then
     echo "Error: $APP_PATH not found. Run build-app.sh first."
     exit 1
 fi
+
+HARNESS_BUILD="$(/usr/libexec/PlistBuddy -c "Print :KritUIHarnessBuild" "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)"
+if [ "$HARNESS_BUILD" = "true" ]; then
+    echo "Error: refusing to package a local UI harness build. Rebuild normally first."
+    exit 1
+fi
+
+VERSION=$(defaults read "$APP_PATH/Contents/Info.plist" CFBundleShortVersionString)
+DMG_NAME="$APP_NAME-v$VERSION-macOS"
+DMG_PATH="$SCRIPT_DIR/$DMG_NAME.dmg"
 
 RW_DMG_PATH="$SCRIPT_DIR/rw.$$.$DMG_NAME.dmg"
 # Mount point must live on the system volume: hdiutil attach refuses custom
@@ -40,7 +47,7 @@ trap cleanup EXIT
 BG_PATH="$SCRIPT_DIR/dmg-background.png"
 if [ -f "$SCRIPT_DIR/make-dmg-bg.swift" ]; then
     echo "▶ Generating DMG background…"
-    (cd "$SCRIPT_DIR" && swift make-dmg-bg.swift 2>/dev/null) || true
+    swift "$SCRIPT_DIR/make-dmg-bg.swift"
 fi
 
 echo "▶ Creating DMG installer…"
@@ -93,6 +100,7 @@ on run
                 set current view to icon view
                 set toolbar visible to false
                 set statusbar visible to false
+                set pathbar visible to false
                 set the bounds to {200, 120, 800, 520}
             end tell
 
@@ -107,12 +115,14 @@ on run
             set position of item (appName & ".app") to {120, 175}
             set extension hidden of item (appName & ".app") to true
             set position of item "Applications" to {480, 175}
+            if exists item ".background" then set position of item ".background" to {120, 520}
 
             close
             open
             delay 1
             tell container window
                 set statusbar visible to false
+                set pathbar visible to false
                 set the bounds to {200, 120, 790, 510}
             end tell
         end tell
@@ -122,6 +132,7 @@ on run
         tell folder dmgFolder
             tell container window
                 set statusbar visible to false
+                set pathbar visible to false
                 set the bounds to {200, 120, 800, 520}
             end tell
         end tell

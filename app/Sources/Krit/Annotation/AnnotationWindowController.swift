@@ -642,7 +642,7 @@ final class AnnotationWindowController: NSWindowController {
         let name = ImageExporter.timestampedName
         let ext = Settings.screenshotFormat
         let url = URL(fileURLWithPath: dir, isDirectory: true).appendingPathComponent("\(name).\(ext)")
-        guard ImageExporter.save(image: flat, to: url) != nil else {
+        guard ImageExporter.save(image: flat, to: url, collisionPolicy: .uniquify) != nil else {
             ToastWindow.show(message: "Could not save screenshot")
             return
         }
@@ -808,14 +808,16 @@ final class AnnotationWindowController: NSWindowController {
             ctx.allowsImplicitAnimation = true
             layoutStage(sidebarVisible: showing, animated: true)
         }, completionHandler: { [weak self] in
-            guard let self else { return }
-            if !showing { sidebar.isHidden = true }
-            if showing {
-                self.chromeBackdrop?.update(leftArmWidth: Self.sidebarWidth,
-                                            bottomArmHeight: Self.bottomBarHeight,
-                                            topArmHeight: Self.toolbarHeight)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !showing { self.backgroundSidebar?.isHidden = true }
+                if showing {
+                    self.chromeBackdrop?.update(leftArmWidth: Self.sidebarWidth,
+                                                bottomArmHeight: Self.bottomBarHeight,
+                                                topArmHeight: Self.toolbarHeight)
+                }
+                self.canvas.setNeedsDisplay(self.canvas.bounds)
             }
-            self.canvas.setNeedsDisplay(self.canvas.bounds)
         })
     }
 
@@ -2100,6 +2102,68 @@ final class AnnotationToolbar: NSView {
     @objc private func doneTapped()       { onDone?() }
 }
 
+// MARK: - Editor chrome pointer feedback
+
+/// Shared pointer contract for the editor's compact controls. The editor chrome
+/// is structural rather than floating glass, but its tools still need the same
+/// immediate hover and press acknowledgement as the recording controls.
+@MainActor
+class EditorChromeButton: NSButton {
+    private var pointerTrackingArea: NSTrackingArea?
+    fileprivate private(set) var isPointerInside = false
+    fileprivate private(set) var isPointerPressed = false
+
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let pointerTrackingArea { removeTrackingArea(pointerTrackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        pointerTrackingArea = area
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        setPointerInside(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setPointerInside(false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        setPointerPressed(true)
+        super.mouseDown(with: event)
+        setPointerPressed(false)
+    }
+
+    private func setPointerInside(_ isInside: Bool) {
+        guard isPointerInside != isInside else { return }
+        isPointerInside = isInside
+        needsDisplay = true
+    }
+
+    private func setPointerPressed(_ isPressed: Bool) {
+        guard isPointerPressed != isPressed else { return }
+        isPointerPressed = isPressed
+        layer?.setAffineTransform(isPressed
+            ? CGAffineTransform(scaleX: 0.97, y: 0.97)
+            : .identity)
+        needsDisplay = true
+    }
+}
+
 // MARK: - Flat tool button (CleanShot tool strip)
 
 /// One tool in the header strip. CleanShot draws inactive tools as a bare glyph
@@ -2112,7 +2176,7 @@ final class AnnotationToolbar: NSView {
 /// leading crop reads as part of the bordered canvas group rather than the flat
 /// strip; its selected state still uses the same mono pad as the strip.
 @MainActor
-final class FlatToolButton: NSButton {
+final class FlatToolButton: EditorChromeButton {
     let tool: AnnotationTool
     /// Draw a chrome pad even when not selected (canvas-group crop). The flat
     /// strip tools leave this false, so they show only the bare glyph.
@@ -2154,6 +2218,10 @@ final class FlatToolButton: NSButton {
             let path = NSBezierPath(roundedRect: pad, xRadius: radius, yRadius: radius)
             KritColors.toolSelectedFill.setFill()
             path.fill()
+        } else if isPointerPressed || isPointerInside {
+            let path = NSBezierPath(roundedRect: pad, xRadius: radius, yRadius: radius)
+            (isPointerPressed ? KritColors.editorToolPressedFill : KritColors.editorToolHoverFill).setFill()
+            path.fill()
         } else if isBorderedTool {
             let path = NSBezierPath(roundedRect: pad, xRadius: radius, yRadius: radius)
             KritColors.editorActionBackground.setFill()
@@ -2181,7 +2249,7 @@ final class FlatToolButton: NSButton {
 /// it fills coral with a white glyph (CleanShot tints this blue). Custom-drawn so
 /// the active state is a real fill, not just a tint over a native bezel.
 @MainActor
-final class ChromeToggleButton: NSButton {
+final class ChromeToggleButton: EditorChromeButton {
     var isActive = false { didSet { needsDisplay = true } }
     /// Hides the glyph while the redact spinner overlays it.
     var hidesGlyph = false { didSet { needsDisplay = true } }
@@ -2210,10 +2278,21 @@ final class ChromeToggleButton: NSButton {
         let pad = bounds.insetBy(dx: 1, dy: 1)
         let path = NSBezierPath(roundedRect: pad, xRadius: 6, yRadius: 6)
         if isActive {
-            KritColors.accent.setFill()
+            let activeFill: NSColor
+            if isPointerPressed {
+                activeFill = KritColors.accent.blended(withFraction: 0.16, of: .black) ?? KritColors.accent
+            } else if isPointerInside {
+                activeFill = KritColors.accent.blended(withFraction: 0.12, of: .white) ?? KritColors.accent
+            } else {
+                activeFill = KritColors.accent
+            }
+            activeFill.setFill()
             path.fill()
         } else {
-            KritColors.editorActionBackground.setFill()
+            let inactiveFill = isPointerPressed
+                ? KritColors.editorToolPressedFill
+                : (isPointerInside ? KritColors.editorToolHoverFill : KritColors.editorActionBackground)
+            inactiveFill.setFill()
             path.fill()
             KritColors.editorDockBorder.setStroke()
             path.lineWidth = 1
@@ -2229,10 +2308,9 @@ final class ChromeToggleButton: NSButton {
     }
 
     override func mouseDown(with event: NSEvent) {
-        // Independent toggle: flip on click (the controller may override via
-        // isActive), then fire the action. AppKit's pushOnPushOff is bypassed
-        // because the button is custom-drawn; the controller owns the truth.
-        sendAction(action, to: target)
+        // The controller owns the persistent toggle state. Super keeps the
+        // standard momentary click tracking, including a held-press response.
+        super.mouseDown(with: event)
     }
 }
 
@@ -2320,6 +2398,7 @@ final class EditorBottomBar: NSView {
         modeControl.target = self
         modeControl.action = #selector(modeChanged(_:))
         modeControl.selectedSegment = 0
+        modeControl.selectedSegmentBezelColor = KritColors.accent
         modeControl.controlSize = .regular
         modeControl.translatesAutoresizingMaskIntoConstraints = false
         addSubview(modeControl)

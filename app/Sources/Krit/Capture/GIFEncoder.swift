@@ -31,11 +31,10 @@ enum GIFEncoder {
     ) async throws -> URL {
         let asset = AVURLAsset(url: videoURL)
         let duration = try await asset.load(.duration)
-        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+        guard !(try await asset.loadTracks(withMediaType: .video)).isEmpty else {
             throw GIFEncoderError.noVideoTrack
         }
 
-        let sourceFPS = max(Double(try await track.load(.nominalFrameRate)), 1)
         let fps = max(targetFPS, 1)
         let totalSeconds = max(CMTimeGetSeconds(duration), 0)
         guard totalSeconds > 0 else { throw GIFEncoderError.noFrames }

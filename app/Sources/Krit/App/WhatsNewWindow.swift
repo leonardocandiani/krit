@@ -32,11 +32,7 @@ enum WhatsNewStore {
 
     private static func resourceURL() -> URL? {
         let bundleName = "Krit_KritKit.bundle"
-        var roots: [URL] = []
-        if let resources = Bundle.main.resourceURL { roots.append(resources.appendingPathComponent(bundleName)) }
-        roots.append(Bundle.main.bundleURL.appendingPathComponent(bundleName))
-        roots.append(Bundle.module.bundleURL)
-        for root in roots {
+        for root in KritResourceBundleLocator.candidates(named: bundleName) {
             if let bundle = Bundle(url: root), let url = bundle.url(forResource: "WhatsNew", withExtension: "md") {
                 return url
             }
@@ -80,6 +76,7 @@ final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
         shared?.close()
         let controller = WhatsNewWindowController(notes: notes)
         shared = controller
+        NSApp.setActivationPolicy(.accessory)
         controller.showWindow(nil)
         controller.window?.center()
         controller.window?.makeKeyAndOrderFront(nil)
@@ -105,6 +102,7 @@ final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         if Self.shared === self { Self.shared = nil }
+        NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded(excluding: window)
     }
 
     /// GUI test hook: the panel is open and visible.

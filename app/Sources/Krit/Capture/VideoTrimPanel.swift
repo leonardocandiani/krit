@@ -281,17 +281,17 @@ final class VideoTrimPanel: NSView {
         generator.requestedTimeToleranceBefore = CMTime(seconds: 0.4, preferredTimescale: 600)
         generator.requestedTimeToleranceAfter = CMTime(seconds: 0.4, preferredTimescale: 600)
 
-        let times: [NSValue] = (0..<count).map { index in
+        let times: [CMTime] = (0..<count).map { index in
             let fraction = (Double(index) + 0.5) / Double(count)
-            return NSValue(time: CMTime(seconds: fraction * duration, preferredTimescale: 600))
+            return CMTime(seconds: fraction * duration, preferredTimescale: 600)
         }
 
         // Generate off the main actor; the strip fills in once all frames arrive.
         nonisolated(unsafe) let gen = generator
         DispatchQueue.global(qos: .userInitiated).async {
             var collected = [Int: NSImage]()
-            for (index, value) in times.enumerated() {
-                if let cgImage = try? gen.copyCGImage(at: value.timeValue, actualTime: nil) {
+            for (index, time) in times.enumerated() {
+                if let cgImage = try? gen.copyCGImage(at: time, actualTime: nil) {
                     collected[index] = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                 }
             }

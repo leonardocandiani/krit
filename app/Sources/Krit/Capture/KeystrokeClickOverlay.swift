@@ -240,10 +240,13 @@ final class KeystrokeClickOverlay {
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = Motion.reduced ? 0 : 0.3
                 pill.animator().alphaValue = 0
-            }, completionHandler: {
-                pill.removeFromSuperview()
-                self.keyPills.removeAll { $0 === pill }
-                self.layoutKeyPills()
+            }, completionHandler: { [weak self, weak pill] in
+                Task { @MainActor [weak self, weak pill] in
+                    guard let self, let pill else { return }
+                    pill.removeFromSuperview()
+                    self.keyPills.removeAll { $0 === pill }
+                    self.layoutKeyPills()
+                }
             })
         }
     }

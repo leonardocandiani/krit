@@ -3,11 +3,11 @@ import AppKit
 /// What kind of capture an item holds. Drives the band's filter tabs. Stored on
 /// disk so old items (which predate the field) decode as nil and fall back to
 /// the file extension via `HistoryItem.kind`.
-enum HistoryKind: String, Codable {
+enum HistoryKind: String, Codable, Sendable {
     case screenshot, video, gif
 }
 
-struct HistoryItem: Codable, Identifiable {
+struct HistoryItem: Codable, Identifiable, Sendable {
     let id: UUID
     let createdAt: Date
     let imagePath: String     // Full-res PNG on disk
@@ -42,17 +42,30 @@ struct HistoryItem: Codable, Identifiable {
     /// (the overlay's edit action reads it directly), so a window background is
     /// reapplied live instead of double-composed.
     var presentedImage: NSImage {
-        if let presentedPath, FileManager.default.fileExists(atPath: presentedPath) {
-            return HistoryImageCache.fullImage(for: presentedPath)
+        if let presentedPath {
+            if let cached = HistoryImageCache.cachedFull(for: presentedPath) {
+                return cached
+            }
+            if FileManager.default.fileExists(atPath: presentedPath) {
+                return HistoryImageCache.fullImage(for: presentedPath)
+            }
         }
         return fullImage
     }
 
-    /// The file to hand off on drag / copy-as-file: the composed image (with the
-    /// preset) when one exists, otherwise the raw shot. This is what the user sees
-    /// in the band, so it is what they expect to drag out.
+    /// Existing finished file on disk, if persistence has completed. A composed
+    /// capture must not hand callers a missing `presentedPath` while its write is
+    /// still queued or after an I/O failure.
+    var persistedPresentationFileURL: URL? {
+        let url = URL(fileURLWithPath: presentedPath ?? imagePath)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// The file to hand off for Finder and copy-as-file. The composed image wins
+    /// when it exists; otherwise fall back to the raw capture instead of returning
+    /// a dead path.
     var presentedFileURL: URL {
-        URL(fileURLWithPath: presentedPath ?? imagePath)
+        persistedPresentationFileURL ?? URL(fileURLWithPath: imagePath)
     }
 
     /// Effective kind: the stored value when present, otherwise inferred from the
@@ -76,7 +89,7 @@ struct HistoryItem: Codable, Identifiable {
     }
 }
 
-struct CodableRect: Codable {
+struct CodableRect: Codable, Sendable {
     let x, y, width, height: Double
     var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
     init(_ r: CGRect) { x = r.origin.x; y = r.origin.y; width = r.width; height = r.height }
@@ -107,6 +120,10 @@ enum HistoryImageCache {
         guard let img = NSImage(contentsOfFile: path) else { return NSImage() }
         fullCache.setObject(img, forKey: key, cost: imageCost(img))
         return img
+    }
+
+    static func cachedFull(for path: String) -> NSImage? {
+        fullCache.object(forKey: path as NSString)
     }
 
     static func thumbnail(for path: String) -> NSImage {

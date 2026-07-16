@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 /// The Preferences sections, in sidebar order (CaseIterable follows source order,
 /// not raw value). Raw values are stable so `show(tab:)` callers (AppDelegate,
@@ -43,36 +44,42 @@ enum PreferencesTab: Int, CaseIterable {
         case .about:       return "info.circle"
         }
     }
+
+    var subtitle: String {
+        switch self {
+        case .general:     return "Make KRIT feel at home on this Mac."
+        case .capture:     return "Screenshots that land exactly where you need them."
+        case .recording:   return "Crisp screen recordings with the right inputs."
+        case .preview:     return "Choose how completed captures stay within reach."
+        case .editor:      return "Set the defaults for fast, focused annotation."
+        case .shortcuts:   return "Keep every capture tool one keystroke away."
+        case .presets:     return "Turn repeated capture workflows into one action."
+        case .permissions: return "See what KRIT can access and why it needs it."
+        case .about:       return "Version, updates, support, and project links."
+        }
+    }
 }
 
-/// Raycast-style Settings: a single dark surface split into a sidebar of
-/// sections and a scrolling content pane. The window chrome (fullSizeContentView,
-/// sidebar vibrancy, glass chip rows, coral accent) stays in AppKit so it matches
-/// the editor and onboarding windows; each section's body is a grouped SwiftUI
-/// `Form` hosted in an `NSHostingView` (see PreferencesContent), giving the
-/// native System Settings controls.
+/// Native macOS Settings shell: AppKit owns the window and source-list sidebar,
+/// while one SwiftUI hosting view renders the selected grouped form. Replacing
+/// the hosting root keeps settings fresh without retaining nine UI trees.
 @MainActor
 final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
 
     static let shared = PreferencesWindowController()
 
-    private let windowSize = NSSize(width: 860, height: 620)
-    private let sidebarWidth: CGFloat = 230
+    private let windowSize = NSSize(width: 980, height: 680)
+    private let sidebarWidth: CGFloat = 220
 
-    private var sidebar: PreferencesSidebar!
-    private var contentContainer: NSView!
-    private var currentSectionView: NSView?
-    private var sectionCache: [PreferencesTab: NSView] = [:]
-    private var selectedTab: PreferencesTab = .general
-
-    private var reduceMotion: Bool {
-        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-    }
+    private var sidebar: NativePreferencesSidebar!
+    private var contentHostingView: NSHostingView<AnyView>!
+    private var selectedTab: PreferencesTab?
+    private(set) var uiTestRenderFallbackCount = 0
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: NSSize(width: 860, height: 620)),
-            styleMask: [.titled, .closable, .fullSizeContentView],
+            contentRect: NSRect(origin: .zero, size: windowSize),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -82,6 +89,7 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         window.isMovableByWindowBackground = true
         window.center()
         window.isReleasedWhenClosed = false
+        window.contentMinSize = NSSize(width: 860, height: 620)
         // Settings follows the app appearance (System / Light / Dark) like a native
         // macOS settings window, instead of forcing dark. AppearanceMode.applyCurrent
         // sets NSApp.appearance; this window inherits it.
@@ -103,48 +111,32 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         root.autoresizingMask = [.width, .height]
         window.contentView = root
 
-        // Sidebar: real Liquid Glass (NSGlassEffectView via ChromeFactory, the same
-        // backing the overlay and Welcome use), replacing the old .sidebar vibrancy
-        // so Settings finally speaks the app's glass language. Square corners; the
-        // window's own rounding clips the left edge. Traffic lights float over it
-        // (titlebar transparent). Pre-26 systems fall back to the HUD blur.
-        sidebar = PreferencesSidebar(width: sidebarWidth, height: windowSize.height) { [weak self] tab in
+        // A native source list owns keyboard navigation, selection and VoiceOver.
+        // The sidebar material is structural on every supported macOS version;
+        // Liquid Glass stays reserved for floating chrome such as HUDs and docks.
+        sidebar = NativePreferencesSidebar(width: sidebarWidth, height: windowSize.height) { [weak self] tab in
             self?.select(tab: tab, animated: true)
         }
-        // On macOS 26+ the sidebar is real Liquid Glass. Below that, the glass
-        // chip fallback is wrong for a full-height structural panel: its floating
-        // rim framed the sidebar in a white border and the HUD material washed the
-        // tabs out (the bug Intel/older-macOS users saw). Fall back to native
-        // `.sidebar` vibrancy, which is what a sidebar should be pre-26.
-        let sidebarBacking: NSView
-        if #available(macOS 26.0, *), !ChromeFactory.forceFallback {
-            sidebarBacking = ChromeFactory.make(content: sidebar.view, cornerRadius: 0)
-        } else {
-            let vev = NSVisualEffectView()
-            vev.material = .sidebar
-            vev.blendingMode = .behindWindow
-            vev.state = .active
-            sidebar.view.translatesAutoresizingMaskIntoConstraints = false
-            vev.addSubview(sidebar.view)
-            NSLayoutConstraint.activate([
-                sidebar.view.leadingAnchor.constraint(equalTo: vev.leadingAnchor),
-                sidebar.view.trailingAnchor.constraint(equalTo: vev.trailingAnchor),
-                sidebar.view.topAnchor.constraint(equalTo: vev.topAnchor),
-                sidebar.view.bottomAnchor.constraint(equalTo: vev.bottomAnchor),
-            ])
-            sidebarBacking = vev
-        }
+        let sidebarBacking = NSVisualEffectView()
+        sidebarBacking.material = .sidebar
+        sidebarBacking.blendingMode = .behindWindow
+        sidebarBacking.state = .active
+        sidebar.view.translatesAutoresizingMaskIntoConstraints = false
+        sidebarBacking.addSubview(sidebar.view)
+        NSLayoutConstraint.activate([
+            sidebar.view.leadingAnchor.constraint(equalTo: sidebarBacking.leadingAnchor),
+            sidebar.view.trailingAnchor.constraint(equalTo: sidebarBacking.trailingAnchor),
+            sidebar.view.topAnchor.constraint(equalTo: sidebarBacking.topAnchor),
+            sidebar.view.bottomAnchor.constraint(equalTo: sidebarBacking.bottomAnchor),
+        ])
         sidebarBacking.frame = NSRect(x: 0, y: 0, width: sidebarWidth, height: windowSize.height)
         sidebarBacking.autoresizingMask = [.height]
         root.addSubview(sidebarBacking)
 
         // Hairline between sidebar and content. A separator color so it reads in
         // both light and dark instead of a fixed white alpha that vanished on light.
-        let hairline = NSBox()
-        hairline.boxType = .custom
-        hairline.borderWidth = 0
-        hairline.fillColor = .separatorColor
-        hairline.frame = NSRect(x: sidebarWidth, y: 0, width: 1, height: windowSize.height)
+        let hairline = PreferencesSeparatorView()
+        hairline.frame = NSRect(x: sidebarWidth, y: 0, width: 0.5, height: windowSize.height)
         hairline.autoresizingMask = [.height]
         root.addSubview(hairline)
 
@@ -152,57 +144,31 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         // in light and dark-grey in dark exactly like System Settings, instead of
         // the editor's fixed dark stage color (which made Settings look non-native).
         let contentBlur = NSVisualEffectView(frame: NSRect(
-            x: sidebarWidth + 1, y: 0,
-            width: windowSize.width - sidebarWidth - 1, height: windowSize.height
+            x: sidebarWidth + 0.5, y: 0,
+            width: windowSize.width - sidebarWidth - 0.5, height: windowSize.height
         ))
         contentBlur.material = .contentBackground
         contentBlur.blendingMode = .behindWindow
         contentBlur.state = .active
         contentBlur.autoresizingMask = [.width, .height]
         root.addSubview(contentBlur)
-        contentContainer = contentBlur
+
+        contentHostingView = NSHostingView(rootView: PreferencesContent.makeRootView(for: .general))
+        contentHostingView.frame = contentBlur.bounds
+        contentHostingView.autoresizingMask = [.width, .height]
+        contentBlur.addSubview(contentHostingView)
     }
 
     // MARK: - Section switching
 
-    private func sectionView(for tab: PreferencesTab) -> NSView {
-        if let cached = sectionCache[tab] { return cached }
-        let view = PreferencesContent.makeView(for: tab)
-        sectionCache[tab] = view
-        return view
-    }
-
-    private func select(tab: PreferencesTab, animated: Bool) {
+    private func select(tab: PreferencesTab, animated _: Bool, forceReload: Bool = false) {
+        guard selectedTab != tab || forceReload else {
+            sidebar.setSelected(tab)
+            return
+        }
         selectedTab = tab
         sidebar.setSelected(tab)
-
-        let incoming = sectionView(for: tab)
-        incoming.frame = contentContainer.bounds
-        incoming.autoresizingMask = [.width, .height]
-        let outgoing = currentSectionView
-        currentSectionView = incoming
-
-        if animated, !reduceMotion, let outgoing, outgoing !== incoming {
-            incoming.alphaValue = 0
-            incoming.frame.origin.x = 14
-            contentContainer.addSubview(incoming)
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.22
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                ctx.allowsImplicitAnimation = true
-                incoming.animator().alphaValue = 1
-                incoming.animator().frame.origin.x = 0
-                outgoing.animator().alphaValue = 0
-            }, completionHandler: {
-                outgoing.removeFromSuperview()
-                outgoing.alphaValue = 1
-            })
-        } else {
-            outgoing?.removeFromSuperview()
-            incoming.alphaValue = 1
-            incoming.frame.origin.x = 0
-            contentContainer.addSubview(incoming)
-        }
+        contentHostingView.rootView = PreferencesContent.makeRootView(for: tab)
     }
 
     // MARK: - Public surface
@@ -210,7 +176,7 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
     func show(tab: PreferencesTab = .general) {
         NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
-        select(tab: tab, animated: window?.isVisible == true)
+        select(tab: tab, animated: false, forceReload: window?.isVisible != true)
         window?.makeKeyAndOrderFront(nil)
     }
 
@@ -219,156 +185,178 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
-// MARK: - Sidebar
+// MARK: - Native source-list sidebar
 
-/// Vertical list of section rows: a small glass-tiled icon plus the section
-/// name, with a rounded highlight on the selected row.
+/// AppKit's source list supplies the navigation behavior a Settings window is
+/// expected to have: arrow keys, selected-row semantics, focus and VoiceOver.
+/// KRIT only customizes the selected fill and the compact cell content.
 @MainActor
-private final class PreferencesSidebar {
+final class NativePreferencesSidebar: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     let view: NSView
-    private var rows: [PreferencesTab: PreferencesSidebarRow] = [:]
+
+    private let tableView = NSTableView()
+    private let tabs = PreferencesTab.allCases
     private let onSelect: (PreferencesTab) -> Void
+    private var suppressSelectionCallback = false
 
     init(width: CGFloat, height: CGFloat, onSelect: @escaping (PreferencesTab) -> Void) {
         self.onSelect = onSelect
         view = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        super.init()
 
-        let rowHeight: CGFloat = 38
-        let gap: CGFloat = 4
-        let horizontalInset: CGFloat = 14
-        // Leave room under the traffic lights at the top of the window.
-        var y = height - 56
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("preferences.section"))
+        column.resizingMask = .autoresizingMask
+        tableView.addTableColumn(column)
+        tableView.headerView = nil
+        tableView.style = .sourceList
+        tableView.rowHeight = 36
+        tableView.intercellSpacing = NSSize(width: 0, height: 3)
+        tableView.backgroundColor = .clear
+        tableView.selectionHighlightStyle = .none
+        tableView.allowsEmptySelection = false
+        tableView.allowsMultipleSelection = false
+        tableView.allowsTypeSelect = true
+        tableView.focusRingType = .default
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.setAccessibilityLabel("Preferences sections")
 
-        for tab in PreferencesTab.allCases {
-            y -= rowHeight
-            let row = PreferencesSidebarRow(tab: tab) { [weak self] in self?.onSelect(tab) }
-            row.view.frame = NSRect(
-                x: horizontalInset, y: y,
-                width: width - horizontalInset * 2, height: rowHeight
-            )
-            // Anchor to the TOP edge: the frames above are computed from the
-            // initial height, and the default mask pins them to the bottom, so
-            // any window-height change pushed the first rows under the traffic
-            // lights. A flexible bottom margin keeps the 56pt top clearance at
-            // every height.
-            row.view.autoresizingMask = [.minYMargin]
-            view.addSubview(row.view)
-            rows[tab] = row
-            y -= gap
+        let scrollView = NSScrollView()
+        scrollView.documentView = tableView
+        scrollView.hasVerticalScroller = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.drawsBackground = false
+        scrollView.autohidesScrollers = true
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor, constant: 58),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10),
+        ])
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { tabs.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let identifier = NSUserInterfaceItemIdentifier("preferences.sidebar.cell")
+        let cell: NativePreferencesSidebarCell
+        if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NativePreferencesSidebarCell {
+            cell = reused
+        } else {
+            cell = NativePreferencesSidebarCell()
+            cell.identifier = identifier
         }
+        cell.configure(tab: tabs[row], selected: tableView.selectedRowIndexes.contains(row))
+        return cell
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        NativePreferencesSidebarRowView()
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        refreshVisibleCells()
+        guard !suppressSelectionCallback,
+              tableView.selectedRow >= 0,
+              tableView.selectedRow < tabs.count else { return }
+        onSelect(tabs[tableView.selectedRow])
     }
 
     func setSelected(_ tab: PreferencesTab) {
-        for (key, row) in rows { row.setSelected(key == tab) }
+        guard let row = tabs.firstIndex(of: tab) else { return }
+        if tableView.selectedRow != row {
+            suppressSelectionCallback = true
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            tableView.scrollRowToVisible(row)
+            suppressSelectionCallback = false
+        }
+        refreshVisibleCells()
+    }
+
+    private func refreshVisibleCells() {
+        for row in 0..<tabs.count {
+            guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false)
+                    as? NativePreferencesSidebarCell else { continue }
+            cell.configure(tab: tabs[row], selected: tableView.selectedRowIndexes.contains(row))
+        }
+    }
+
+    var uiTestTableView: NSTableView { tableView }
+
+    var uiTestSelectedTab: PreferencesTab? {
+        guard tableView.selectedRow >= 0, tableView.selectedRow < tabs.count else { return nil }
+        return tabs[tableView.selectedRow]
     }
 }
 
 @MainActor
-private final class PreferencesSidebarRow {
+private final class PreferencesSeparatorView: NSView {
+    override var wantsUpdateLayer: Bool { true }
 
-    let view: HoverButtonView
-    private let highlight: NSView
-    private let iconTile: NSView
-    private let icon: NSImageView
-    private let label: NSTextField
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.14).cgColor
+    }
+}
 
-    init(tab: PreferencesTab, onClick: @escaping () -> Void) {
-        view = HoverButtonView(onClick: onClick)
-        view.wantsLayer = true
+@MainActor
+private final class NativePreferencesSidebarRowView: NSTableRowView {
 
-        highlight = NSView()
-        highlight.wantsLayer = true
-        highlight.layer?.cornerRadius = 8
-        highlight.layer?.cornerCurve = .continuous
-        highlight.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.09).cgColor
-        highlight.isHidden = true
-        view.addSubview(highlight)
+    override func drawSelection(in dirtyRect: NSRect) {
+        // The cell draws KRIT's accent in its own non-vibrant layer. Drawing a
+        // custom color here lets source-list vibrancy reinterpret coral as black.
+    }
+}
 
-        let tileSize: CGFloat = 24
-        iconTile = NSView()
-        iconTile.wantsLayer = true
-        iconTile.layer?.cornerRadius = 6
-        iconTile.layer?.cornerCurve = .continuous
-        iconTile.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.07).cgColor
-        view.addSubview(iconTile)
+@MainActor
+private final class NativePreferencesSidebarCell: NSTableCellView {
 
-        icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: nil)
-        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12.5, weight: .medium)
-        icon.contentTintColor = .labelColor
-        view.addSubview(icon)
+    private let glyph = NSImageView()
+    private let label = NSTextField(labelWithString: "")
 
-        label = NSTextField(labelWithString: tab.title)
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
+
+        glyph.imageScaling = .scaleProportionallyDown
+        glyph.translatesAutoresizingMaskIntoConstraints = false
+        glyph.setAccessibilityElement(false)
+        addSubview(glyph)
+
         label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.textColor = .labelColor
-        view.addSubview(label)
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        textField = label
+        imageView = glyph
 
-        view.onLayout = { [weak self] bounds in
-            guard let self else { return }
-            self.highlight.frame = bounds
-            let tileY = (bounds.height - tileSize) / 2
-            self.iconTile.frame = NSRect(x: 8, y: tileY, width: tileSize, height: tileSize)
-            self.icon.frame = NSRect(x: 8 + (tileSize - 16) / 2, y: tileY + (tileSize - 16) / 2, width: 16, height: 16)
-            self.label.frame = NSRect(x: 8 + tileSize + 10, y: (bounds.height - 18) / 2, width: bounds.width - 8 - tileSize - 14, height: 18)
-        }
-        view.onHover = { [weak self] hovering in
-            guard let self, self.highlight.isHidden else { return }
-            self.view.layer?.backgroundColor = hovering
-                ? NSColor.white.withAlphaComponent(0.04).cgColor
-                : NSColor.clear.cgColor
-        }
-    }
-
-    func setSelected(_ selected: Bool) {
-        highlight.isHidden = !selected
-        if selected { view.layer?.backgroundColor = NSColor.clear.cgColor }
-        icon.contentTintColor = selected ? KritColors.accent : .labelColor
-        iconTile.layer?.backgroundColor = selected
-            ? KritColors.accent.withAlphaComponent(0.18).cgColor
-            : NSColor.white.withAlphaComponent(0.07).cgColor
-        label.textColor = selected ? .labelColor : .secondaryLabelColor
-    }
-}
-
-// MARK: - Hover/click view
-
-/// A lightweight clickable, hover-tracking NSView. Reused for sidebar rows and
-/// the visual selection cards so we get pointer feedback without NSButton chrome.
-@MainActor
-final class HoverButtonView: NSView {
-
-    var onClick: (() -> Void)?
-    var onHover: ((Bool) -> Void)?
-    var onLayout: ((NSRect) -> Void)?
-
-    private var trackingAreaRef: NSTrackingArea?
-
-    init(onClick: (() -> Void)? = nil) {
-        self.onClick = onClick
-        super.init(frame: .zero)
+        NSLayoutConstraint.activate([
+            glyph.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
+            glyph.widthAnchor.constraint(equalToConstant: 17),
+            glyph.heightAnchor.constraint(equalToConstant: 17),
+            label.leadingAnchor.constraint(equalTo: glyph.trailingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
 
-    override func layout() {
-        super.layout()
-        onLayout?(bounds)
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingAreaRef { removeTrackingArea(trackingAreaRef) }
-        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp], owner: self, userInfo: nil)
-        addTrackingArea(area)
-        trackingAreaRef = area
-    }
-
-    override func mouseEntered(with event: NSEvent) { onHover?(true) }
-    override func mouseExited(with event: NSEvent) { onHover?(false) }
-    override func mouseDown(with event: NSEvent) { /* swallow so mouseUp lands */ }
-    override func mouseUp(with event: NSEvent) {
-        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+    func configure(tab: PreferencesTab, selected: Bool) {
+        layer?.backgroundColor = selected ? KritColors.accent.cgColor : NSColor.clear.cgColor
+        glyph.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: nil)
+        glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        glyph.contentTintColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
+        label.stringValue = tab.title
+        label.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
+        setAccessibilityLabel(tab.title)
     }
 }
 
@@ -378,12 +366,11 @@ extension PreferencesWindowController {
 
     /// Test-only: forces the window up without changing activation policy.
     func uiTestForceShow() {
-        select(tab: .general, animated: false)
+        select(tab: .general, animated: false, forceReload: true)
         window?.makeKeyAndOrderFront(nil)
     }
 
-    /// Switch tabs with no cross-fade, so a snapshot catches the settled state
-    /// instead of two layers mid-transition.
+    /// Switch tabs synchronously so a snapshot catches the settled native form.
     func uiTestSelect(_ tab: PreferencesTab) {
         select(tab: tab, animated: false)
     }
@@ -398,6 +385,7 @@ extension PreferencesWindowController {
     func uiTestRenderAllSections(toDirectory dir: String) async -> [String] {
         guard let window, let content = window.contentView else { return [] }
         var paths: [String] = []
+        uiTestRenderFallbackCount = 0
         for tab in PreferencesTab.allCases {
             select(tab: tab, animated: false)
             content.layoutSubtreeIfNeeded()
@@ -409,11 +397,16 @@ extension PreferencesWindowController {
             if let cg = CGWindowListCreateImage(
                 .null, .optionIncludingWindow, winID,
                 [.boundsIgnoreFraming, .bestResolution]
-            ) {
+            ), ScreenshotVisualQuality.hasVisibleContent(cg) {
                 data = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
-            } else if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+            }
+
+            if data == nil, let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
                 content.cacheDisplay(in: content.bounds, to: rep)
-                data = rep.representation(using: .png, properties: [:])
+                if let cg = rep.cgImage, ScreenshotVisualQuality.hasVisibleContent(cg) {
+                    data = rep.representation(using: .png, properties: [:])
+                    uiTestRenderFallbackCount += 1
+                }
             }
 
             let path = (dir as NSString).appendingPathComponent("preferences-\(tab.title.lowercased().replacingOccurrences(of: " ", with: "-")).png")

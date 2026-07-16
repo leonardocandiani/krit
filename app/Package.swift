@@ -38,5 +38,10 @@ let package = Package(
             name: "KritCLI",
             path: "Sources/KritCLI"
         ),
+        .testTarget(
+            name: "KritKitTests",
+            dependencies: ["KritKit"],
+            path: "Tests/KritKitTests"
+        ),
     ]
 )

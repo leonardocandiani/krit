@@ -19,6 +19,11 @@ final class CameraBubbleWindow {
     private let session: AVCaptureSession
     private let diameter: CGFloat
     private let screen: NSScreen
+    // AVCaptureSession start/stop can block for hardware warm-up and teardown.
+    // A single queue preserves their ordering, while the epoch lets a queued
+    // start expire when recording ends before that queue reaches it.
+    private let sessionQueue = DispatchQueue(label: "com.krit.camera-bubble.session", qos: .userInitiated)
+    private let sessionEpoch = CameraSessionEpoch()
 
     /// - deviceID: persisted webcam unique ID; empty falls back to the default
     ///   front camera.
@@ -38,7 +43,7 @@ final class CameraBubbleWindow {
         self.session = session
         self.diameter = diameter
         self.screen = screen
-        self.window = BubbleWindow(diameter: diameter, session: session)
+        self.window = BubbleWindow(diameter: diameter, session: session, targetScreen: screen)
     }
 
     /// Positions the bubble in the bottom-right corner of the screen and starts
@@ -54,16 +59,20 @@ final class CameraBubbleWindow {
         window.setFrameOrigin(origin)
         window.orderFrontRegardless()
 
-        let session = self.session
-        DispatchQueue.global(qos: .userInitiated).async {
+        let epoch = sessionEpoch.begin()
+        nonisolated(unsafe) let session = self.session
+        let sessionEpoch = self.sessionEpoch
+        sessionQueue.async {
+            guard sessionEpoch.accepts(epoch) else { return }
             session.startRunning()
         }
     }
 
     /// Stops the camera and removes the bubble.
     func stop() {
-        let session = self.session
-        DispatchQueue.global(qos: .userInitiated).async {
+        sessionEpoch.invalidate()
+        nonisolated(unsafe) let session = self.session
+        sessionQueue.async {
             session.stopRunning()
         }
         window.orderOut(nil)
@@ -78,12 +87,39 @@ final class CameraBubbleWindow {
     }
 }
 
+/// Thread-safe generation for a camera session lifecycle. `start()` runs on a
+/// serial queue because it can block; invalidating this token on the main actor
+/// prevents an old queued start from reviving the camera after `stop()`.
+final class CameraSessionEpoch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func begin() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        value &+= 1
+        return value
+    }
+
+    func invalidate() {
+        lock.lock()
+        value &+= 1
+        lock.unlock()
+    }
+
+    func accepts(_ token: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value == token
+    }
+}
+
 /// Borderless circular window carrying the webcam preview. Draggable from
 /// anywhere inside it; left IN the SCStream capture so it is recorded in place.
 @MainActor
 private final class BubbleWindow: NSWindow {
 
-    init(diameter: CGFloat, session: AVCaptureSession) {
+    init(diameter: CGFloat, session: AVCaptureSession, targetScreen: NSScreen) {
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: diameter, height: diameter),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -99,7 +135,7 @@ private final class BubbleWindow: NSWindow {
         level = .statusBar + 3
         sharingType = .readWrite
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        contentView = BubbleContentView(diameter: diameter, session: session)
+        contentView = BubbleContentView(diameter: diameter, session: session, targetScreen: targetScreen)
     }
 
     override var canBecomeKey: Bool { false }
@@ -114,10 +150,12 @@ private final class BubbleContentView: NSView {
 
     private let previewLayer: AVCaptureVideoPreviewLayer
     private let ringLayer = CAShapeLayer()
+    private let targetScreen: NSScreen
     private var dragOffset: NSPoint = .zero
 
-    init(diameter: CGFloat, session: AVCaptureSession) {
+    init(diameter: CGFloat, session: AVCaptureSession, targetScreen: NSScreen) {
         self.previewLayer = AVCaptureVideoPreviewLayer(session: session)
+        self.targetScreen = targetScreen
         super.init(frame: NSRect(x: 0, y: 0, width: diameter, height: diameter))
 
         wantsLayer = true
@@ -175,13 +213,32 @@ private final class BubbleContentView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let window, let screen = window.screen ?? NSScreen.main else { return }
-        let mouse = NSEvent.mouseLocation
-        var origin = NSPoint(x: mouse.x - dragOffset.x, y: mouse.y - dragOffset.y)
-        // Keep the whole bubble on the screen it is dragged across.
-        let visible = screen.visibleFrame
-        origin.x = min(max(origin.x, visible.minX), visible.maxX - window.frame.width)
-        origin.y = min(max(origin.y, visible.minY), visible.maxY - window.frame.height)
+        guard let window else { return }
+        let origin = CameraBubbleGeometry.clampedOrigin(
+            mouseLocation: NSEvent.mouseLocation,
+            dragOffset: dragOffset,
+            bubbleSize: window.frame.size,
+            visibleFrame: targetScreen.visibleFrame
+        )
         window.setFrameOrigin(origin)
+    }
+}
+
+/// Geometry kept outside the AppKit view so the multi-display recording contract
+/// is testable: a bubble captured by one SCStream must never leave that stream's
+/// source screen just because the pointer crosses a display boundary.
+enum CameraBubbleGeometry {
+    static func clampedOrigin(
+        mouseLocation: CGPoint,
+        dragOffset: CGPoint,
+        bubbleSize: CGSize,
+        visibleFrame: CGRect
+    ) -> CGPoint {
+        let maxX = max(visibleFrame.minX, visibleFrame.maxX - bubbleSize.width)
+        let maxY = max(visibleFrame.minY, visibleFrame.maxY - bubbleSize.height)
+        return CGPoint(
+            x: min(max(mouseLocation.x - dragOffset.x, visibleFrame.minX), maxX),
+            y: min(max(mouseLocation.y - dragOffset.y, visibleFrame.minY), maxY)
+        )
     }
 }

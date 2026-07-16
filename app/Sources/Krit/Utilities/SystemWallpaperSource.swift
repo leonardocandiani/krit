@@ -24,36 +24,29 @@ enum SystemWallpaperSource {
 
     private static let imageExtensions: Set<String> = ["heic", "heif", "jpg", "jpeg", "png"]
 
-    /// The bundled collection (ported from Snapzy, see THIRD_PARTY_NOTICES.md),
-    /// in display order: the showpieces first, the abstract set after.
+    /// KRIT's original Precision Monolith collection in display order.
     private static let bundledWallpapers: [(file: String, name: String)] = [
-        ("default-tahoe-light",      "Tahoe Light"),
-        ("default-tahoe-dark",       "Tahoe Dark"),
-        ("default-macbook-pro-blue", "MacBook Pro Blue"),
-        ("default-macbook-pro-m3",   "MacBook Pro M3"),
-        ("default-helios-dark",      "Helios"),
-        ("default-macintosh-light",  "Macintosh Light"),
-        ("default-macintosh-dark",   "Macintosh Dark"),
-        ("default-abstract-amber",   "Abstract Amber"),
-        ("default-abstract-blue",    "Abstract Blue"),
-        ("default-abstract-cyan",    "Abstract Cyan"),
-        ("default-abstract-magenta", "Abstract Magenta"),
-        ("default-abstract-violet",  "Abstract Violet"),
+        ("krit-monolith-obsidian-cut",   "Obsidian Cut"),
+        ("krit-monolith-cobalt-plane",   "Cobalt Plane"),
+        ("krit-monolith-titanium-fold",  "Titanium Fold"),
+        ("krit-monolith-ember-channel",  "Ember Channel"),
+        ("krit-monolith-porcelain-edge", "Porcelain Edge"),
+        ("krit-monolith-glacier-plane",  "Glacier Plane"),
+        ("krit-monolith-carbon-violet",  "Carbon Violet"),
+        ("krit-monolith-jade-alloy",     "Jade Alloy"),
     ]
 
+    static let bundledWallpaperNames = bundledWallpapers.map(\.name)
+    static let defaultBlurWallpaperName = "Obsidian Cut"
+    private static let defaultBlurWallpaperFile = "krit-monolith-obsidian-cut"
+
     /// Resolves a bundled wallpaper JPG inside Krit_KritKit.bundle, probing the
-    /// same layouts SoundManager does (.app Resources, next to the binary, SPM
-    /// dev bundle). The processed bundle is flat, so a direct filename lookup
+    /// same layouts SoundManager does (.app Resources or next to a raw SwiftPM
+    /// executable). The processed bundle is flat, so a direct filename lookup
     /// inside each candidate is enough.
     private static func bundledWallpaperURL(_ file: String) -> URL? {
         let bundleName = "Krit_KritKit.bundle"
-        var roots: [URL] = []
-        if let resources = Bundle.main.resourceURL {
-            roots.append(resources.appendingPathComponent(bundleName))
-        }
-        roots.append(Bundle.main.bundleURL.appendingPathComponent(bundleName))
-        roots.append(Bundle.module.bundleURL)
-        for root in roots {
+        for root in KritResourceBundleLocator.candidates(named: bundleName) {
             if let bundle = Bundle(url: root),
                let url = bundle.url(forResource: file, withExtension: "jpg") {
                 return url
@@ -63,6 +56,17 @@ enum SystemWallpaperSource {
         }
         return nil
     }
+
+    /// The manifest entries that are actually present in the active resource
+    /// bundle. Kept separate from `all`, whose first entries belong to the user's
+    /// current desktop and imported collection.
+    static var resolvedBundledWallpapers: [Wallpaper] {
+        bundledWallpapers.compactMap { entry in
+            guard let url = bundledWallpaperURL(entry.file) else { return nil }
+            return Wallpaper(name: entry.name, url: url, imageIndex: 0)
+        }
+    }
+
     /// Anything smaller than this on its long edge is a thumbnail asset, not a
     /// real wallpaper, too small to sit behind a screenshot.
     private static let minLongEdge = 1200
@@ -217,13 +221,13 @@ enum SystemWallpaperSource {
     private static func captureDisplayWallpaper(for screen: NSScreen) async -> CGImage? {
         guard let wantID = displayID(of: screen) else { return nil }
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let scDisplay = content.displays.first(where: { $0.displayID == wantID }) else {
-                uiTestLastWallpaperGrabDetail = "no-display(want=\(wantID), displays=\(content.displays.count))"
+            let snapshot = try await ScreenCaptureCatalog.shared.windows(.visibleContent)
+            guard let scDisplay = snapshot.display(id: wantID) else {
+                uiTestLastWallpaperGrabDetail = "no-display(want=\(wantID), displays=\(snapshot.displays.count))"
                 return nil
             }
             // Exclude every window so only the desktop wallpaper remains.
-            let filter = SCContentFilter(display: scDisplay, excludingWindows: content.windows)
+            let filter = SCContentFilter(display: scDisplay, excludingWindows: snapshot.windows)
             let scale = CGFloat(filter.pointPixelScale)
             let config = SCStreamConfiguration()
             config.width = max(1, Int(CGFloat(scDisplay.width) * scale))
@@ -249,14 +253,15 @@ enum SystemWallpaperSource {
     @available(macOS 14.0, *)
     private static func captureWallpaperWindowImage(for screen: NSScreen, onScreenOnly: Bool) async -> CGImage? {
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: onScreenOnly)
+            let query: ScreenCaptureCatalog.Query = onScreenOnly ? .visibleContent : .allContent
+            let snapshot = try await ScreenCaptureCatalog.shared.windows(query)
             let screenFrameCG = cgFrame(of: screen)
             // The desktop wallpaper layer is owned by the Dock on older macOS, but
             // by WindowManager / wallpaper.agent on macOS 26/27 — that "Wallpaper"
             // window's isolated grab returns the real aerial frame (proven: lum ~30
             // dark, where the display-exclude path returned black).
             let wallpaperOwners: Set<String> = ["com.apple.dock", "com.apple.WindowManager", "com.apple.wallpaper.agent"]
-            let candidates = content.windows.filter { window in
+            let candidates = snapshot.windows.filter { window in
                 guard let owner = window.owningApplication?.bundleIdentifier, wallpaperOwners.contains(owner) else { return false }
                 let title = window.title ?? ""
                 if title.hasPrefix("Wallpaper") { return true }
@@ -273,7 +278,7 @@ enum SystemWallpaperSource {
             guard let window = pool.max(by: { lhs, rhs in
                 overlapArea(lhs.frame, screenFrameCG) < overlapArea(rhs.frame, screenFrameCG)
             }) else {
-                uiTestLastWallpaperGrabDetail = "no-candidates(onScreenOnly=\(onScreenOnly), dockWindows=\(content.windows.filter { $0.owningApplication?.bundleIdentifier == "com.apple.dock" }.count))"
+                uiTestLastWallpaperGrabDetail = "no-candidates(onScreenOnly=\(onScreenOnly), dockWindows=\(snapshot.windows.filter { $0.owningApplication?.bundleIdentifier == "com.apple.dock" }.count))"
                 return nil
             }
 
@@ -299,9 +304,8 @@ enum SystemWallpaperSource {
     /// `screen.frame` in CoreGraphics (top-left origin) coordinates, the space
     /// SCWindow.frame lives in. Flips around the primary display's height.
     private static func cgFrame(of screen: NSScreen) -> CGRect? {
-        guard let primary = NSScreen.screens.first else { return nil }
-        let f = screen.frame
-        return CGRect(x: f.origin.x, y: primary.frame.height - f.origin.y - f.height, width: f.width, height: f.height)
+        guard let id = displayID(of: screen) else { return nil }
+        return CGDisplayBounds(id)
     }
 
     private static func frameMatches(_ a: CGRect, _ b: CGRect, tolerance: CGFloat = 2) -> Bool {
@@ -437,8 +441,8 @@ enum SystemWallpaperSource {
             }
         }
 
-        // The curated collection bundled with the app (the Snapzy set; see
-        // THIRD_PARTY_NOTICES.md). This IS the wallpaper section: the old scan
+        // The original Precision Monolith collection bundled with the app. This
+        // IS the wallpaper section: the old scan
         // of every system wallpaper produced an unpredictable soup of assets
         // that varied per machine, which the owner rejected.
         for (file, display) in bundledWallpapers {
@@ -467,14 +471,15 @@ enum SystemWallpaperSource {
 
     private static let thumbnailCache = NSCache<NSString, NSImage>()
 
-    private static func cacheKey(_ wallpaper: Wallpaper) -> NSString {
-        "\(wallpaper.url.path)#\(wallpaper.imageIndex)" as NSString
+    private static func cacheKey(_ wallpaper: Wallpaper, maxPixel: CGFloat) -> NSString {
+        let sizeKey = Int((maxPixel * 1_000).rounded())
+        return "\(wallpaper.url.path)#\(wallpaper.imageIndex)#\(sizeKey)" as NSString
     }
 
     static func thumbnail(for wallpaper: Wallpaper, maxPixel: CGFloat, completion: @escaping (NSImage?) -> Void) {
-        let key = cacheKey(wallpaper)
+        let key = cacheKey(wallpaper, maxPixel: maxPixel)
         if let cached = thumbnailCache.object(forKey: key) {
-            completion(cached)
+            DispatchQueue.main.async { completion(cached) }
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
@@ -491,8 +496,22 @@ enum SystemWallpaperSource {
     /// Downscaled JPEG of the wallpaper, sized for compositing. Kept modest so
     /// history items don't balloon with a 6K source.
     static func backgroundData(for wallpaper: Wallpaper, maxPixel: CGFloat = 2560, completion: @escaping (Data?) -> Void) {
+        backgroundData(from: wallpaper.url, index: wallpaper.imageIndex, maxPixel: maxPixel, completion: completion)
+    }
+
+    /// The deterministic source for the untouched editor's blur tiles. Resolves
+    /// the bundled file directly because `all` is led by the current desktop.
+    static func defaultBlurBackgroundData(maxPixel: CGFloat = 2560, completion: @escaping (Data?) -> Void) {
+        guard let url = bundledWallpaperURL(defaultBlurWallpaperFile) else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
+        backgroundData(from: url, index: 0, maxPixel: maxPixel, completion: completion)
+    }
+
+    private static func backgroundData(from url: URL, index: Int, maxPixel: CGFloat, completion: @escaping (Data?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let data = downscaled(url: wallpaper.url, index: wallpaper.imageIndex, maxPixel: maxPixel).flatMap { cg -> Data? in
+            let data = downscaled(url: url, index: index, maxPixel: maxPixel).flatMap { cg -> Data? in
                 NSBitmapImageRep(cgImage: cg).representation(using: .jpeg, properties: [.compressionFactor: 0.9])
             }
             DispatchQueue.main.async { completion(data) }

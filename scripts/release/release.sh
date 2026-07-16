@@ -14,13 +14,14 @@
 #   echo "release notes here" | scripts/release/release.sh 0.16.0
 #
 # What it does, in order:
-#   1. Verifies the working tree is clean and gh is authenticated.
+#   1. Verifies the working tree, GitHub access, and Apple distribution
+#      credentials before mutating release metadata.
 #   2. Reads the target version from the first argument (e.g. 0.16.0).
 #   3. Bumps CFBundleShortVersionString in app/Info.plist to that version.
-#   4. Builds the app bundle    (app/build-app.sh) and deploys it to /Applications.
-#   5. Packages the DMG         (app/make-dmg.sh)  -> app/KRIT-v<version>-macOS.dmg.
+#   4. Runs tests, builds and verifies the signed app bundle.
+#   5. Packages and notarizes the DMG -> app/KRIT-v<version>-macOS.dmg.
 #   6. Creates an annotated git tag v<version>.
-#   7. Publishes the release    (gh release create) with the DMG attached and
+#   7. Publishes the release    (gh release create) with the notarized DMG attached and
 #      notes from the notes-file argument, stdin, or an auto-generated stub.
 #
 # The DMG artifact name is KRIT-v<version>-macOS.dmg. That suffix is fixed by
@@ -43,6 +44,23 @@ APP_DIR="$REPO_ROOT/app"
 INFO_PLIST="$APP_DIR/Info.plist"
 BUILD_SCRIPT="$APP_DIR/build-app.sh"
 DMG_SCRIPT="$APP_DIR/make-dmg.sh"
+NOTARIZE_SCRIPT="$APP_DIR/notarize-dmg.sh"
+WHATSNEW_FILE="$APP_DIR/Sources/Krit/Resources/WhatsNew.md"
+CHANGELOG_FILE="$REPO_ROOT/CHANGELOG.md"
+CASK_FILE="$REPO_ROOT/Casks/krit.rb"
+APPCAST_FILE="$REPO_ROOT/appcast.xml"
+INSTALL_SCRIPT="$REPO_ROOT/install.sh"
+BUNDLE_LAYOUT_TEST="$SCRIPT_DIR/test-app-bundle-layout.sh"
+
+# A public release must not silently use the ad-hoc development default. Load
+# local credentials early so their absence fails before the version bump changes
+# any tracked source file.
+if [ -f "$APP_DIR/.env.local" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$APP_DIR/.env.local"
+    set +a
+fi
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -52,17 +70,26 @@ info() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# zsh's gitstatusd (running in a parallel interactive shell on this repo) leaves
-# an orphaned .git/index.lock on the external volume, which aborts a git write
-# mid-release. Clear a STALE lock — only when no real git write is in flight — so
-# the release doesn't die after the DMG is already built and signed.
-clear_stale_index_lock() {
+assert_universal_binary() {
+    local label="$1" path="$2" archs required
+    archs="$(lipo -archs "$path" 2>/dev/null)" || \
+        fail "$label is not a readable Mach-O binary: $path"
+    for required in arm64 x86_64; do
+        case " $archs " in
+            *" $required "*) ;;
+            *) fail "$label is missing $required (has: ${archs:-none}): $path" ;;
+        esac
+    done
+    ok "$label is universal: $archs"
+}
+
+# A Git index lock represents an active or interrupted write. A release must
+# never guess that it is stale: deleting a valid lock risks corrupting another
+# Git operation running in the same worktree.
+assert_no_index_lock() {
     local lock="$REPO_ROOT/.git/index.lock"
     [ -e "$lock" ] || return 0
-    if pgrep -f 'git (commit|merge|rebase|add|tag)' >/dev/null 2>&1; then
-        fail "A real git process is writing the index; refusing to clear $lock. Retry once it finishes."
-    fi
-    rm -f "$lock"
+    fail "Git index lock exists at $lock. Refusing to remove it automatically; resolve the active or stale operation before releasing."
 }
 
 # ---------------------------------------------------------------------------
@@ -86,6 +113,9 @@ fi
 TAG="v$VERSION"
 DMG_NAME="KRIT-v$VERSION-macOS.dmg"
 DMG_PATH="$APP_DIR/$DMG_NAME"
+# Keep release assembly isolated from the running development install. A failed
+# release must not overwrite /Applications/KRIT.app before its DMG is notarized.
+RELEASE_APP_PATH="/tmp/krit-release-$VERSION/KRIT.app"
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -95,13 +125,16 @@ info "Running pre-flight checks for $TAG"
 
 [ "$(uname -s)" = "Darwin" ] || fail "Releases must be built on macOS (codesign, hdiutil)."
 
-for cmd in git gh defaults swift hdiutil; do
+for cmd in git gh defaults swift hdiutil codesign security xcrun lipo; do
     command -v "$cmd" >/dev/null 2>&1 || fail "Required command not found: $cmd"
 done
 
 [ -f "$BUILD_SCRIPT" ] || fail "Build script not found: $BUILD_SCRIPT"
 [ -f "$DMG_SCRIPT" ]   || fail "DMG script not found: $DMG_SCRIPT"
+[ -f "$NOTARIZE_SCRIPT" ] || fail "Notarization script not found: $NOTARIZE_SCRIPT"
 [ -f "$INFO_PLIST" ]   || fail "Info.plist not found: $INFO_PLIST"
+[ -f "$INSTALL_SCRIPT" ] || fail "Installer script not found: $INSTALL_SCRIPT"
+[ -f "$BUNDLE_LAYOUT_TEST" ] || fail "Bundle layout test not found: $BUNDLE_LAYOUT_TEST"
 
 # gh must be authenticated, or `gh release create` fails late after a full build.
 if ! gh auth status >/dev/null 2>&1; then
@@ -120,10 +153,41 @@ case "$ORIGIN_URL" in
     *) fail "origin points to $ORIGIN_URL; releases are cut from leonardocandiani/krit." ;;
 esac
 
+CURRENT_BRANCH="$(cd "$REPO_ROOT" && git branch --show-current)"
+if [ "$CURRENT_BRANCH" != "main" ]; then
+    fail "Releases must be cut from main, not '${CURRENT_BRANCH:-detached HEAD}'."
+fi
+
 MAINTAINER_EMAIL="llima.leo.lima@gmail.com"
 GIT_EMAIL="$(cd "$REPO_ROOT" && git config user.email || true)"
 if [ "$GIT_EMAIL" != "$MAINTAINER_EMAIL" ]; then
     fail "git user.email is '${GIT_EMAIL:-unset}'; the release commit must be authored as $MAINTAINER_EMAIL. Run: git config user.email $MAINTAINER_EMAIL"
+fi
+
+# Public releases require a Developer ID signature and notarization. An ad-hoc
+# bundle is useful for local development, but it cannot be a GitHub or Sparkle
+# release artifact.
+case "${KRIT_CODESIGN_IDENTITY:-}" in
+    "Developer ID Application:"*) ;;
+    *) fail "KRIT_CODESIGN_IDENTITY must name a Developer ID Application certificate. Ad-hoc signing is local-development only." ;;
+esac
+
+if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$KRIT_CODESIGN_IDENTITY"; then
+    fail "Developer ID identity not available in this keychain: $KRIT_CODESIGN_IDENTITY"
+fi
+
+if [ -n "${KRIT_NOTARY_APPLE_ID:-}" ] || [ -n "${KRIT_NOTARY_PASSWORD:-}" ] || [ -n "${KRIT_NOTARY_TEAM_ID:-}" ]; then
+    if [ -z "${KRIT_NOTARY_APPLE_ID:-}" ] || [ -z "${KRIT_NOTARY_PASSWORD:-}" ] || [ -z "${KRIT_NOTARY_TEAM_ID:-}" ]; then
+        fail "Set all of KRIT_NOTARY_APPLE_ID, KRIT_NOTARY_PASSWORD, and KRIT_NOTARY_TEAM_ID, or use KRIT_NOTARY_PROFILE."
+    fi
+elif [ -z "${KRIT_NOTARY_PROFILE:-}" ]; then
+    fail "Set KRIT_NOTARY_PROFILE or the full direct notarization credential set before releasing."
+elif ! security find-generic-password -l "$KRIT_NOTARY_PROFILE" >/dev/null 2>&1; then
+    fail "Notarization profile not found in this keychain: $KRIT_NOTARY_PROFILE"
+fi
+
+if grep -Fq "com.apple.quarantine" "$CASK_FILE" "$INSTALL_SCRIPT"; then
+    fail "Public release still removes the Gatekeeper quarantine attribute. Remove the legacy workaround first."
 fi
 
 # The EdDSA private key must be in the login keychain BEFORE we spend minutes
@@ -160,7 +224,61 @@ ok "Pre-flight checks passed."
 # ---------------------------------------------------------------------------
 
 NOTES_TMP="$(mktemp -t krit-release-notes)"
-cleanup() { rm -f "$NOTES_TMP"; }
+METADATA_BACKUP_DIR="$(mktemp -d -t krit-release-metadata)"
+RELEASE_METADATA_MUTATED=false
+RELEASE_COMMITTED=false
+METADATA_FILES=(
+    "$INFO_PLIST"
+    "$WHATSNEW_FILE"
+    "$CHANGELOG_FILE"
+    "$APPCAST_FILE"
+    "$CASK_FILE"
+)
+
+backup_release_metadata() {
+    local path name
+    for path in "${METADATA_FILES[@]}"; do
+        name="$(basename "$path")"
+        if [ -e "$path" ]; then
+            cp -p "$path" "$METADATA_BACKUP_DIR/$name"
+        else
+            : > "$METADATA_BACKUP_DIR/$name.absent"
+        fi
+    done
+}
+
+restore_release_metadata() {
+    local path name
+    for path in "${METADATA_FILES[@]}"; do
+        name="$(basename "$path")"
+        if [ -f "$METADATA_BACKUP_DIR/$name" ]; then
+            cp -p "$METADATA_BACKUP_DIR/$name" "$path"
+        elif [ -f "$METADATA_BACKUP_DIR/$name.absent" ]; then
+            rm -f "$path"
+        fi
+    done
+    git reset --quiet HEAD -- "${METADATA_FILES[@]}" || true
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT HUP TERM
+    if [ "$status" -ne 0 ] && [ "$RELEASE_METADATA_MUTATED" = true ] && [ "$RELEASE_COMMITTED" != true ]; then
+        info "Release failed before commit; restoring release metadata."
+        restore_release_metadata || true
+    fi
+    rm -f "$NOTES_TMP" || true
+    rm -rf "$METADATA_BACKUP_DIR" || true
+    return "$status"
+}
+
+handle_signal() {
+    exit "$1"
+}
+
+trap 'handle_signal 130' INT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 143' TERM
 trap cleanup EXIT
 
 if [ -n "$NOTES_FILE" ]; then
@@ -201,6 +319,9 @@ fi
 # Bump the app version
 # ---------------------------------------------------------------------------
 
+backup_release_metadata
+RELEASE_METADATA_MUTATED=true
+
 CURRENT_VERSION="$(defaults read "$INFO_PLIST" CFBundleShortVersionString 2>/dev/null || true)"
 info "Bumping CFBundleShortVersionString: ${CURRENT_VERSION:-unknown} -> $VERSION"
 
@@ -215,14 +336,12 @@ ok "Version set to $VERSION in app/Info.plist"
 # Bundle the release notes so the in-app "What's New" panel shows them after the
 # update. Written BEFORE the build so it ships inside the app; the leading
 # "version:" line gates the panel to this exact build.
-WHATSNEW_FILE="$APP_DIR/Sources/Krit/Resources/WhatsNew.md"
 { printf 'version: %s\n' "$VERSION"; cat "$NOTES_TMP"; } > "$WHATSNEW_FILE"
 ok "What's New notes bundled for $VERSION"
 
 # Prepend the same notes to CHANGELOG.md (Keep-a-Changelog style: newest first,
 # right under the "# Changelog" heading). Section headers in the notes are demoted
 # to ### so they nest under the ## version. Skipped if the entry already exists.
-CHANGELOG_FILE="$REPO_ROOT/CHANGELOG.md"
 if [ -f "$CHANGELOG_FILE" ] && ! grep -q "^## $VERSION$" "$CHANGELOG_FILE"; then
     CL_TMP="$(mktemp -t krit-changelog)"
     {
@@ -242,23 +361,48 @@ fi
 # Build the app
 # ---------------------------------------------------------------------------
 
+info "Running test suite"
+(cd "$APP_DIR" && swift test --disable-index-store --force-resolved-versions)
+ok "Test suite passed."
+
 info "Building KRIT.app (release)"
-bash "$BUILD_SCRIPT"
-ok "App built and deployed to /Applications/KRIT.app"
+RELEASE_BUILD_STAMP="$(date +%Y%m%d.%H%M.%S)"
+KRIT_ARCHS="arm64 x86_64" \
+KRIT_APP_DESTINATION="$RELEASE_APP_PATH" \
+    bash "$BUILD_SCRIPT" --build-stamp "$RELEASE_BUILD_STAMP"
+ok "App built at $RELEASE_APP_PATH"
+
+assert_universal_binary "KRIT app" "$RELEASE_APP_PATH/Contents/MacOS/KRIT"
+assert_universal_binary "krit CLI" "$RELEASE_APP_PATH/Contents/Helpers/krit"
+
+info "Verifying the signed app bundle"
+codesign --verify --deep --strict --verbose=4 "$RELEASE_APP_PATH"
+ok "App signature verified."
+
+info "Verifying resource bundle independence"
+KRIT_BUILD_PATHS_TO_HIDE=/tmp/krit-app-build \
+    bash "$BUNDLE_LAYOUT_TEST" "$RELEASE_APP_PATH"
+ok "Resource bundle independence verified."
 
 # ---------------------------------------------------------------------------
 # Package the DMG
 # ---------------------------------------------------------------------------
 
-# make-dmg.sh reads the version from the installed app and writes the DMG next
-# to itself (app/). Clear any stale DMG for this version first so we package a
-# fresh one.
+# make-dmg.sh reads the version from the isolated release bundle and writes the
+# DMG next to itself (app/). Clear any stale DMG for this version first so we
+# package a fresh one.
 rm -f "$DMG_PATH"
 
 info "Packaging $DMG_NAME"
-bash "$DMG_SCRIPT"
+KRIT_APP_PATH="$RELEASE_APP_PATH" bash "$DMG_SCRIPT"
 
 [ -f "$DMG_PATH" ] || fail "Expected DMG not produced: $DMG_PATH"
+
+info "Notarizing and stapling $DMG_NAME"
+bash "$NOTARIZE_SCRIPT" "$DMG_PATH"
+xcrun stapler validate "$DMG_PATH"
+ok "DMG notarization verified."
+
 DMG_SHA="$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')"
 ok "DMG packaged: $DMG_PATH"
 info "DMG sha256: $DMG_SHA"
@@ -301,18 +445,17 @@ ED_SIG="$("$SIGN_UPDATE" -p "$DMG_PATH")"
 ok "EdDSA signature: $ED_SIG"
 
 # sparkle:version compares against the installed app's CFBundleVersion, which
-# build-app.sh stamps with the build time (YYYYMMDD.HHMM) — monotonic across
-# releases by construction.
-BUILD_NUMBER="$(defaults read /Applications/KRIT.app/Contents/Info CFBundleVersion)"
+# release.sh supplies one build stamp with second precision
+# (YYYYMMDD.HHMM.SS), keeping the appcast and the signed bundle in lockstep.
+BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$RELEASE_APP_PATH/Contents/Info.plist")"
 
 info "Updating appcast.xml"
-bash "$SCRIPT_DIR/update-appcast.sh" "$VERSION" "$BUILD_NUMBER" "$DMG_PATH" "$ED_SIG" "$REPO_ROOT/appcast.xml"
+bash "$SCRIPT_DIR/update-appcast.sh" "$VERSION" "$BUILD_NUMBER" "$DMG_PATH" "$ED_SIG" "$APPCAST_FILE"
 
 # ---------------------------------------------------------------------------
 # Bump the Homebrew cask
 # ---------------------------------------------------------------------------
 
-CASK_FILE="$REPO_ROOT/Casks/krit.rb"
 if [ -f "$CASK_FILE" ]; then
     info "Bumping Casks/krit.rb to $VERSION"
     sed -i '' -e "s/^  version \".*\"/  version \"$VERSION\"/" \
@@ -332,9 +475,9 @@ fi
 # version but the download 404s (the release is still a draft while assets
 # upload), and every in-app update attempted in that window fails.
 info "Committing release metadata"
-clear_stale_index_lock
-git add "$INFO_PLIST" "$REPO_ROOT/appcast.xml" "$CASK_FILE" "$WHATSNEW_FILE" "$CHANGELOG_FILE"
-clear_stale_index_lock
+assert_no_index_lock
+git add "$INFO_PLIST" "$APPCAST_FILE" "$CASK_FILE" "$WHATSNEW_FILE" "$CHANGELOG_FILE"
+assert_no_index_lock
 git commit -m "chore: release $TAG
 
 - bump CFBundleShortVersionString to $VERSION
@@ -342,9 +485,10 @@ git commit -m "chore: release $TAG
 - cask digest $DMG_SHA
 
 Autor: Leonardo Candiani"
+RELEASE_COMMITTED=true
 
 info "Creating git tag $TAG"
-clear_stale_index_lock
+assert_no_index_lock
 git tag -a "$TAG" -m "KRIT $TAG"
 
 info "Publishing GitHub release $TAG with $DMG_NAME"
@@ -368,7 +512,7 @@ for attempt in 1 2 3 4 5; do
     info "  upload attempt $attempt did not complete; retrying"
     sleep 5
 done
-[ "$dmg_uploaded" = true ] || fail "DMG upload failed after retries. Finish with: gh release upload $TAG $DMG_PATH --clobber && gh release edit $TAG --draft=false && git push origin HEAD"
+[ "$dmg_uploaded" = true ] || fail "DMG upload failed after retries. Finish with: gh release upload $TAG $DMG_PATH --clobber && gh release edit $TAG --draft=false && git push origin HEAD:refs/heads/main"
 
 # Only now, with the DMG downloadable, publish the release and move main. This
 # ordering is what keeps the updater from ever announcing a version whose
@@ -376,7 +520,7 @@ done
 gh release edit "$TAG" --draft=false
 
 info "Publishing appcast (in-app updates go live)"
-git push origin HEAD
+git push origin HEAD:refs/heads/main
 
 ok "Released $TAG"
 printf '\n'

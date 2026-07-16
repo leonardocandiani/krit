@@ -6,9 +6,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/v0.16.0/install.sh | bash
 #   VERSION=0.16.0 bash install.sh
 #
-# The script downloads the DMG from GitHub Releases, mounts it, copies KRIT.app
-# to /Applications, unmounts, and strips the quarantine attribute so macOS does
-# not block the (ad-hoc signed) app on first launch.
+# The script downloads the notarized DMG from GitHub Releases, mounts it, copies
+# KRIT.app to /Applications, and lets Gatekeeper validate the downloaded app.
 
 set -euo pipefail
 
@@ -42,7 +41,7 @@ fail() { printf "%b✖%b %s\n" "${RED}" "${RESET}" "$*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || fail "KRIT is a macOS app. This script only works on macOS."
 
-for cmd in curl hdiutil xattr shasum; do
+for cmd in curl hdiutil shasum; do
     command -v "$cmd" >/dev/null 2>&1 || fail "Required command not found: $cmd"
 done
 
@@ -136,16 +135,6 @@ info "Unmounting disk image…"
 hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null || true
 
 ok "Installed KRIT.app to ${INSTALL_DIR}"
-
-# ---------------------------------------------------------------------------
-# Post-install
-# ---------------------------------------------------------------------------
-
-# KRIT is ad-hoc signed, not notarized, so macOS quarantines the downloaded app.
-# Strip the quarantine flag so it launches without a Gatekeeper block.
-info "Removing quarantine attribute…"
-xattr -rd com.apple.quarantine "${INSTALL_DIR}/KRIT.app" 2>/dev/null || true
-ok "Quarantine attribute removed"
 
 printf "\n%bInstallation complete!%b\n\n" "${GREEN}${BOLD}" "${RESET}"
 printf "  Launch KRIT from your Applications folder or Spotlight.\n"

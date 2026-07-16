@@ -3,9 +3,8 @@ import AppKit
 @MainActor
 extension NSApplication {
     /// Windows that must count as "persistent" for activation-policy purposes even
-    /// though their style mask is borderless. The only opt-in today is the TourKit
-    /// tour window, a borderless card with none of the titled/closable masks the
-    /// heuristic below keys off. Held weakly so a closed window drops out on its own.
+    /// though their style mask is borderless. Held weakly so a closed window drops
+    /// out on its own.
     private static let activationOptInWindows = NSHashTable<NSWindow>.weakObjects()
 
     /// Opt a non-standard (borderless) window into the "still open" heuristic, so
@@ -17,6 +16,10 @@ extension NSApplication {
 
     func removeActivationPersistentWindow(_ window: NSWindow) {
         Self.activationOptInWindows.remove(window)
+    }
+
+    func isActivationPersistentWindow(_ window: NSWindow) -> Bool {
+        Self.activationOptInWindows.allObjects.contains { $0 === window }
     }
 
     func restoreBackgroundOnlyActivationPolicyIfNeeded(excluding closingWindow: NSWindow? = nil) {
@@ -41,8 +44,16 @@ extension NSApplication {
                 return true
             }
 
-            if Self.activationOptInWindows.allObjects.contains(where: { $0 === window }) {
+            if isActivationPersistentWindow(window) {
                 return true
+            }
+
+            // AppKit's internal status-bar windows can carry `.resizable` after
+            // menu tracking even though they are not user-facing content. Their
+            // lifecycle must never keep this accessory app activated. A custom
+            // status-level surface that does need that behavior must opt in above.
+            if window.level.rawValue >= NSWindow.Level.statusBar.rawValue {
+                return false
             }
 
             let persistentMasks: NSWindow.StyleMask = [.titled, .closable, .resizable, .miniaturizable]

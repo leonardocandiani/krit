@@ -34,6 +34,10 @@ final class AreaSelectionWindow: NSObject {
     /// hotkey right after Esc felt laggy and the overlay barely held focus. Nil
     /// when KRIT itself was already frontmost, so we never steal focus back to it.
     private weak var appToRestoreOnCancel: NSRunningApplication?
+    private var pendingCompletion: DispatchWorkItem?
+    private var didFinish = false
+    private var didCancel = false
+    private var cursorPushed = false
 
     init(mode: SelectionMode, completion: @escaping Completion) {
         self.mode = mode
@@ -42,7 +46,10 @@ final class AreaSelectionWindow: NSObject {
 
     private var keyMonitor: Any?
 
-    func prepareAndShow(engine: CaptureEngine) async {
+    func prepareAndShow(
+        engine: CaptureEngine,
+        canPresent: @escaping () -> Bool = { true }
+    ) async {
         AreaSelectionDiag.mark("prepareEntry")
 
         // Freeze each display's desktop FIRST, before activating KRIT or raising
@@ -85,6 +92,14 @@ final class AreaSelectionWindow: NSObject {
             return frames
         }
         AreaSelectionDiag.mark("freezesCaptured")
+
+        // The frozen backdrop is asynchronous. A newer interactive intent may
+        // claim the screen while it is in flight, in which case this selector
+        // must disappear instead of presenting above the newer surface.
+        guard !didCancel, canPresent() else {
+            AreaSelectionDiag.mark("presentationCancelled")
+            return
+        }
 
         // KRIT is an LSUIElement accessory app: while another app is frontmost it
         // stays inactive, and a non-activating panel of an inactive accessory app
@@ -131,6 +146,7 @@ final class AreaSelectionWindow: NSObject {
         }
 
         NSCursor.crosshair.push()
+        cursorPushed = true
     }
     private func focusFirstOverlay() {
         guard !overlays.isEmpty, let first = overlays.first else { return }
@@ -142,14 +158,20 @@ final class AreaSelectionWindow: NSObject {
     }
 
     private func finish(rect: CGRect, screen: NSScreen, windowID: CGWindowID? = nil) {
-        NSCursor.pop()
+        guard !didFinish, !didCancel else { return }
+        didFinish = true
+        popCursorIfNeeded()
         // Latch the frozen crop while the overlays still exist: tearDown() empties
         // them, and the deferred completion below is what reads the crop.
         pendingFrozenCrop = croppedFrozenImage(globalRect: rect, on: screen)
         tearDown()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            self?.completion(rect, screen, windowID)
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.didCancel else { return }
+            self.pendingCompletion = nil
+            self.completion(rect, screen, windowID)
         }
+        pendingCompletion = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: workItem)
     }
 
     /// Automation/test hook: completes the selection exactly like a mouse-up,
@@ -238,13 +260,19 @@ final class AreaSelectionWindow: NSObject {
     }
 
     private func finishColorPick(_ hex: String) {
-        NSCursor.pop()
+        guard !didFinish, !didCancel else { return }
+        didFinish = true
+        popCursorIfNeeded()
         tearDown()
         onColorPicked?(hex)
     }
 
     func cancel() {
-        NSCursor.pop()
+        guard !didCancel else { return }
+        didCancel = true
+        pendingCompletion?.cancel()
+        pendingCompletion = nil
+        popCursorIfNeeded()
         pendingFrozenCrop = nil
         tearDown()
         // Hand activation back to the app the overlay stole it from, rather than
@@ -256,6 +284,12 @@ final class AreaSelectionWindow: NSObject {
         appToRestoreOnCancel = nil
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         completion(nil, screen, nil)
+    }
+
+    private func popCursorIfNeeded() {
+        guard cursorPushed else { return }
+        NSCursor.pop()
+        cursorPushed = false
     }
 
     private func tearDown() {
@@ -274,6 +308,28 @@ final class AreaSelectionWindow: NSObject {
 enum AreaSelectionDiag {
     nonisolated(unsafe) static var timeline: [String: CFTimeInterval] = [:]
     static func mark(_ name: String) { timeline[name] = CACurrentMediaTime() }
+}
+
+/// The capture pipeline owns one ScreenCaptureKit display at a time, so an area
+/// gesture must never produce a rect that crosses into a neighboring display.
+enum AreaSelectionGeometry {
+    static func rect(from start: CGPoint, to current: CGPoint, constrainedTo bounds: CGRect) -> CGRect {
+        let boundedStart = clampedPoint(start, to: bounds)
+        let boundedCurrent = clampedPoint(current, to: bounds)
+        return CGRect(
+            x: min(boundedStart.x, boundedCurrent.x),
+            y: min(boundedStart.y, boundedCurrent.y),
+            width: abs(boundedCurrent.x - boundedStart.x),
+            height: abs(boundedCurrent.y - boundedStart.y)
+        )
+    }
+
+    static func clampedPoint(_ point: CGPoint, to bounds: CGRect) -> CGPoint {
+        CGPoint(
+            x: min(max(point.x, bounds.minX), bounds.maxX),
+            y: min(max(point.y, bounds.minY), bounds.maxY)
+        )
+    }
 }
 
 @MainActor
@@ -318,6 +374,7 @@ private final class SelectionOverlayWindow: NSPanel {
         // the rect on the bare sides, never over the app you wanted to shoot. Still
         // a non-activating panel, so that app stays frontmost underneath.
         level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+        sharingType = .none
         ignoresMouseEvents = false
         acceptsMouseMovedEvents = true
         hidesOnDeactivate = false
@@ -883,25 +940,21 @@ private final class SelectionOverlayView: NSView {
             }
             return
         }
-        startPoint = event.locationInWindow
+        let point = AreaSelectionGeometry.clampedPoint(event.locationInWindow, to: bounds)
+        startPoint = point
         isSelecting = true
         currentRect = .zero
-        mousePosition = event.locationInWindow  // keep the loupe anchored at the drag corner
+        mousePosition = point  // keep the loupe anchored at the drag corner
         setNeedsDisplay(bounds)
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard mode == .area, let start = startPoint else { return }
-        let current = event.locationInWindow
+        let current = AreaSelectionGeometry.clampedPoint(event.locationInWindow, to: bounds)
         let previousRect = currentRect
         let previousCursor = mousePosition
         mousePosition = current
-        currentRect = NSRect(
-            x: min(start.x, current.x),
-            y: min(start.y, current.y),
-            width: abs(current.x - start.x),
-            height: abs(current.y - start.y)
-        )
+        currentRect = AreaSelectionGeometry.rect(from: start, to: current, constrainedTo: bounds)
         // The loupe rides the drag corner; invalidate its old/new footprint.
         if let previousCursor { invalidateCursorArtifacts(at: previousCursor) }
         invalidateCursorArtifacts(at: current)

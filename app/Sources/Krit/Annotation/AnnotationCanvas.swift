@@ -190,7 +190,19 @@ final class AnnotationCanvas: NSView {
         let options: ScreenshotBackgroundOptions
         let size: NSSize
     }
-    private var pendingComposeKey: ComposeKey?
+    private struct CompositeRequest {
+        let key: ComposeKey
+        let source: CompositeImagePayload
+        let options: ScreenshotBackgroundOptions
+        let size: NSSize
+    }
+    private static let presentationComposeQueue = DispatchQueue(
+        label: "com.krit.annotation.presentation-compose",
+        qos: .userInitiated
+    )
+    private var compositeScheduler = LatestWorkScheduler<ComposeKey>()
+    private var queuedCompositeRequest: CompositeRequest?
+    private var uiTestPresentationCompositeStartCount = 0
 
 
     // MARK: - Init
@@ -406,7 +418,7 @@ final class AnnotationCanvas: NSView {
             cachedPresentationSource = image
             cachedPresentationOptions = backgroundOptions
             cachedPresentationSize = bounds.size
-            pendingComposeKey = nil
+            resetAsyncCompositeScheduler()
             return composed
         }
 
@@ -420,32 +432,76 @@ final class AnnotationCanvas: NSView {
     /// requests the current state.
     private func requestAsyncComposite(for image: NSImage, options: ScreenshotBackgroundOptions, size: NSSize) {
         let key = ComposeKey(source: ObjectIdentifier(image), options: options, size: size)
-        if pendingComposeKey == key { return }
-        pendingComposeKey = key
+        let submission = compositeScheduler.submit(key)
+        if submission == .alreadyActive {
+            queuedCompositeRequest = nil
+            return
+        }
         // Realize the source bitmap on the main thread so the background compose
         // only reads an already-decoded, immutable CGImage (no rep mutation race).
         _ = image.bestCGImage
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let composed = ScreenshotBackgroundComposer.composeIfNeeded(image, options: options, quality: .display)
+        let request = CompositeRequest(
+            key: key,
+            source: CompositeImagePayload(image),
+            options: options,
+            size: size
+        )
+        if submission == .start {
+            startAsyncComposite(request)
+        } else {
+            // One active composition is already spending CPU. Keep only this latest
+            // replacement and start it after that work settles.
+            queuedCompositeRequest = request
+        }
+    }
+
+    private func startAsyncComposite(_ request: CompositeRequest) {
+        uiTestPresentationCompositeStartCount += 1
+        Self.presentationComposeQueue.async { [weak self] in
+            let composed = CompositeImagePayload(
+                ScreenshotBackgroundComposer.composeIfNeeded(
+                    request.source.image,
+                    options: request.options,
+                    quality: .display
+                )
+            )
             DispatchQueue.main.async {
-                guard let self else { return }
-                guard self.backgroundImage === image,
-                      self.backgroundOptions == options,
-                      self.bounds.size == size else {
-                    // State moved on while composing: drop this one and let the next
-                    // draw request the now-current backdrop.
-                    if self.pendingComposeKey == key { self.pendingComposeKey = nil }
-                    self.setNeedsDisplay(self.bounds)
-                    return
-                }
-                self.cachedPresentationImage = composed
-                self.cachedPresentationSource = image
-                self.cachedPresentationOptions = options
-                self.cachedPresentationSize = size
-                self.pendingComposeKey = nil
-                self.setNeedsDisplay(self.bounds)
+                self?.finishAsyncComposite(request, composed: composed)
             }
         }
+    }
+
+    private func finishAsyncComposite(_ request: CompositeRequest, composed: CompositeImagePayload) {
+        let completedActiveRequest = compositeScheduler.active == request.key
+        let nextKey = compositeScheduler.complete(request.key)
+
+        if completedActiveRequest,
+           backgroundImage === request.source.image,
+           backgroundOptions == request.options,
+           bounds.size == request.size {
+            cachedPresentationImage = composed.image
+            cachedPresentationSource = request.source.image
+            cachedPresentationOptions = request.options
+            cachedPresentationSize = request.size
+        }
+
+        if let nextKey {
+            guard let nextRequest = queuedCompositeRequest, nextRequest.key == nextKey else {
+                // The queue can only mismatch after a test/cache reset. Return to a
+                // neutral state and let the next draw submit the live request.
+                resetAsyncCompositeScheduler()
+                setNeedsDisplay(bounds)
+                return
+            }
+            queuedCompositeRequest = nil
+            startAsyncComposite(nextRequest)
+        }
+        setNeedsDisplay(bounds)
+    }
+
+    private func resetAsyncCompositeScheduler() {
+        compositeScheduler = LatestWorkScheduler<ComposeKey>()
+        queuedCompositeRequest = nil
     }
 
     /// Test-only: drop the composed-backdrop cache so the next draw takes the miss
@@ -455,7 +511,22 @@ final class AnnotationCanvas: NSView {
         cachedPresentationSource = nil
         cachedPresentationOptions = nil
         cachedPresentationSize = .zero
-        pendingComposeKey = nil
+        resetAsyncCompositeScheduler()
+    }
+
+    func uiTestResetPresentationCompositeStartCount() {
+        uiTestPresentationCompositeStartCount = 0
+    }
+
+    func uiTestCurrentPresentationCompositeStartCount() -> Int {
+        uiTestPresentationCompositeStartCount
+    }
+
+    func uiTestHasPresentationCache(options: ScreenshotBackgroundOptions) -> Bool {
+        cachedPresentationImage != nil
+            && cachedPresentationSource === backgroundImage
+            && cachedPresentationOptions == options
+            && cachedPresentationSize == bounds.size
     }
 
     private func backgroundImageRect(for image: NSImage) -> CGRect {
@@ -3223,6 +3294,17 @@ final class AnnotationCanvas: NSView {
         let img = NSImage(size: pointSize)
         img.addRepresentation(rep)
         return img
+    }
+}
+
+/// Background composition only receives an already-realized screenshot and
+/// creates a new result. Neither image is mutated while it crosses the worker
+/// queue boundary, so this explicitly models that ownership transfer.
+private final class CompositeImagePayload: @unchecked Sendable {
+    let image: NSImage
+
+    init(_ image: NSImage) {
+        self.image = image
     }
 }
 

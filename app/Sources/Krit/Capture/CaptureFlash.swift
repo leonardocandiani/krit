@@ -112,7 +112,7 @@ enum CaptureFlash {
         window.hasShadow = false
         // Keep the flash/ghost out of any concurrent recording. In UI-test mode
         // it stays capturable so the harness can film the fly-to-tray handoff.
-        window.sharingType = ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" ? .readWrite : .none
+        window.sharingType = KritTestHarness.isEnabled ? .readWrite : .none
 
         let host = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
         host.wantsLayer = true

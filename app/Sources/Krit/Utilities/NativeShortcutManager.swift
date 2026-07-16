@@ -68,17 +68,31 @@ enum NativeShortcutManager {
     /// Only shown once (tracked via UserDefaults).
     @MainActor
     static func promptIfNeeded(onDisabled: (() -> Void)? = nil) {
-        guard nativeShortcutsEnabled else {
+        let shortcutsEnabled = nativeShortcutsEnabled
+        guard shortcutsEnabled else {
             UserDefaults.standard.set(true, forKey: promptKey)
             onDisabled?()
             return
         }
 
-        if UserDefaults.standard.bool(forKey: promptKey) {
-            UserDefaults.standard.removeObject(forKey: promptKey)
-        }
+        let hasPromptedBefore = UserDefaults.standard.bool(forKey: promptKey)
+        guard shouldOfferConflictResolution(
+            nativeShortcutsEnabled: shortcutsEnabled,
+            hasPromptedBefore: hasPromptedBefore
+        ) else { return }
 
+        // Record the offer before entering the modal session. Choosing System
+        // Settings instead of the automatic fix must not make the alert recur
+        // on every launch.
+        UserDefaults.standard.set(true, forKey: promptKey)
         showConflictAlert(onDisabled: onDisabled)
+    }
+
+    static func shouldOfferConflictResolution(
+        nativeShortcutsEnabled: Bool,
+        hasPromptedBefore: Bool
+    ) -> Bool {
+        nativeShortcutsEnabled && !hasPromptedBefore
     }
 
     @MainActor

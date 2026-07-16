@@ -29,19 +29,33 @@ enum ImageExporter {
         }
     }
 
+    enum SaveCollisionPolicy: Sendable {
+        /// Respect an explicit destination, as selected in Save As.
+        case overwrite
+        /// Keep every generated autosave by choosing the next available suffix.
+        case uniquify
+    }
+
     private static let webpUTI = "org.webmproject.webp" as CFString
     private static var activeSavePanels: [NSSavePanel] = []
     private static var activeSaveAccessories: [SaveFormatPicker] = []
+    private static let generatedSaveLock = NSLock()
 
     // MARK: - Clipboard
 
+    @MainActor
     static func copyToClipboard(image: NSImage) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
         // PNG only, NSPasteboard synthesizes TIFF on demand for legacy readers,
         // and every modern macOS app (Slack, Notion, Figma, Preview, Messages)
         // prefers PNG. Skipping the TIFF encode saves ~30 MB + ~50 ms per 4K copy.
         guard let cg = image.bestCGImage, let png = pngData(from: cg) else { return }
+        copyPNGToClipboard(png)
+    }
+
+    @MainActor
+    static func copyPNGToClipboard(_ png: Data) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
         pb.declareTypes([.png], owner: nil)
         pb.setData(png, forType: .png)
     }
@@ -86,7 +100,49 @@ enum ImageExporter {
 
         activeSavePanels.append(panel)
 
-        let handler: (NSApplication.ModalResponse) -> Void = { response in
+        let context = SavePanelContext(
+            panel: panel,
+            formatPicker: formatPicker,
+            image: image,
+            presentingWindow: presentingWindow,
+            completion: completion
+        )
+        let handler: @Sendable (NSApplication.ModalResponse) -> Void = { response in
+            MainActor.assumeIsolated {
+                context.finish(response)
+            }
+        }
+
+        if let presentingWindow {
+            panel.beginSheetModal(for: presentingWindow, completionHandler: handler)
+        } else {
+            panel.begin(completionHandler: handler)
+        }
+    }
+
+    @MainActor
+    private final class SavePanelContext {
+        private let panel: NSSavePanel
+        private let formatPicker: SaveFormatPicker
+        private let image: NSImage
+        private weak var presentingWindow: NSWindow?
+        private let completion: ((SavePanelResult) -> Void)?
+
+        init(
+            panel: NSSavePanel,
+            formatPicker: SaveFormatPicker,
+            image: NSImage,
+            presentingWindow: NSWindow?,
+            completion: ((SavePanelResult) -> Void)?
+        ) {
+            self.panel = panel
+            self.formatPicker = formatPicker
+            self.image = image
+            self.presentingWindow = presentingWindow
+            self.completion = completion
+        }
+
+        func finish(_ response: NSApplication.ModalResponse) {
             activeSavePanels.removeAll { $0 === panel }
             activeSaveAccessories.removeAll { $0 === formatPicker }
 
@@ -108,12 +164,6 @@ enum ImageExporter {
             }
 
             completion?(.saved(savedURL))
-        }
-
-        if let presentingWindow {
-            panel.beginSheetModal(for: presentingWindow, completionHandler: handler)
-        } else {
-            panel.begin(completionHandler: handler)
         }
     }
 
@@ -139,7 +189,11 @@ enum ImageExporter {
     // MARK: - Silent save
 
     @discardableResult
-    static func save(image: NSImage, to url: URL) -> URL? {
+    static func save(
+        image: NSImage,
+        to url: URL,
+        collisionPolicy: SaveCollisionPolicy = .overwrite
+    ) -> URL? {
         // Extract the CGImage once and reuse it for whichever encoder runs.
         guard let cg = image.bestCGImage else {
             print("[KRIT] Save failed: image has no CGImage backing")
@@ -164,15 +218,74 @@ enum ImageExporter {
             print("[KRIT] Save failed: unable to encode image")
             return nil
         }
+        return write(data, to: outputURL, collisionPolicy: collisionPolicy)
+    }
+
+    /// Writes bytes already produced by a per-capture artifact cache. The actual
+    /// extension may differ from the request only when WebP is unavailable and
+    /// the encoder intentionally falls back to PNG.
+    @discardableResult
+    nonisolated static func save(
+        encoded capture: EncodedCapture,
+        to requestedURL: URL,
+        collisionPolicy: SaveCollisionPolicy = .overwrite
+    ) -> URL? {
+        let currentExtension = requestedURL.pathExtension.lowercased()
+        let outputURL = currentExtension == capture.ext
+            ? requestedURL
+            : requestedURL.deletingPathExtension().appendingPathExtension(capture.ext)
+        return write(capture.data, to: outputURL, collisionPolicy: collisionPolicy)
+    }
+
+    private static func write(
+        _ data: Data,
+        to requestedURL: URL,
+        collisionPolicy: SaveCollisionPolicy
+    ) -> URL? {
         do {
-            let dir = outputURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try data.write(to: outputURL, options: .atomic)
+            try FileManager.default.createDirectory(
+                at: requestedURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let outputURL: URL
+            switch collisionPolicy {
+            case .overwrite:
+                try data.write(to: requestedURL, options: .atomic)
+                outputURL = requestedURL
+            case .uniquify:
+                outputURL = try generatedSaveLock.withLock {
+                    let candidate = firstAvailableURL(for: requestedURL)
+                    try data.write(to: candidate, options: .atomic)
+                    return candidate
+                }
+            }
             HistoryManager.applyScreenshotMetadata(to: outputURL.path, rect: nil)
             return outputURL
         } catch {
-            print("[KRIT] Save failed at \(outputURL.path): \(error)")
+            print("[KRIT] Save failed at \(requestedURL.path): \(error)")
             return nil
+        }
+    }
+
+    private static func firstAvailableURL(for requestedURL: URL) -> URL {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: requestedURL.path) else {
+            return requestedURL
+        }
+
+        let directory = requestedURL.deletingLastPathComponent()
+        let baseName = requestedURL.deletingPathExtension().lastPathComponent
+        let ext = requestedURL.pathExtension
+        var suffix = 2
+        while true {
+            let name = ext.isEmpty
+                ? "\(baseName) \(suffix)"
+                : "\(baseName) \(suffix).\(ext)"
+            let candidate = directory.appendingPathComponent(name)
+            if !fileManager.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+            suffix += 1
         }
     }
 

@@ -1,154 +1,188 @@
 #!/usr/bin/env swift
 import AppKit
 import CoreGraphics
+import CoreText
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
-// The window is 600x400 points. We MUST generate a 600x400 image so create-dmg
-// maps it 1:1 to the window coordinate system.
-let width: CGFloat = 600
-let height: CGFloat = 400
+private let pixelWidth = 1200
+private let pixelHeight = 800
+private let scale: CGFloat = 2
+private let outputDPI = 144
 
-let img = NSImage(size: NSSize(width: width, height: height))
-img.lockFocus()
+private enum BackgroundError: LocalizedError {
+    case missingMaster(URL)
+    case unreadableMaster(URL)
+    case invalidMasterSize(width: Int, height: Int)
+    case contextCreationFailed
+    case imageCreationFailed
+    case encodingFailed
 
-let ctx = NSGraphicsContext.current!.cgContext
-
-// --- Deep Space Background ---
-let bgGradient = CGGradient(
-    colorsSpace: CGColorSpaceCreateDeviceRGB(),
-    colors: [
-        CGColor(red: 0.12, green: 0.12, blue: 0.13, alpha: 1.0),
-        CGColor(red: 0.05, green: 0.05, blue: 0.06, alpha: 1.0),
-    ] as CFArray,
-    locations: [0, 1]
-)!
-ctx.drawRadialGradient(
-    bgGradient,
-    startCenter: CGPoint(x: width * 0.5, y: height * 0.4),
-    startRadius: 0,
-    endCenter: CGPoint(x: width * 0.5, y: height * 0.4),
-    endRadius: width * 0.8,
-    options: [.drawsAfterEndLocation, .drawsBeforeStartLocation]
-)
-
-// --- Spotlight effect from bottom ---
-let spotlight = CGGradient(
-    colorsSpace: CGColorSpaceCreateDeviceRGB(),
-    colors: [
-        CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.08),
-        CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.0)
-    ] as CFArray,
-    locations: [0, 1]
-)!
-ctx.drawRadialGradient(
-    spotlight,
-    startCenter: CGPoint(x: width * 0.5, y: -50),
-    startRadius: 0,
-    endCenter: CGPoint(x: width * 0.5, y: -50),
-    endRadius: height * 0.8,
-    options: [.drawsAfterEndLocation]
-)
-
-// Add noise texture
-if let noiseImg = CGImage.createNoiseImage(width: Int(width), height: Int(height)) {
-    ctx.setBlendMode(.screen)
-    ctx.setAlpha(0.02)
-    ctx.draw(noiseImg, in: CGRect(x: 0, y: 0, width: width, height: height))
-    ctx.setBlendMode(.normal)
-    ctx.setAlpha(1.0)
-}
-
-// --- Warp-style Inline Arrow ---
-// create-dmg places icons at Y=175pt from top.
-// Center of 128pt image is ~164pt from top.
-// CoreGraphics Y is from bottom: 400 - 164 = 236
-let arrowY: CGFloat = 236
-let text = "INSTALL KRIT"
-
-let font = NSFont.systemFont(ofSize: 11, weight: .bold)
-let attributes: [NSAttributedString.Key: Any] = [
-    .font: font,
-    .foregroundColor: NSColor(calibratedWhite: 1.0, alpha: 0.4),
-    .kern: 1.5
-]
-let attrText = NSAttributedString(string: text, attributes: attributes)
-let textSize = attrText.size()
-
-// Positions
-let centerX = width / 2
-let textPadding: CGFloat = 12
-let textX = centerX - (textSize.width / 2)
-// Adjust textY to optically center it vertically with the line
-// CoreGraphics Y is from bottom, so subtracting moves it DOWN
-let textY = arrowY - (textSize.height / 2) - 2
-
-let leftLineStart: CGFloat = 200
-let leftLineEnd = textX - textPadding
-
-let rightLineStart = textX + textSize.width + textPadding
-let rightLineEnd: CGFloat = 400
-
-ctx.setStrokeColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.3))
-ctx.setLineWidth(1.5)
-ctx.setLineCap(.round)
-ctx.setLineJoin(.round)
-
-// Left line segment
-ctx.move(to: CGPoint(x: leftLineStart, y: arrowY))
-ctx.addLine(to: CGPoint(x: leftLineEnd, y: arrowY))
-ctx.strokePath()
-
-// Right line segment
-ctx.move(to: CGPoint(x: rightLineStart, y: arrowY))
-ctx.addLine(to: CGPoint(x: rightLineEnd, y: arrowY))
-ctx.strokePath()
-
-// Arrow head
-let headSize: CGFloat = 6
-ctx.move(to: CGPoint(x: rightLineEnd, y: arrowY))
-ctx.addLine(to: CGPoint(x: rightLineEnd - headSize, y: arrowY + headSize * 0.8))
-ctx.move(to: CGPoint(x: rightLineEnd, y: arrowY))
-ctx.addLine(to: CGPoint(x: rightLineEnd - headSize, y: arrowY - headSize * 0.8))
-ctx.strokePath()
-
-// Draw Text
-attrText.draw(at: NSPoint(x: textX, y: textY))
-
-// --- Icon Glows ---
-func drawGlow(at center: CGPoint, radius: CGFloat, color: CGColor) {
-    let glow = CGGradient(
-        colorsSpace: CGColorSpaceCreateDeviceRGB(),
-        colors: [color, CGColor(red: 0, green: 0, blue: 0, alpha: 0)] as CFArray,
-        locations: [0, 1]
-    )!
-    ctx.drawRadialGradient(glow, startCenter: center, startRadius: 0,
-                           endCenter: center, endRadius: radius, options: [])
-}
-
-// Glow under icons
-drawGlow(at: CGPoint(x: 120, y: arrowY), radius: 80,
-         color: CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.08))
-drawGlow(at: CGPoint(x: 480, y: arrowY), radius: 80,
-         color: CGColor(red: 0.2, green: 0.6, blue: 1.0, alpha: 0.06))
-
-img.unlockFocus()
-
-let rep = NSBitmapImageRep(data: img.tiffRepresentation!)!
-let pngData = rep.representation(using: .png, properties: [:])!
-let outputURL = URL(fileURLWithPath: "dmg-background.png")
-try! pngData.write(to: outputURL)
-print("✓ dmg-background.png created (600x400)")
-
-extension CGImage {
-    static func createNoiseImage(width: Int, height: Int) -> CGImage? {
-        let colorSpace = CGColorSpaceCreateDeviceGray()
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue)
-        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width, space: colorSpace, bitmapInfo: bitmapInfo.rawValue) else { return nil }
-        
-        guard let data = context.data else { return nil }
-        let buffer = data.bindMemory(to: UInt8.self, capacity: width * height)
-        for i in 0..<(width * height) {
-            buffer[i] = UInt8.random(in: 0...255)
+    var errorDescription: String? {
+        switch self {
+        case .missingMaster(let url):
+            return "Missing DMG background master: \(url.path)"
+        case .unreadableMaster(let url):
+            return "Could not read DMG background master: \(url.path)"
+        case .invalidMasterSize(let width, let height):
+            return "DMG background master must be 1200x800 pixels, got \(width)x\(height)"
+        case .contextCreationFailed:
+            return "Could not create the sRGB bitmap context"
+        case .imageCreationFailed:
+            return "Could not create the rendered DMG background image"
+        case .encodingFailed:
+            return "Could not encode the rendered DMG background as PNG"
         }
-        return context.makeImage()
     }
+}
+
+private func scriptDirectory() -> URL {
+    let workingDirectory = URL(
+        fileURLWithPath: FileManager.default.currentDirectoryPath,
+        isDirectory: true
+    )
+    return URL(
+        fileURLWithPath: CommandLine.arguments[0],
+        relativeTo: workingDirectory
+    )
+    .standardizedFileURL
+    .deletingLastPathComponent()
+}
+
+private func loadMaster(at url: URL) throws -> CGImage {
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        throw BackgroundError.missingMaster(url)
+    }
+    guard
+        let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+        let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+    else {
+        throw BackgroundError.unreadableMaster(url)
+    }
+    guard image.width == pixelWidth, image.height == pixelHeight else {
+        throw BackgroundError.invalidMasterSize(width: image.width, height: image.height)
+    }
+    return image
+}
+
+private func makeContext() throws -> CGContext {
+    guard
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+        let context = CGContext(
+            data: nil,
+            width: pixelWidth,
+            height: pixelHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )
+    else {
+        throw BackgroundError.contextCreationFailed
+    }
+    context.setShouldAntialias(true)
+    context.setAllowsAntialiasing(true)
+    context.interpolationQuality = .high
+    return context
+}
+
+private func drawInstallGuide(in context: CGContext) {
+    let logicalWidth: CGFloat = 600
+    let logicalHeight: CGFloat = 400
+    let iconCenterY: CGFloat = 175
+    let guideY = (logicalHeight - iconCenterY) * scale
+    let centerX = logicalWidth * scale / 2
+
+    let systemFont = NSFont.systemFont(ofSize: 11 * scale, weight: .semibold)
+    let font = CTFontCreateWithName(systemFont.fontName as CFString, 11 * scale, nil)
+    let textColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.72)
+    let attributes: [NSAttributedString.Key: Any] = [
+        NSAttributedString.Key(kCTFontAttributeName as String): font,
+        NSAttributedString.Key(kCTForegroundColorAttributeName as String): textColor,
+        NSAttributedString.Key(kCTKernAttributeName as String): 1.5 * scale,
+    ]
+    let attributedText = NSAttributedString(string: "INSTALL KRIT", attributes: attributes)
+    let line = CTLineCreateWithAttributedString(attributedText)
+    let textBounds = CTLineGetBoundsWithOptions(line, [.useGlyphPathBounds])
+    let textOrigin = CGPoint(
+        x: centerX - textBounds.midX,
+        y: guideY - textBounds.midY
+    )
+
+    let padding = 12 * scale
+    let leftLineStart = 200 * scale
+    let leftLineEnd = textOrigin.x + textBounds.minX - padding
+    let rightLineStart = textOrigin.x + textBounds.maxX + padding
+    let rightLineEnd = 400 * scale
+
+    context.saveGState()
+    context.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.42))
+    context.setLineWidth(1 * scale)
+    context.setLineCap(.round)
+    context.setLineJoin(.round)
+
+    context.move(to: CGPoint(x: leftLineStart, y: guideY))
+    context.addLine(to: CGPoint(x: leftLineEnd, y: guideY))
+    context.move(to: CGPoint(x: rightLineStart, y: guideY))
+    context.addLine(to: CGPoint(x: rightLineEnd, y: guideY))
+
+    let arrowHead = 6 * scale
+    context.move(to: CGPoint(x: rightLineEnd, y: guideY))
+    context.addLine(to: CGPoint(x: rightLineEnd - arrowHead, y: guideY + arrowHead * 0.8))
+    context.move(to: CGPoint(x: rightLineEnd, y: guideY))
+    context.addLine(to: CGPoint(x: rightLineEnd - arrowHead, y: guideY - arrowHead * 0.8))
+    context.strokePath()
+
+    context.textMatrix = .identity
+    context.textPosition = textOrigin
+    CTLineDraw(line, context)
+    context.restoreGState()
+}
+
+private func pngData(for image: CGImage) throws -> Data {
+    let data = NSMutableData()
+    guard
+        let destination = CGImageDestinationCreateWithData(
+            data,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        )
+    else {
+        throw BackgroundError.encodingFailed
+    }
+    let properties: [CFString: Any] = [
+        kCGImagePropertyDPIWidth: outputDPI,
+        kCGImagePropertyDPIHeight: outputDPI,
+    ]
+    CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+    guard CGImageDestinationFinalize(destination) else {
+        throw BackgroundError.encodingFailed
+    }
+    return data as Data
+}
+
+do {
+    let directory = scriptDirectory()
+    let masterURL = directory.appendingPathComponent("Branding/dmg-precision-monolith.png")
+    let outputURL = directory.appendingPathComponent("dmg-background.png")
+    let master = try loadMaster(at: masterURL)
+    let context = try makeContext()
+
+    context.draw(
+        master,
+        in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight)
+    )
+    drawInstallGuide(in: context)
+
+    guard let renderedImage = context.makeImage() else {
+        throw BackgroundError.imageCreationFailed
+    }
+    let data = try pngData(for: renderedImage)
+    try data.write(to: outputURL, options: .atomic)
+    print("Created \(outputURL.path) (1200x800, sRGB, 144 DPI)")
+} catch {
+    fputs("error: \(error.localizedDescription)\n", stderr)
+    exit(EXIT_FAILURE)
 }

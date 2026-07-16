@@ -5,9 +5,27 @@ import Darwin
 @MainActor
 final class HistoryManager: ObservableObject {
 
+    enum LoadState {
+        case loading
+        case loaded
+    }
+
+    private enum PendingMutation {
+        case add(HistoryItem)
+        case update(HistoryItem)
+        case delete(UUID)
+        case deleteAll
+    }
+
     private(set) var items: [HistoryItem] = []
+    private(set) var loadState: LoadState = .loading
+    var isLoading: Bool { loadState == .loading }
     private let storageDir: URL
-    private let indexURL: URL
+    private let diskStore: HistoryDiskStore
+    private var initialLoadTask: Task<Void, Never>?
+    private var operationTail: Task<Void, Never>?
+    private var pendingMutations: [PendingMutation] = []
+    private var loadCallbacks: [@MainActor () -> Void] = []
 
     // Source app captured by `prepareForCapture()` just before KRIT activates and
     // steals focus. Consumed (and cleared) by the next `add()`. Once KRIT is
@@ -28,22 +46,102 @@ final class HistoryManager: ObservableObject {
         pendingSourceBundleID = front.bundleIdentifier
     }
 
+    /// Drops source-app metadata when a capture flow ends before it creates a
+    /// history item. Without this, a cancelled selection can badge an unrelated
+    /// later capture or an editor save with the app that was active earlier.
+    func cancelPreparedCapture() {
+        pendingSourceBundleID = nil
+    }
+
     init() {
         guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             fatalError("[KRIT] Application Support directory not found")
         }
-        storageDir = appSupport.appendingPathComponent("KRIT/History", isDirectory: true)
-        indexURL   = storageDir.appendingPathComponent("index.json")
-        try? FileManager.default.createDirectory(at: storageDir, withIntermediateDirectories: true)
-        load()
+        let storageDir = appSupport.appendingPathComponent("KRIT/History", isDirectory: true)
+        self.storageDir = storageDir
+        diskStore = HistoryDiskStore(storageDir: storageDir)
+        startInitialLoad()
+    }
+
+    /// Test boundary for exercising persistence without touching the user's real
+    /// history. Production continues to use `init()` and Application Support.
+    init(storageDir: URL) {
+        self.storageDir = storageDir
+        diskStore = HistoryDiskStore(storageDir: storageDir)
+        startInitialLoad()
+    }
+
+    init(storageDir: URL, initialLoader: @escaping HistoryDiskStore.Loader) {
+        self.storageDir = storageDir
+        diskStore = HistoryDiskStore(storageDir: storageDir, loader: initialLoader)
+        startInitialLoad()
+    }
+
+    func waitUntilLoaded() async {
+        await initialLoadTask?.value
+    }
+
+    func whenLoaded(_ callback: @escaping @MainActor () -> Void) {
+        if isLoading {
+            loadCallbacks.append(callback)
+        } else {
+            callback()
+        }
+    }
+
+    private func startInitialLoad() {
+        let store = diskStore
+        let task = Task { @MainActor [weak self] in
+            let loaded = await store.load()
+            guard let self else { return }
+            self.finishInitialLoad(loaded)
+        }
+        initialLoadTask = task
+        operationTail = task
+    }
+
+    private func finishInitialLoad(_ loaded: [HistoryItem]) {
+        var merged = loaded
+        for mutation in pendingMutations {
+            switch mutation {
+            case .add(let item):
+                merged.removeAll { $0.id == item.id }
+                merged.insert(item, at: 0)
+            case .update(let item):
+                if let index = merged.firstIndex(where: { $0.id == item.id }) {
+                    merged[index] = item
+                }
+            case .delete(let id):
+                merged.removeAll { $0.id == id }
+            case .deleteAll:
+                merged.removeAll()
+            }
+        }
+        items = merged
+        pendingMutations.removeAll()
+        loadState = .loaded
+        let callbacks = loadCallbacks
+        loadCallbacks.removeAll()
+        callbacks.forEach { $0() }
+    }
+
+    private func enqueue(
+        _ operation: @escaping @MainActor @Sendable (HistoryDiskStore) async -> Void
+    ) {
+        let previous = operationTail
+        let store = diskStore
+        operationTail = Task { @MainActor in
+            await previous?.value
+            await operation(store)
+        }
     }
 
     // MARK: - Add
     //
     // Two-phase insert: the HistoryItem is returned synchronously so the UI
     // (overlay, auto-copy, auto-save) unblocks immediately. PNG encoding,
-    // thumbnail generation, xattr metadata and JSON index write all happen on
-    // a detached background Task. We prime HistoryImageCache with the
+    // thumbnail generation, xattr metadata and JSON index write all happen in
+    // the serial HistoryDiskStore actor. We prime HistoryImageCache with the
     // in-memory NSImage so any call to `item.fullImage` / `item.thumbnail`
     // before the disk write finishes serves from memory.
     //
@@ -55,7 +153,9 @@ final class HistoryManager: ObservableObject {
 
     @discardableResult
     func add(image: NSImage, rect: CGRect?, isWindowCapture: Bool = false, presentedImage: NSImage? = nil,
-             kind: HistoryKind = .screenshot, sourceBundleID: String? = nil) -> HistoryItem {
+             kind: HistoryKind = .screenshot, sourceBundleID: String? = nil,
+             rawArtifact suppliedRawArtifact: CaptureArtifact? = nil,
+             presentedArtifact suppliedPresentedArtifact: CaptureArtifact? = nil) -> HistoryItem {
         let id = UUID()
         let imagePath = storageDir.appendingPathComponent("\(id.uuidString).png").path
         let thumbPath = storageDir.appendingPathComponent("\(id.uuidString)_thumb.png").path
@@ -87,10 +187,18 @@ final class HistoryManager: ObservableObject {
             presentedPath: presentedPath
         )
         items.insert(item, at: 0)
+        if isLoading {
+            pendingMutations.append(.add(item))
+        }
 
         // The thumbnail mirrors the presented (finished) frame when we have one,
         // so the band shows the result; the full-res cache and disk file stay raw.
         let thumbSource = presentedImage ?? image
+        let rawArtifact = suppliedRawArtifact ?? CaptureArtifact(image: image)
+        let presentedArtifact = suppliedPresentedArtifact ?? {
+            if thumbSource === image { return rawArtifact }
+            return CaptureArtifact(image: thumbSource)
+        }()
 
         // Serve the full image from memory until the disk write lands.
         HistoryImageCache.primeFull(image, for: imagePath)
@@ -102,30 +210,74 @@ final class HistoryManager: ObservableObject {
             HistoryImageCache.primeFull(presentedImage, for: presentedPath)
         }
 
-        Task.detached(priority: .userInitiated) { [weak self] in
-            Self.encodeAndPersist(
-                image: image,
-                thumbnailSource: thumbSource,
-                imagePath: imagePath,
-                thumbPath: thumbPath,
-                rect: rect,
-                manager: self
-            )
-            // Persist the composed full-res frame next to the raw shot when a
-            // preset was applied, so the drag file survives an app restart.
-            if let presentedPath, let presentedImage,
-               let tiff = presentedImage.tiffRepresentation,
-               let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
-                try? png.write(to: URL(fileURLWithPath: presentedPath))
+        let request = HistoryDiskStore.InsertRequest(
+            item: item,
+            rawArtifact: rawArtifact,
+            thumbnailArtifact: presentedArtifact ?? rawArtifact,
+            presentedArtifact: hasPreset ? presentedArtifact : nil,
+            captureRect: rect
+        )
+        enqueue { store in
+            let thumbData = await store.insert(request)
+            if let thumbData, let thumbImage = NSImage(data: thumbData) {
+                HistoryImageCache.primeThumbnail(thumbImage, for: item.thumbnailPath)
             }
         }
         return item
     }
 
-    /// Called from the detached encode task once the index needs to be written.
-    /// Runs on the main actor because it reads `items`, which is actor-isolated.
+    /// Queues an explicit snapshot after every earlier history operation. Normal
+    /// inserts and deletes persist inside `HistoryDiskStore` themselves.
     func persistCurrentIndex() {
-        Self.persist(items: items, to: indexURL)
+        enqueue { [weak self] store in
+            guard let self else { return }
+            await store.replaceIndex(with: self.items)
+        }
+    }
+
+    /// Replaces the representation visible in the overlay, history, drag and
+    /// Finder while preserving the raw capture used by the editor. The first
+    /// transformation of a plain capture promotes it to a presented sidecar rather
+    /// than overwriting the editor's original image.
+    @discardableResult
+    func updatePresentedImage(_ image: NSImage, for requestedItem: HistoryItem) -> HistoryItem? {
+        guard let index = items.firstIndex(where: { $0.id == requestedItem.id }) else {
+            return nil
+        }
+        guard let artifact = CaptureArtifact(image: image) else {
+            print("[KRIT] History presentation update skipped: image has no CGImage backing")
+            return nil
+        }
+
+        var item = items[index]
+        if item.presentedPath == nil {
+            item.presentedPath = storageDir
+                .appendingPathComponent("\(item.id.uuidString)_presented.png")
+                .path
+            items[index] = item
+            if isLoading {
+                pendingMutations.append(.update(item))
+            }
+        }
+        let targetPath = item.presentedPath ?? item.imagePath
+        HistoryImageCache.primeFull(image, for: targetPath)
+        HistoryImageCache.primeThumbnail(image, for: item.thumbnailPath)
+
+        let request = HistoryDiskStore.PresentationUpdateRequest(
+            item: item,
+            artifact: artifact
+        )
+        enqueue { store in
+            let thumbnailData = await store.updatePresentation(request)
+            if let thumbnailData, let thumbnail = NSImage(data: thumbnailData) {
+                HistoryImageCache.primeThumbnail(thumbnail, for: item.thumbnailPath)
+            }
+        }
+        return item
+    }
+
+    func contains(_ item: HistoryItem) -> Bool {
+        items.contains { $0.id == item.id }
     }
 
     // MARK: - Thumbnail access (UI convenience)
@@ -136,144 +288,30 @@ final class HistoryManager: ObservableObject {
 
     // MARK: - Delete
 
-    func delete(_ item: HistoryItem) {
+    func delete(_ requestedItem: HistoryItem) {
+        let item = items.first { $0.id == requestedItem.id } ?? requestedItem
         items.removeAll { $0.id == item.id }
+        if isLoading {
+            pendingMutations.append(.delete(item.id))
+        }
         HistoryImageCache.evict(fullPath: item.imagePath, thumbnailPath: item.thumbnailPath)
         if let presented = item.presentedPath {
             HistoryImageCache.evict(fullPath: presented, thumbnailPath: presented)
         }
-        let imgPath = item.imagePath
-        let thumbPath = item.thumbnailPath
-        let presentedPath = item.presentedPath
-        persistCurrentIndex()
-        Task.detached(priority: .utility) {
-            try? FileManager.default.removeItem(atPath: imgPath)
-            try? FileManager.default.removeItem(atPath: thumbPath)
-            if let presentedPath { try? FileManager.default.removeItem(atPath: presentedPath) }
+        enqueue { store in
+            await store.delete(item)
         }
     }
 
     func deleteAll() {
-        let removed = items
         items.removeAll()
+        if isLoading {
+            pendingMutations.append(.deleteAll)
+        }
         HistoryImageCache.evictAll()
-        persistCurrentIndex()
-        Task.detached(priority: .utility) {
-            removed.forEach {
-                try? FileManager.default.removeItem(atPath: $0.imagePath)
-                try? FileManager.default.removeItem(atPath: $0.thumbnailPath)
-                if let presented = $0.presentedPath { try? FileManager.default.removeItem(atPath: presented) }
-            }
+        enqueue { store in
+            await store.deleteAll()
         }
-    }
-
-    // MARK: - Persistence
-
-    private func load() {
-        guard FileManager.default.fileExists(atPath: indexURL.path) else { return }
-        do {
-            let data = try Data(contentsOf: indexURL)
-            let decoded = try JSONDecoder().decode([HistoryItem].self, from: data)
-            items = decoded.filter { FileManager.default.fileExists(atPath: $0.imagePath) }
-        } catch {
-            print("[KRIT] History index corrupted, starting fresh: \(error)")
-            // Don't overwrite, the corrupt file may be recoverable manually.
-        }
-    }
-
-    @discardableResult
-    nonisolated private static func persist(items: [HistoryItem], to indexURL: URL) -> Bool {
-        do {
-            let data = try JSONEncoder().encode(items)
-            try data.write(to: indexURL, options: .atomic)
-            return true
-        } catch {
-            print("[KRIT] History persist failed: \(error)")
-            return false
-        }
-    }
-
-    // MARK: - Encode + persist (off-main)
-    //
-    // Runs on a detached background Task. Does the expensive PNG encode, the
-    // thumbnail downsample + encode, xattr metadata, and JSON index write,
-    // none of which need the main actor. Once the files are on disk, we
-    // reach back to the main actor to prime the thumbnail cache with the
-    // downsampled version so the history grid picks it up.
-
-    nonisolated private static func encodeAndPersist(
-        image: NSImage,
-        thumbnailSource: NSImage,
-        imagePath: String,
-        thumbPath: String,
-        rect: CGRect?,
-        manager: HistoryManager?
-    ) {
-        guard let fullCG = image.bestCGImage else {
-            print("[KRIT] History persist failed: image has no CGImage backing")
-            return
-        }
-
-        guard let pngFull = ImageExporter.pngData(from: fullCG) else {
-            print("[KRIT] History persist failed: unable to encode full image")
-            return
-        }
-
-        do {
-            try pngFull.write(to: URL(fileURLWithPath: imagePath), options: .atomic)
-            applyScreenshotMetadata(to: imagePath, rect: rect)
-        } catch {
-            print("[KRIT] History persist failed at \(imagePath): \(error)")
-            return
-        }
-
-        // Thumbnail via CoreGraphics (thread-safe, ~2-3× faster than lockFocus).
-        // Downsample the presented frame when one was supplied (falls back to the
-        // raw image), so the band thumbnail matches what the user saw.
-        let thumbCGSource = thumbnailSource.bestCGImage ?? fullCG
-        var thumbImage: NSImage?
-        if let thumbCG = downsample(cg: thumbCGSource, maxDimension: 240),
-           let pngThumb = ImageExporter.pngData(from: thumbCG) {
-            do {
-                try pngThumb.write(to: URL(fileURLWithPath: thumbPath), options: .atomic)
-                let logicalSize = NSSize(width: thumbCG.width, height: thumbCG.height)
-                thumbImage = CaptureEngine.nsImage(from: thumbCG, logicalSize: logicalSize)
-            } catch {
-                print("[KRIT] History thumbnail persist failed at \(thumbPath): \(error)")
-            }
-        }
-
-        Task { @MainActor in
-            if let thumbImage {
-                HistoryImageCache.primeThumbnail(thumbImage, for: thumbPath)
-            }
-            manager?.persistCurrentIndex()
-        }
-    }
-
-    /// Downsample a CGImage so its longest edge is `maxDimension` points.
-    /// Returns the input unchanged if it already fits.
-    nonisolated private static func downsample(cg: CGImage, maxDimension: CGFloat) -> CGImage? {
-        let w = CGFloat(cg.width)
-        let h = CGFloat(cg.height)
-        let longest = max(w, h)
-        guard longest > maxDimension else { return cg }
-        let scale = maxDimension / longest
-        let newW = max(1, Int((w * scale).rounded()))
-        let newH = max(1, Int((h * scale).rounded()))
-        let colorSpace = cg.colorSpace ?? CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: newW,
-            height: newH,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        ctx.interpolationQuality = .high
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: newW, height: newH))
-        return ctx.makeImage()
     }
 
     // MARK: - Screenshot metadata

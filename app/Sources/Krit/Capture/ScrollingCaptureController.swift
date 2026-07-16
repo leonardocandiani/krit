@@ -5,6 +5,7 @@ import ScreenCaptureKit
 @MainActor
 final class ScrollingCaptureController: NSObject {
 
+    private let onAreaSelected: ((CGRect, NSScreen) -> Void)?
     private var selectionWindow: AreaSelectionWindow?
     private var captureRect: CGRect?
     private var captureScreen: NSScreen?
@@ -30,13 +31,23 @@ final class ScrollingCaptureController: NSObject {
     /// Single reusable capture engine, never allocate per-frame
     private let captureEngine = CaptureEngine()
 
+    init(onAreaSelected: ((CGRect, NSScreen) -> Void)? = nil) {
+        self.onAreaSelected = onAreaSelected
+        super.init()
+    }
+
     var isActive: Bool { isCapturing || isFinishing || selectionWindow != nil }
+    private var isSelecting: Bool { selectionWindow != nil }
 
     deinit {
         captureTimer?.invalidate()
     }
 
-    func start(historyManager: HistoryManager, excludeDesktopIcons: Bool = false) async {
+    func start(
+        historyManager: HistoryManager,
+        excludeDesktopIcons: Bool = false,
+        canPresent: @escaping () -> Bool = { true }
+    ) async {
         self.excludeDesktopIcons = excludeDesktopIcons
         selectionWindow = AreaSelectionWindow(mode: .area) { [weak self] rect, screen, _ in
             guard let self else { return }
@@ -44,9 +55,21 @@ final class ScrollingCaptureController: NSObject {
             guard let rect else { return }
             self.captureRect = rect
             self.captureScreen = screen
+            self.onAreaSelected?(rect, screen)
             self.beginScrollingPhase(historyManager: historyManager)
         }
-        await selectionWindow?.prepareAndShow(engine: captureEngine)
+        await selectionWindow?.prepareAndShow(engine: captureEngine, canPresent: canPresent)
+        if !canPresent() {
+            selectionWindow = nil
+        }
+    }
+
+    /// A newer capture intent may replace the scrolling region before the user
+    /// chooses it. Do not interrupt an already-running stitch or capture here.
+    func cancelPendingSelection() {
+        guard isSelecting, !isCapturing, !isFinishing else { return }
+        selectionWindow?.cancel()
+        selectionWindow = nil
     }
 
     private func beginScrollingPhase(historyManager: HistoryManager) {
@@ -124,24 +147,26 @@ final class ScrollingCaptureController: NSObject {
         // Capture the values directly (no [weak self]/guard): the finished capture
         // must be saved even if the controller would otherwise be released, and
         // self is needed to clear isFinishing, so retain it for the stitch.
+        let frameBatch = StitchFrameBatch(framesToStitch)
         Task.detached(priority: .userInitiated) {
-            let stitched = FrameStitcher.stitch(frames: framesToStitch)
+            let stitched = StitchedImage(FrameStitcher.stitch(frames: frameBatch.images))
             await MainActor.run {
                 self.isFinishing = false
-                let item = historyManager.add(image: stitched, rect: rect)
+                let image = stitched.image
+                let item = historyManager.add(image: image, rect: rect)
 
                 if Settings.afterCaptureCopyToClipboard {
-                    ImageExporter.copyToClipboard(image: stitched)
+                    ImageExporter.copyToClipboard(image: image)
                 }
                 if Settings.afterCaptureSaveAutomatically {
                     let dir = Settings.autoSaveLocation
                     let name = ImageExporter.timestampedName
                     let ext = Settings.screenshotFormat
                     let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name).\(ext)")
-                    ImageExporter.save(image: stitched, to: url)
+                    ImageExporter.save(image: image, to: url, collisionPolicy: .uniquify)
                 }
                 if Settings.afterCaptureShowOverlay {
-                    QuickAccessOverlay.show(image: stitched, historyItem: item, historyManager: historyManager, screen: self.captureScreen)
+                    QuickAccessOverlay.show(image: image, historyItem: item, historyManager: historyManager, screen: self.captureScreen)
                 }
             }
         }
@@ -334,13 +359,32 @@ enum FrameStitcher {
 
         // Direct buffer copy: the canvas is already RGBA8 premultipliedLast in
         // deviceRGB, exactly the NSBitmapImageRep layout, no re-render needed.
-        canvasPixels.withUnsafeBytes { src in
+        _ = canvasPixels.withUnsafeBytes { src in
             memcpy(dest, src.baseAddress!, width * height * 4)
         }
 
         let output = NSImage(size: NSSize(width: width, height: height))
         output.addRepresentation(result)
         return output
+    }
+}
+
+/// The frame images are immutable snapshots after the capture loop closes. The
+/// stitch worker owns its batch, then hands its finished image back to the main
+/// actor, so neither side touches an NSImage concurrently.
+private final class StitchFrameBatch: @unchecked Sendable {
+    let images: [NSImage]
+
+    init(_ images: [NSImage]) {
+        self.images = images
+    }
+}
+
+private final class StitchedImage: @unchecked Sendable {
+    let image: NSImage
+
+    init(_ image: NSImage) {
+        self.image = image
     }
 }
 

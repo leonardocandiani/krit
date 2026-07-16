@@ -119,12 +119,7 @@ enum SoundManager {
     /// time so a silenced build is diagnosable from Console.
     private static let soundBundleURLs: [URL] = {
         let bundleName = "Krit_KritKit.bundle"
-        var urls: [URL] = []
-        if let resources = Bundle.main.resourceURL {            // .app: Contents/Resources/
-            urls.append(resources.appendingPathComponent(bundleName))
-        }
-        urls.append(Bundle.main.bundleURL.appendingPathComponent(bundleName)) // swift build: next to binary
-        urls.append(Bundle.module.bundleURL)                    // SPM dev: synthesized module bundle
+        let urls = KritResourceBundleLocator.candidates(named: bundleName)
 
         let existing = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
         if let resolved = existing.first {

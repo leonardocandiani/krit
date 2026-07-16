@@ -8,22 +8,18 @@ import os
 ///
 /// A default install answers `false`: the port never binds and `krit://` URLs are
 /// refused, so no local process can drive capture / AX / file writes through KRIT.
-/// The user opts in with `Settings.automationEnabled`; the UI-test harness opts in
-/// with `KRIT_UI_TEST=1` (which already gates the rest of the test IPC), so tests
-/// keep working without flipping a persisted user pref.
+/// Only the persisted `Settings.automationEnabled` preference can opt in. The
+/// UI-test harness is deliberately separate so an environment variable can never
+/// open this release capability.
 enum AutomationGate {
     static var isEnabled: Bool {
-        decide(
-            envTestMode: ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1",
-            prefEnabled: Settings.automationEnabled
-        )
+        decide(prefEnabled: Settings.automationEnabled)
     }
 
-    /// Pure decision, split out so the security-critical rule can be tested against
-    /// explicit inputs (the live `isEnabled` always reads true under the test
-    /// harness, which sets `KRIT_UI_TEST`, so the OFF path is untestable through it).
-    static func decide(envTestMode: Bool, prefEnabled: Bool) -> Bool {
-        envTestMode || prefEnabled
+    /// Pure decision, split out so the security-critical default-off rule is
+    /// independently testable without reading a process environment.
+    static func decide(prefEnabled: Bool) -> Bool {
+        prefEnabled
     }
 }
 

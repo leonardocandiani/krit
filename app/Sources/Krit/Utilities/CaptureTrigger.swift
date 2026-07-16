@@ -1,11 +1,16 @@
 import AppKit
 import os
 
-/// Automation hook: lets external tooling (CLIs, agents, tests) drive captures
-/// without touching the UI. Post a distributed notification named
-/// "com.krit.capture.rect" whose object is "x,y,w,h|/absolute/out.png"
+/// UI-test-only hook: lets the in-app harness drive captures without touching
+/// the UI. Post a distributed notification named
+/// "com.krit.capture.rect" whose object is "x,y,w,h|/tmp/out.png"
 /// (AppKit screen coordinates, in points). KRIT captures the region, writes the
 /// PNG to the given path and a "<out>.status" sidecar describing the result.
+///
+/// Distributed notifications do not authenticate their sender. They must never
+/// be registered by a normal KRIT launch because the app owns Screen Recording
+/// permission. Production automation goes through the opt-in AutomationPort and
+/// `krit://` routes instead.
 @MainActor
 final class CaptureTrigger: NSObject {
 
@@ -17,9 +22,24 @@ final class CaptureTrigger: NSObject {
     private let engine: CaptureEngine
     private var simSelection: AreaSelectionWindow?
 
+    /// The legacy notification hooks exist solely for the isolated UI-test
+    /// process. Keeping this decision pure gives the SwiftPM suite a regression
+    /// boundary without reading the current process environment.
+    static func isEnabled(in environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        KritTestHarness.isEnabled(in: environment)
+    }
+
+    /// Test reports are intentionally confined to the shared temporary directory.
+    /// The notification sender is unauthenticated, so test mode must not turn
+    /// KRIT into a generic file-writing proxy.
+    static func temporaryOutputURL(for path: String) -> URL? {
+        KritTestOutput.temporaryURL(for: path)
+    }
+
     init(engine: CaptureEngine) {
         self.engine = engine
         super.init()
+        guard Self.isEnabled() else { return }
         DistributedNotificationCenter.default().addObserver(
             self,
             selector: #selector(handleCaptureRect(_:)),
@@ -42,11 +62,11 @@ final class CaptureTrigger: NSObject {
 
     /// Opens the annotation editor seeded with one of every element, so the
     /// editor's look can be verified programmatically (dev affordance).
-    /// Payload (optional): an absolute path; when present, the editor window's
+    /// Payload (optional): a /tmp output path; when present, the editor window's
     /// content is rendered offscreen to that PNG, works even on a locked
     /// screen, where the compositor never shows the window.
     @objc private func handleEditorDemo(_ note: Notification) {
-        let outPath = (note.object as? String).flatMap { $0.hasPrefix("/") ? $0 : nil }
+        let outputURL = (note.object as? String).flatMap { Self.temporaryOutputURL(for: $0) }
         Task { @MainActor in
             guard let screen = NSScreen.main else { return }
             let rect = CGRect(x: screen.frame.midX - 450, y: screen.frame.midY - 280,
@@ -56,7 +76,7 @@ final class CaptureTrigger: NSObject {
             let image = await engine.captureRectToImage(rect, on: screen) ?? Self.syntheticBackdrop(size: NSSize(width: 900, height: 560))
             let controller = AnnotationWindowController.openDemo(image: image)
 
-            guard let outPath else { return }
+            guard let outputURL else { return }
             try? await Task.sleep(nanoseconds: 700_000_000)
             var status = "error: no window content"
             if let content = controller.window?.contentView,
@@ -64,14 +84,14 @@ final class CaptureTrigger: NSObject {
                 content.cacheDisplay(in: content.bounds, to: rep)
                 if let png = rep.representation(using: .png, properties: [:]) {
                     do {
-                        try png.write(to: URL(fileURLWithPath: outPath))
+                        try KritTestOutput.write(png, to: outputURL)
                         status = "ok \(rep.pixelsWide)x\(rep.pixelsHigh)"
                     } catch {
                         status = "error: \(error.localizedDescription)"
                     }
                 }
             }
-            try? status.write(toFile: outPath + ".status", atomically: true, encoding: .utf8)
+            Self.writeStatus(status, for: outputURL)
         }
     }
 
@@ -87,15 +107,18 @@ final class CaptureTrigger: NSObject {
             Self.log.error("area-sim trigger: malformed payload \(payload)")
             return
         }
+        guard let outputURL = Self.temporaryOutputURL(for: parts[1]) else {
+            Self.log.error("area-sim trigger: rejected output path \(parts[1], privacy: .public)")
+            return
+        }
         let rect = CGRect(x: nums[0], y: nums[1], width: nums[2], height: nums[3])
-        let outPath = parts[1]
-        Self.log.info("area-sim trigger: rect=\(String(describing: rect)) out=\(outPath)")
+        Self.log.info("area-sim trigger: rect=\(String(describing: rect)) out=\(outputURL.path)")
 
         Task { @MainActor in
             guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(rect) }) ?? NSScreen.main else { return }
 
             if let frozen = await engine.captureRectToImage(screen.frame, on: screen) {
-                Self.writePNG(frozen, to: outPath + ".frozen.png")
+                Self.writePNG(frozen, to: URL(fileURLWithPath: outputURL.path + ".frozen.png"))
             }
 
             let selection = AreaSelectionWindow(mode: .area) { [weak self] selectedRect, selScreen, _ in
@@ -104,12 +127,12 @@ final class CaptureTrigger: NSObject {
                 guard let selectedRect else { return }
                 Task { @MainActor in
                     var status = "error: capture returned nil"
-                    defer { try? status.write(toFile: outPath + ".status", atomically: true, encoding: .utf8) }
+                    defer { Self.writeStatus(status, for: outputURL) }
                     guard let image = await self.engine.captureRectToImage(selectedRect, on: selScreen) else {
                         if self.engine.lastCaptureFailureWasPermission { status = "error: permission declined (-3801)" }
                         return
                     }
-                    status = Self.writePNG(image, to: outPath) ?? "error: png encode failed"
+                    status = Self.writePNG(image, to: outputURL) ?? "error: png encode failed"
                 }
             }
             simSelection = selection
@@ -138,12 +161,12 @@ final class CaptureTrigger: NSObject {
 
     /// Writes the image as PNG; returns an "ok WxH uniform=..." status or nil on failure.
     @discardableResult
-    private static func writePNG(_ image: NSImage, to path: String) -> String? {
+    private static func writePNG(_ image: NSImage, to outputURL: URL) -> String? {
         guard let tiff = image.tiffRepresentation,
               let rep = NSBitmapImageRep(data: tiff),
               let png = rep.representation(using: .png, properties: [:]) else { return nil }
         do {
-            try png.write(to: URL(fileURLWithPath: path))
+            try KritTestOutput.write(png, to: outputURL)
             let flat = rep.cgImage.flatMap { CaptureEngine.uniformColorDescription($0) }
             return "ok \(rep.pixelsWide)x\(rep.pixelsHigh) uniform=\(flat ?? "none")"
         } catch {
@@ -159,17 +182,20 @@ final class CaptureTrigger: NSObject {
             return
         }
         let nums = parts[0].split(separator: ",").compactMap { Double($0) }
-        let outPath = parts[1]
         guard nums.count == 4 else {
             Self.log.error("capture trigger: malformed rect \(parts[0])")
             return
         }
+        guard let outputURL = Self.temporaryOutputURL(for: parts[1]) else {
+            Self.log.error("capture trigger: rejected output path \(parts[1], privacy: .public)")
+            return
+        }
         let rect = CGRect(x: nums[0], y: nums[1], width: nums[2], height: nums[3])
-        Self.log.info("capture trigger: rect=\(String(describing: rect)) out=\(outPath)")
+        Self.log.info("capture trigger: rect=\(String(describing: rect)) out=\(outputURL.path)")
 
         Task { @MainActor in
             var status = "error: no screen intersects rect"
-            defer { try? status.write(toFile: outPath + ".status", atomically: true, encoding: .utf8) }
+            defer { Self.writeStatus(status, for: outputURL) }
 
             guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(rect) }) ?? NSScreen.main else {
                 return
@@ -187,12 +213,17 @@ final class CaptureTrigger: NSObject {
                 return
             }
             do {
-                try png.write(to: URL(fileURLWithPath: outPath))
+                try KritTestOutput.write(png, to: outputURL)
                 let flat = (rep.cgImage).flatMap { CaptureEngine.uniformColorDescription($0) }
                 status = "ok \(rep.pixelsWide)x\(rep.pixelsHigh) uniform=\(flat ?? "none")"
             } catch {
                 status = "error: write failed \(error.localizedDescription)"
             }
         }
+    }
+
+    private static func writeStatus(_ status: String, for outputURL: URL) {
+        guard let statusURL = KritTestOutput.temporaryURL(for: outputURL.path + ".status") else { return }
+        try? KritTestOutput.write(Data(status.utf8), to: statusURL)
     }
 }

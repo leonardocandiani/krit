@@ -12,17 +12,16 @@ final class QuickAccessOverlay {
     /// no capture screen (falls back to the main display).
     /// How a new card enters the screen.
     /// - slide: slides in from the stack's screen edge (default; restore flows).
-    /// - handoff: born invisible at its slot so the capture-flash "fly to tray"
-    ///   ghost can land EXACTLY on it; `revealPendingHandoff(after:)` then fades
-    ///   the card in under the ghost's fade-out. One continuous motion, the
-    ///   ghost landing on top of an already-visible sliding card was the
-    ///   "grows a little then snaps back" flicker.
+    /// - handoff: enters directly at its final slot. The thumbnail is interactive
+    ///   from the first frame, while the action chrome becomes available once the
+    ///   initial presentation turn completes.
     enum EntranceStyle { case slide, handoff }
 
     /// Shows a card and returns its settled slot frame (global AppKit coords),
     /// so the capture flash can target the real landing spot.
     @discardableResult
     static func show(image: NSImage, historyItem: HistoryItem, historyManager: HistoryManager,
+                     presentedArtifact: CaptureArtifact? = nil,
                      screen: NSScreen? = nil, entrance: EntranceStyle = .slide) -> NSRect {
         // Continue the SAME session: if this screen's stack is tucked in standby, a
         // new capture restores it so the shot joins one continuing stack instead of
@@ -30,15 +29,21 @@ final class QuickAccessOverlay {
         if QuickAccessWindow.hasParked(on: screen) {
             QuickAccessWindow.restoreAll(on: screen)
         }
-        let window = QuickAccessWindow(image: image, historyItem: historyItem, historyManager: historyManager,
-                                       screen: screen, entrance: entrance)
+        let window = QuickAccessWindow(
+            image: image,
+            historyItem: historyItem,
+            historyManager: historyManager,
+            presentedArtifact: presentedArtifact,
+            screen: screen,
+            entrance: entrance
+        )
         window.show()
-        // For .handoff the card is parked invisible exactly at its slot, so the
-        // frame IS the landing target. (.slide callers ignore the return.)
+        // For .handoff the card enters directly at its final interactive slot.
+        // (.slide callers ignore the returned frame.)
         return window.frame
     }
 
-    /// Reveals the most recent handoff card once the fly-to-tray ghost lands.
+    /// Completes the initial presentation turn for the most recent handoff card.
     static func revealPendingHandoff(after delay: TimeInterval) {
         QuickAccessWindow.revealPendingHandoff(after: delay)
     }
@@ -117,6 +122,39 @@ private struct OverlayMetrics {
                 pillHeight: 32, pillGap: 8, pillPadding: 32,
                 pillFontSize: 14, cornerSymbolPointSize: 13, shadowRadius: 36)
         }
+    }
+}
+
+enum QuickAccessScreenResolution {
+    static func resolve(
+        storedScreenID: ObjectIdentifier?,
+        liveScreenIDs: [ObjectIdentifier],
+        fallbackScreenID: ObjectIdentifier?
+    ) -> ObjectIdentifier? {
+        guard !liveScreenIDs.isEmpty else { return nil }
+        if let storedScreenID, liveScreenIDs.contains(storedScreenID) {
+            return storedScreenID
+        }
+        if let fallbackScreenID, liveScreenIDs.contains(fallbackScreenID) {
+            return fallbackScreenID
+        }
+        return liveScreenIDs.first
+    }
+}
+
+/// Generation token for auto-dismiss work that has crossed from a timer onto
+/// the main queue. Invalidating the timer alone cannot retract that queued work.
+struct OverlayDismissEpoch {
+    private(set) var value: UInt64 = 0
+
+    @discardableResult
+    mutating func advance() -> UInt64 {
+        value &+= 1
+        return value
+    }
+
+    func accepts(_ token: UInt64) -> Bool {
+        value == token
     }
 }
 
@@ -199,6 +237,9 @@ private final class QuickAccessWindow: NSWindow {
     /// change. Visible cards spring to their recomputed slots (reflowStack); parked
     /// cards get their handle moved to the bottom edge of a still-valid screen.
     fileprivate static func reflowForScreenChange() {
+        for card in openWindows where !card.isClosing {
+            card.normalizeCardScreen()
+        }
         reflowStack()
         for card in openWindows where card.isParked {
             card.repositionParkedHandle()
@@ -337,6 +378,7 @@ private final class QuickAccessWindow: NSWindow {
     }
 
     private var dismissTimer: Timer?
+    private var dismissEpoch = OverlayDismissEpoch()
     /// The hover/key/scroll monitors are shared across all open cards by this single
     /// coordinator, not installed per card: with N cards the old model put 4N monitors
     /// on the run loop, each re-deriving ownership per event. Installed with the first
@@ -345,8 +387,9 @@ private final class QuickAccessWindow: NSWindow {
     /// Screenshot cards carry both; video cards carry neither (a recording never
     /// enters the screenshot history). `videoPayload` is the discriminator: nil for
     /// a screenshot card, set for a video card.
-    private let historyItem: HistoryItem?
+    private var historyItem: HistoryItem?
     private let historyManager: HistoryManager?
+    private var presentedArtifact: CaptureArtifact?
     private let videoPayload: VideoCardPayload?
     private var isVideoCard: Bool { videoPayload != nil }
     private var image: NSImage
@@ -359,7 +402,7 @@ private final class QuickAccessWindow: NSWindow {
     /// display the user moved to; every geometry read goes through `overlayScreen`,
     /// which reads this, so re-pointing it and reflowing re-lays everything out.
     private var cardScreen: NSScreen?
-    private var controlsOverlay: NSView?
+    private var controlsOverlay: OverlayControlsView?
     private weak var timeoutProgressLayer: CALayer?
     private weak var thumbView: DraggableImageView?
     private weak var backdropDimView: NSView?
@@ -389,6 +432,7 @@ private final class QuickAccessWindow: NSWindow {
     /// and how many the hover/ownership gate dropped.
     nonisolated(unsafe) static var uiTestKeySeen = 0
     nonisolated(unsafe) static var uiTestKeyGateDrop = 0
+    nonisolated(unsafe) static var uiTestGestureEntryCount = 0
     /// Conveyor trace: proves the REAL (synchronous) drag actually translated the
     /// siblings DURING the gesture, which an end-state "all parked" check can't tell
     /// apart from the old per-card park. Reset at drag begin, written by applyConveyor.
@@ -443,19 +487,27 @@ private final class QuickAccessWindow: NSWindow {
     private var isParked = false
     private var parkedHandle: NSWindow?
 
-    /// M1' entrance state: true while the slide-in spring runs, so the initial
-    /// reflowStack (fired by show()) doesn't double-animate this fresh card off its
-    /// in-flight position.
+    /// M1' entrance state: true while the short edge-settle runs, so the initial
+    /// reflowStack (fired by show()) does not disturb this fresh card's presentation.
     private var isEntering = false
+    /// Invalidates a visual-entrance completion when a user grabs, parks or closes
+    /// the card before its short edge-settle animation finishes.
+    private var entranceEpoch: UInt = 0
+    private static let visualEntranceAnimationKey = "quickAccess.edgeSettle"
+    /// Action controls remain click-through until the card is visibly settled. The
+    /// thumbnail can still receive a drag immediately during a handoff or slide.
+    private var controlsReadyForInteraction = false
     private let entrance: QuickAccessOverlay.EntranceStyle
     /// The card waiting for the fly-to-tray ghost to land (handoff entrance).
     private static weak var pendingHandoffCard: QuickAccessWindow?
 
-    init(image: NSImage, historyItem: HistoryItem, historyManager: HistoryManager, screen: NSScreen?,
+    init(image: NSImage, historyItem: HistoryItem, historyManager: HistoryManager,
+         presentedArtifact: CaptureArtifact?, screen: NSScreen?,
          entrance: QuickAccessOverlay.EntranceStyle = .slide) {
         self.image = image
         self.historyItem = historyItem
         self.historyManager = historyManager
+        self.presentedArtifact = presentedArtifact
         self.videoPayload = nil
         self.cardScreen = Self.resolveActiveScreen(captureScreen: screen)
         self.entrance = entrance
@@ -481,10 +533,9 @@ private final class QuickAccessWindow: NSWindow {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         // The overlay must never leak into a user's capture. In UI-test mode it
         // stays capturable so the harness can film entrance animations.
-        sharingType = ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" ? .readWrite : .none
+        sharingType = KritTestHarness.isEnabled ? .readWrite : .none
 
         buildContent()
-        positionOverlay()
     }
 
     /// Video-card init: same window plumbing as the screenshot card, but the
@@ -496,6 +547,7 @@ private final class QuickAccessWindow: NSWindow {
         self.image = videoPayload.thumbnail
         self.historyItem = nil
         self.historyManager = nil
+        self.presentedArtifact = nil
         self.videoPayload = videoPayload
         self.cardScreen = Self.resolveActiveScreen(captureScreen: screen)
         self.entrance = entrance
@@ -517,10 +569,9 @@ private final class QuickAccessWindow: NSWindow {
         isMovableByWindowBackground = false
         acceptsMouseMovedEvents = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        sharingType = ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" ? .readWrite : .none
+        sharingType = KritTestHarness.isEnabled ? .readWrite : .none
 
         buildContent()
-        positionOverlay()
     }
 
     override var canBecomeKey: Bool { true }
@@ -800,14 +851,14 @@ private final class QuickAccessWindow: NSWindow {
         menu.addItem(contextItem("Share…", #selector(shareAction)))
 
         menu.addItem(.separator())
-        let imagePath = historyItem?.imagePath
-        let fileOnDisk = imagePath.map { FileManager.default.fileExists(atPath: $0) } ?? false
+        let fileURL = historyItem?.persistedPresentationFileURL
+        let fileOnDisk = fileURL != nil
         let finderItem = contextItem("Show in Finder", #selector(showInFinderAction))
         finderItem.isEnabled = fileOnDisk
         menu.addItem(finderItem)
         let openWithItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
-        if fileOnDisk, let imagePath {
-            let submenu = openWithSubmenu(for: URL(fileURLWithPath: imagePath))
+        if fileOnDisk, let fileURL {
+            let submenu = openWithSubmenu(for: fileURL)
             openWithItem.submenu = submenu
             openWithItem.isEnabled = !submenu.items.isEmpty
         } else {
@@ -963,7 +1014,7 @@ private final class QuickAccessWindow: NSWindow {
 
     /// Latch the card-drag origin. Safe to call from the window override or from
     /// the thumb once it decides the gesture is a downward card drag.
-    func cardDragBegin() {
+    func cardDragBegin(startingAt start: NSPoint = NSEvent.mouseLocation) {
         guard !isClosing, !isParked, !isPreviewZoomed else { return }
         // Raise the grabbed card above its siblings for the whole gesture. Without
         // this, dragging a card that overlaps another could slide it BEHIND the
@@ -972,18 +1023,16 @@ private final class QuickAccessWindow: NSWindow {
         // orderFrontRegardless matches how the rest of the overlay surfaces cards
         // (non-activating floating windows) without stealing the user's focus.
         orderFrontRegardless()
-        // A drag that starts while ANY frame animation is in flight (the 0.35s
-        // entrance slide, a reflow spring, a snap-back, a zoom collapse) fights it:
-        // both write the frame, so the drag's setFrameOrigin and the animator's
-        // setFrame ping-pong the card and it "won't move". Clear the entrance latch
-        // and replace whatever animation is running with a zero-duration one at the
-        // current frame, so the drag owns the window from the first event.
+        // A drag owns the final window frame from its first event. Cancel the short
+        // content-only entrance too, so a completion from an old presentation turn
+        // cannot re-gate the controls during the gesture.
         isEntering = false
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0
-            self.animator().setFrame(self.frame, display: true)
-        }
-        cardDragStartMouse = NSEvent.mouseLocation
+        cancelVisualEntrance()
+        // The user has deliberately grabbed the thumbnail. Once that gesture
+        // settles, controls may appear normally even if the entrance animation was
+        // interrupted before its completion callback ran.
+        controlsReadyForInteraction = true
+        cardDragStartMouse = start
         cardDragStartOrigin = frame.origin
         isCardDragging = false
         // Conveyor: snapshot every OTHER visible card on this screen with its
@@ -995,7 +1044,7 @@ private final class QuickAccessWindow: NSWindow {
             .map { (card: $0, startOrigin: $0.frame.origin) }
         QuickAccessWindow.uiTestConveyorMaxDrop = 0
         QuickAccessWindow.uiTestConveyorSiblingsMoved = 0
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
         // Freeze the SIBLINGS' auto-dismiss too: their countdowns kept running
         // through a gesture, so a card could animate itself away mid-drag of its
@@ -1004,11 +1053,10 @@ private final class QuickAccessWindow: NSWindow {
         conveyorSiblings.forEach { $0.card.pauseDismissForSiblingGesture() }
     }
 
-    func cardDragUpdate() {
+    func cardDragUpdate(at current: NSPoint = NSEvent.mouseLocation) {
         guard let m0 = cardDragStartMouse, let o0 = cardDragStartOrigin else { return }
-        let now = NSEvent.mouseLocation
-        let dx = now.x - m0.x
-        let dy = now.y - m0.y
+        let dx = current.x - m0.x
+        let dy = current.y - m0.y
         // 4pt threshold so a tiny accidental press doesn't move/delete.
         if !isCardDragging && (abs(dx) + abs(dy) < 4) { return }
         isCardDragging = true
@@ -1221,54 +1269,26 @@ private final class QuickAccessWindow: NSWindow {
     /// it converted to a file drag (the thumb is done either way). `initialEvent` is
     /// the thumb's first past-threshold drag; `beginFileDrag` starts the drag-out.
     @discardableResult
-    func handleThumbDrag(initialEvent: NSEvent, beginFileDrag: (NSEvent) -> Bool) -> Bool {
+    func handleThumbDrag(
+        initialEvent: NSEvent,
+        dragOrigin: NSPoint,
+        beginFileDrag: (NSEvent) -> Bool
+    ) -> Bool {
         guard !isClosing, !isParked, !isPreviewZoomed else { return false }
-        // Latch the grab; the card already follows the cursor on the first frame for
-        // delete/standby feedback. cardDragBegin kills any in-flight frame animation.
-        cardDragBegin()
-        cardDragUpdate()
+        QuickAccessWindow.uiTestGestureEntryCount += 1
+        // Preserve the real mouse-down location. Starting from the first drag sample
+        // discards a coalesced, fast drag because the first update sees zero delta.
+        cardDragBegin(startingAt: dragOrigin)
 
-        var lastEvent = initialEvent
+        if routeThumbDragEvent(initialEvent, beginFileDrag: beginFileDrag) {
+            return false
+        }
+
         while let next = nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
             if next.type == .leftMouseUp { break }
-            lastEvent = next
-
-            // Displacement from the grab. towardEdge>0 pulls out of the anchor line;
-            // intoScreen>0 pulls into the screen; downward>0 pulls down.
-            let now = NSEvent.mouseLocation
-            let dx = now.x - (cardDragStartMouse?.x ?? now.x)
-            let dy = now.y - (cardDragStartMouse?.y ?? now.y)
-            let towardEdge = Settings.overlayOnLeft ? -dx : dx
-            let intoScreen = -towardEdge
-            let downward = -dy
-
-            // INTO the screen, past the convert distance, and the inward pull beats
-            // the downward pull -> file drag. The card is pinned, so an inward pull
-            // means "take the file out", not "move the card inward". (intoScreen is
-            // -towardEdge, so comparing the two is meaningless; only the down axis
-            // can compete with an inward pull, and down dominant is standby instead.)
-            if intoScreen > fileDragConvertDistance && intoScreen > abs(downward) {
-                currentGestureMode = .filedrag
-                isCardDragging = false
-                clearDragHint()
-                snapBackToSlot()
-                // A standby pull before the inward turn may have carried the belt
-                // down; spring the siblings home (this branch skips cardDragEnd).
-                springConveyorBack()
-                conveyorSiblings = []
-                cardDragStartMouse = nil
-                cardDragStartOrigin = nil
-                _ = beginFileDrag(lastEvent)
+            if routeThumbDragEvent(next, beginFileDrag: beginFileDrag) {
                 return false
             }
-
-            // Toward edge = delete, downward = standby: let the card follow the cursor
-            // with the matching trash/chevron feedback. dragClassify drives the mode
-            // label so the harness can read which pinned gesture is live.
-            currentGestureMode = dragClassify(dx: dx, dy: dy).map {
-                $0.intent == .delete ? CardGestureMode.deleting : .standby
-            } ?? .none
-            cardDragUpdate()
         }
 
         // Release: cardDragEnd confirms delete (past edge threshold) or standby (past
@@ -1278,6 +1298,60 @@ private final class QuickAccessWindow: NSWindow {
         currentGestureMode = .none
         cardDragEnd()
         return true
+    }
+
+    /// Classify and apply every drag sample, including the first one that crossed
+    /// the view threshold. A single coalesced event must be enough to move the card.
+    @discardableResult
+    private func routeThumbDragEvent(
+        _ event: NSEvent,
+        beginFileDrag: (NSEvent) -> Bool
+    ) -> Bool {
+        let now = convertPoint(toScreen: event.locationInWindow)
+        let start = cardDragStartMouse ?? now
+        let dx = now.x - start.x
+        let dy = now.y - start.y
+        let towardEdge = Settings.overlayOnLeft ? -dx : dx
+        let intoScreen = -towardEdge
+        let downward = -dy
+
+        // INTO the screen, past the convert distance, and the inward pull beats
+        // the downward pull -> file drag. The card is pinned, so an inward pull
+        // means "take the file out", not "move the card inward".
+        if intoScreen > fileDragConvertDistance && intoScreen > abs(downward) {
+            settleFileDragConversion()
+            _ = beginFileDrag(event)
+            return true
+        }
+
+        // Toward edge = delete, downward = standby: let the card follow the cursor
+        // with the matching trash/chevron feedback. dragClassify drives the mode
+        // label so the harness can read which pinned gesture is live.
+        currentGestureMode = dragClassify(dx: dx, dy: dy).map {
+            $0.intent == .delete ? CardGestureMode.deleting : .standby
+        } ?? .none
+        cardDragUpdate(at: now)
+        return false
+    }
+
+    /// Settle the card-owned portion of an inward drag before AppKit takes over the
+    /// file session. This deliberately mirrors the cleanup normally performed by
+    /// `cardDragEnd`, except the file session owns the pointer after this point.
+    private func settleFileDragConversion() {
+        currentGestureMode = .filedrag
+        isCardDragging = false
+        clearDragHint()
+        snapBackToSlot()
+        // A standby pull before the inward turn may have carried the belt down;
+        // spring the siblings home because this path skips cardDragEnd.
+        springConveyorBack()
+        // The normal cardDragEnd `defer` resumes every sibling here. File drag
+        // returns early to AppKit, so it must mirror that cleanup before dropping
+        // the snapshot or those cards remain paused until a later hover.
+        conveyorSiblings.forEach { $0.card.resumeDismissIfNeeded() }
+        conveyorSiblings = []
+        cardDragStartMouse = nil
+        cardDragStartOrigin = nil
     }
 
     private func buildContent() {
@@ -1351,7 +1425,10 @@ private final class QuickAccessWindow: NSWindow {
         clipView.addSubview(backdropDim)
         backdropDimView = backdropDim
 
-        let thumb = DraggableImageView(frame: thumbFrame)
+        // Include the two-point progress strip in the thumbnail's hit area. The
+        // strip itself is decorative, but a drag that starts on it must follow the
+        // same card gesture path as any other point in the preview.
+        let thumb = DraggableImageView(frame: NSRect(x: 0, y: 0, width: thumbW, height: totalH))
         // Aspect-FILL via the layer (user rule: the shot always covers the whole
         // card, never letterbox bars). NSImageView only aspect-fits, so the image
         // is rendered by the layer and the view keeps drag/click behavior. The
@@ -1371,9 +1448,13 @@ private final class QuickAccessWindow: NSWindow {
             thumb.fileURLOverride = { payload.url }
             thumb.onDoubleClick = { [weak self] in self?.openVideoAction() }
         } else {
+            // Screenshot drags always materialize the current displayed artifact in
+            // the configured export format. Reusing the history PNG here made the
+            // same card export as JPEG/WebP/PDF before persistence and PNG after it,
+            // and could race a rotation with the older file on disk.
             thumb.onDoubleClick = { [weak self] in self?.editAction() }
         }
-        thumb.onDragStarted = { [weak self] in self?.dismissTimer?.invalidate() }
+        thumb.onDragStarted = { [weak self] in self?.invalidateDismissTimer() }
         thumb.onDragEnded = { [weak self] accepted in
             guard let self else { return }
             if accepted {
@@ -1385,8 +1466,12 @@ private final class QuickAccessWindow: NSWindow {
         // Continuous direction classifier: toward edge = delete, into screen = file
         // drag, downward = standby. Card-pinned, no free move. The card starts the
         // file drag through the supplied callback at the conversion point.
-        thumb.onCardGesture = { [weak self] event, beginFileDrag in
-            self?.handleThumbDrag(initialEvent: event, beginFileDrag: beginFileDrag) ?? false
+        thumb.onCardGesture = { [weak self] event, dragOrigin, beginFileDrag in
+            self?.handleThumbDrag(
+                initialEvent: event,
+                dragOrigin: dragOrigin,
+                beginFileDrag: beginFileDrag
+            ) ?? false
         }
         thumb.onClickWhileZoomed = { [weak self] in
             guard let self, self.isPreviewZoomed else { return false }
@@ -1395,9 +1480,22 @@ private final class QuickAccessWindow: NSWindow {
         }
         // Card fully configured (fileURLOverride decided): pre-export the drag
         // file in background so the drag-out gesture starts without a hitch.
-        thumb.prepareForFileDrag()
+        thumb.prepareForFileDrag(artifact: presentedArtifact)
         clipView.addSubview(thumb)
         thumbView = thumb
+
+        let routeControlDrag: (NSEvent, NSPoint) -> Void = { [weak self, weak thumb] event, dragOrigin in
+            guard let self else { return }
+            _ = self.handleThumbDrag(
+                initialEvent: event,
+                dragOrigin: dragOrigin,
+                beginFileDrag: { event in
+                    guard let thumb else { return false }
+                    thumb.beginFileDrag(with: event)
+                    return true
+                }
+            )
+        }
 
         // Video badge: a centered play glyph + a mm:ss duration pill at the bottom
         // edge, so a card reads as a recording at a glance. Sits above the thumb,
@@ -1416,7 +1514,11 @@ private final class QuickAccessWindow: NSWindow {
         // 2pt progress strip insets the bottom, which has no visible round corner),
         // so it carries the card radius directly. A concentric (radius - inset)
         // would shrink the top corners away from the clip and open a hairline gap.
-        let frost = ChromeFactory.backing(frame: controls.bounds, cornerRadius: metrics.cornerRadius)
+        let frost = ChromeFactory.backing(
+            frame: controls.bounds,
+            cornerRadius: metrics.cornerRadius,
+            variant: .clear
+        )
         controls.glassBacking = frost
         controls.addSubview(frost)
 
@@ -1453,24 +1555,31 @@ private final class QuickAccessWindow: NSWindow {
             btn.target = self
             btn.action = sel
             btn.imageScaling = .scaleNone
-            // CleanShot look: translucent white circle, dark symbol (the pill
-            // palette already encodes exactly that, adaptively).
+            // The card carries a dark clear-glass shell, so its secondary
+            // controls stay restrained until hover or press brings in coral.
             btn.contentTintColor = KritColors.pillButtonText
             btn.wantsLayer = true
             btn.layer?.contentsScale = screenScale
             btn.layer?.cornerRadius = cSize / 2
             btn.layer?.cornerCurve = .continuous
             btn.layer?.backgroundColor = KritColors.pillButtonBackground.cgColor
+            btn.setAccessibilityRole(.button)
+            let accessibilityID = tip == "Save"
+                ? "quickAccess.corner.save"
+                : "quickAccess.\(tip.lowercased().replacingOccurrences(of: " ", with: ""))"
+            btn.setAccessibilityIdentifier(accessibilityID)
+            btn.setAccessibilityLabel(tip)
+            btn.onCardDrag = routeControlDrag
             controls.addSubview(btn)
         }
 
-        // ── Center pills (tight-fit white capsules) ──
+        // ── Center pills (tight-fit secondary actions) ──
         let pillH = metrics.pillHeight
         let pillGap = metrics.pillGap
         let pillPadding = metrics.pillPadding  // total horizontal padding
         let pillFont = NSFont.systemFont(ofSize: metrics.pillFontSize, weight: .medium)
         let pillAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.black.withAlphaComponent(0.85),
+            .foregroundColor: KritColors.pillButtonText,
             .font: pillFont,
         ]
 
@@ -1498,6 +1607,13 @@ private final class QuickAccessWindow: NSWindow {
             pill.layer?.cornerRadius = pillH / 2
             pill.layer?.cornerCurve = .continuous
             pill.layer?.backgroundColor = KritColors.pillButtonBackground.cgColor
+            pill.setAccessibilityRole(.button)
+            let accessibilityID = title == "Save"
+                ? "quickAccess.pill.save"
+                : "quickAccess.\(title.lowercased())"
+            pill.setAccessibilityIdentifier(accessibilityID)
+            pill.setAccessibilityLabel(title)
+            pill.onCardDrag = routeControlDrag
             controls.addSubview(pill)
             pillCursorX += pw + pillGap
         }
@@ -1512,7 +1628,7 @@ private final class QuickAccessWindow: NSWindow {
         // so there's never a stray second timer racing the first.
         let timeout = Settings.overlayTimeout
         if timeout > 0 {
-            let progressBg = NSView(frame: NSRect(x: 0, y: 0, width: thumbW, height: progressH))
+            let progressBg = PassthroughView(frame: NSRect(x: 0, y: 0, width: thumbW, height: progressH))
             progressBg.wantsLayer = true
             progressBg.layer?.backgroundColor = KritColors.progressBackground.cgColor
             clipView.addSubview(progressBg)
@@ -1603,10 +1719,11 @@ private final class QuickAccessWindow: NSWindow {
         // While zoomed (O5) the chrome stays hidden behind the big preview.
         guard hovered != isHovered, !isParked, !isPreviewZoomed else { return }
         isHovered = hovered
+        controlsOverlay?.isInteractive = hovered && controlsReadyForInteraction
 
         // Pause/resume auto-dismiss timer on hover (like CleanShot X)
         if hovered {
-            dismissTimer?.invalidate()
+            invalidateDismissTimer()
             timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
         } else {
             restartDismissTimer()
@@ -1614,7 +1731,7 @@ private final class QuickAccessWindow: NSWindow {
 
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.2
-            controlsOverlay?.animator().alphaValue = hovered ? 1 : 0
+            controlsOverlay?.animator().alphaValue = hovered && controlsReadyForInteraction ? 1 : 0
         }
     }
 
@@ -1625,25 +1742,54 @@ private final class QuickAccessWindow: NSWindow {
         guard !isClosing, !isParked else { return }
         let remaining = Settings.overlayTimeout
         guard remaining > 0 else { return }
+        let epoch = invalidateDismissTimer()
         animateTimeoutProgress(duration: remaining)
-        dismissTimer?.invalidate()
         dismissTimer = Timer.scheduledTimer(withTimeInterval: remaining, repeats: false) { [weak self] _ in
-            DispatchQueue.main.async { self?.animatedClose() }
+            Task { @MainActor [weak self] in
+                self?.enqueueAutoDismiss(for: epoch)
+            }
+        }
+    }
+
+    /// Advances the token before invalidating the timer. A timer callback can
+    /// already have queued its close on the main thread, so callers must retire
+    /// both the timer and any close work carrying its prior token.
+    @discardableResult
+    private func invalidateDismissTimer() -> UInt64 {
+        dismissTimer?.invalidate()
+        dismissTimer = nil
+        return dismissEpoch.advance()
+    }
+
+    private func enqueueAutoDismiss(for epoch: UInt64) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.dismissEpoch.accepts(epoch),
+                  !self.isClosing,
+                  !self.isParked else { return }
+            self.animatedClose()
         }
     }
 
     /// Resume the timer only when the cursor isn't over the card (so a release
     /// inside the card keeps it paused until the mouse actually leaves).
     private func resumeDismissIfNeeded() {
-        guard !isHovered else { return }
-        restartDismissTimer()
+        // A reflow can move a previously hovered sibling away from the cursor
+        // without a new mouse-move event. Use the live ownership test here so that
+        // stale hover state never leaves a sibling timer frozen after a gesture.
+        guard !cursorOwnsThisCard() else { return }
+        if isHovered {
+            setHovered(false)
+        } else {
+            restartDismissTimer()
+        }
     }
 
     /// A sibling started a gesture: hold this card's auto-dismiss (and its coral
     /// countdown) until the gesture settles, so no card vanishes mid-drag of its
     /// neighbor. Mirrors the hover pause.
     private func pauseDismissForSiblingGesture() {
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
     }
 
@@ -1664,7 +1810,39 @@ private final class QuickAccessWindow: NSWindow {
     /// The screen this card lives on: the capture's display when known, else the
     /// main display. Cascade, peek, park and edge tests all key off this.
     private var overlayScreen: NSScreen? {
-        cardScreen ?? NSScreen.main ?? NSScreen.screens.first
+        normalizeCardScreen()
+    }
+
+    @discardableResult
+    private func normalizeCardScreen() -> NSScreen? {
+        let liveScreens = NSScreen.screens
+        let liveScreenIDs = liveScreens.map(ObjectIdentifier.init)
+        let fallbackScreen = screenFallback(from: liveScreens)
+        let resolvedID = QuickAccessScreenResolution.resolve(
+            storedScreenID: cardScreen.map(ObjectIdentifier.init),
+            liveScreenIDs: liveScreenIDs,
+            fallbackScreenID: fallbackScreen.map(ObjectIdentifier.init)
+        )
+        let resolvedScreen = resolvedID.flatMap { resolvedID in
+            liveScreens.first { ObjectIdentifier($0) == resolvedID }
+        }
+        cardScreen = resolvedScreen
+        return resolvedScreen
+    }
+
+    private func screenFallback(from liveScreens: [NSScreen]) -> NSScreen? {
+        if let intersectingScreen = liveScreens.first(where: { $0.frame.intersects(frame) }) {
+            return intersectingScreen
+        }
+        let cursor = NSEvent.mouseLocation
+        if let cursorScreen = liveScreens.first(where: { $0.frame.contains(cursor) }) {
+            return cursorScreen
+        }
+        if let mainScreen = NSScreen.main,
+           let liveMainScreen = liveScreens.first(where: { ObjectIdentifier($0) == ObjectIdentifier(mainScreen) }) {
+            return liveMainScreen
+        }
+        return liveScreens.first
     }
 
     /// B3: pick the display the card should live on. The product rule is "the
@@ -1766,37 +1944,109 @@ private final class QuickAccessWindow: NSWindow {
         }
     }
 
-    private func positionOverlay() {
-        guard let screen = overlayScreen else { return }
+    /// Cancels the content-only entrance without moving the window. A new drag can
+    /// then own the card's final frame on its first event.
+    private func cancelVisualEntrance() {
+        entranceEpoch &+= 1
+        guard let layer = contentView?.layer else { return }
+        layer.removeAnimation(forKey: Self.visualEntranceAnimationKey)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.sublayerTransform = CATransform3DIdentity
+        layer.opacity = 1
+        CATransaction.commit()
+    }
+
+    /// Keeps the real window in its final interactive frame while its contents
+    /// settle in from the stack edge. Borderless floating NSWindows can strand an
+    /// implicit frame animation at its off-screen seed, so this relies only on the
+    /// layer-backed content already used by the card.
+    private func playVisualEntrance(on layer: CALayer, fromX: CGFloat, reduceMotion: Bool) {
+        entranceEpoch &+= 1
+        let epoch = entranceEpoch
+        let duration: CFTimeInterval = reduceMotion ? 0.15 : 0.35
+        let timing = reduceMotion
+            ? CAMediaTimingFunction(name: .easeOut)
+            : CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
+
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.0
+        fade.toValue = 1.0
+        fade.duration = duration
+        fade.timingFunction = timing
+
+        var animations: [CAAnimation] = [fade]
+        if !reduceMotion {
+            let slide = CABasicAnimation(keyPath: "sublayerTransform")
+            slide.fromValue = NSValue(caTransform3D: CATransform3DMakeTranslation(fromX, 0, 0))
+            slide.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+            slide.duration = duration
+            slide.timingFunction = timing
+            animations.append(slide)
+        }
+
+        let group = CAAnimationGroup()
+        group.animations = animations
+        group.duration = duration
+        group.timingFunction = timing
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.sublayerTransform = CATransform3DIdentity
+        layer.opacity = 1
+        CATransaction.setCompletionBlock { [weak self] in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.entranceEpoch == epoch,
+                      self.isEntering,
+                      !self.isClosing,
+                      !self.isParked else { return }
+                self.finishInitialPresentation()
+            }
+        }
+        layer.add(group, forKey: Self.visualEntranceAnimationKey)
+        CATransaction.commit()
+    }
+
+    /// Presents a fully constructed card after it enters the owning stack. The
+    /// window takes its final interactive frame before content motion begins.
+    private func presentInitialOverlay() {
+        guard overlayScreen != nil else { return }
         let slot = slotFrame()
 
-        // Handoff entrance: the card parks INVISIBLE exactly at its slot and
-        // waits for revealPendingHandoff (the fly-to-tray ghost lands on it,
-        // then the card fades in under the ghost's fade-out). No slide.
+        // Handoff entrance: surface the real card directly at its slot. A previous
+        // ghost-only flight left no WindowServer target for the first ~600 ms, so a
+        // drag started right after capture was lost before the thumbnail existed.
         if entrance == .handoff {
             setFrame(NSRect(origin: slot.origin, size: frame.size), display: false)
-            alphaValue = 0
+            alphaValue = 1
             NSApp.setActivationPolicy(.accessory)
             orderFrontRegardless()
+            // Commit the visible card before returning to the capture pipeline. A
+            // deferred first display leaves a short interval where WindowServer has
+            // no surface to target even though `orderFrontRegardless` has returned.
+            displayIfNeeded()
             Self.pendingHandoffCard = self
             return
         }
 
-        // M1': enter by sliding in from the screen edge the stack lives on (left
-        // when overlayOnLeft, right otherwise) with a soft spring (~0.35s), no
-        // instant pop. Start fully off that edge; the window-frame spring carries
-        // it to its slot. Reduce Motion → plain crossfade in place.
+        // Keep the NSWindow at its real hit-testable slot from the first frame.
+        // A borderless floating window can leave an implicit off-screen frame
+        // animation stranded forever, which also leaves its controls gated.
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let vf = screen.visibleFrame
-        let offEdgeX = Settings.overlayOnLeft
-            ? vf.minX - slot.width - 20
-            : vf.maxX + 20
-        if reduceMotion {
-            setFrameOrigin(slot.origin)
-        } else {
-            setFrameOrigin(NSPoint(x: offEdgeX, y: slot.origin.y))
+        let entranceOffset: CGFloat = reduceMotion
+            ? 0
+            : (Settings.overlayOnLeft ? -22 : 22)
+        if let layer = contentView?.layer {
+            layer.removeAnimation(forKey: Self.visualEntranceAnimationKey)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.sublayerTransform = CATransform3DMakeTranslation(entranceOffset, 0, 0)
+            layer.opacity = 0
+            CATransaction.commit()
         }
-        alphaValue = 0
+        setFrame(NSRect(origin: slot.origin, size: frame.size), display: false)
+        alphaValue = 1
 
         // Show the card WITHOUT passively stealing focus on appearance, that was
         // the root of the dead-interaction bug: the old code activated the app and
@@ -1808,27 +2058,12 @@ private final class QuickAccessWindow: NSWindow {
         NSApp.setActivationPolicy(.accessory)
         orderFrontRegardless()
 
-        // Slide to the slot with a spring (off-edge → slot). The hover/focus check
-        // below uses the FINAL slot frame, not the off-screen start, so a cursor
-        // sitting on the landing spot still borrows the keyboard.
-        if !reduceMotion {
-            isEntering = true
-            // animator().setFrame, NOT setFrameOrigin: NSWindow only animates the
-            // whole "frame" key, animator().setFrameOrigin is a silent no-op, which
-            // stranded entering cards off-screen at the slide start position.
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.35
-                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
-                self.animator().setFrame(NSRect(origin: slot.origin, size: self.frame.size), display: true)
-            }, completionHandler: { [weak self] in
-                DispatchQueue.main.async {
-                    self?.isEntering = false
-                    self?.showSpaceHintOnce()
-                }
-            })
-        } else {
-            showSpaceHintOnce()
-        }
+        // Commit the visual seed before the layer entrance starts.
+        contentView?.layoutSubtreeIfNeeded()
+        displayIfNeeded()
+        CATransaction.flush()
+
+        isEntering = true
 
         let underCursor = slot.contains(NSEvent.mouseLocation)
         mouseInsideOverlay = underCursor
@@ -1839,19 +2074,29 @@ private final class QuickAccessWindow: NSWindow {
         // While hovered the timer stays paused; hover-exit restarts it.
         if !underCursor { restartDismissTimer() }
 
-        // Fade in (the slide spring carries the motion when enabled).
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = reduceMotion ? 0.15 : 0.3
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            self.animator().alphaValue = 1
+        if let layer = contentView?.layer {
+            playVisualEntrance(on: layer, fromX: entranceOffset, reduceMotion: reduceMotion)
+        } else {
+            finishInitialPresentation()
         }
+    }
+
+    /// Completes either entrance path only after the card is visible enough to own
+    /// action controls. Hover/key can start earlier, but the thumbnail keeps mouse
+    /// routing until this point.
+    private func finishInitialPresentation() {
+        guard !isClosing, !isParked else { return }
+        isEntering = false
+        controlsReadyForInteraction = true
+        resyncHoverAndTracking()
+        showSpaceHintOnce()
     }
 
     /// Swipe-dismiss: slide overlay off-screen toward the swipe direction
     private func swipeDismiss(direction: CGFloat) {
         guard !isClosing else { return }
         isClosing = true
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
         // Reflow now (this card is already isClosing → excluded) so survivors
         // close the gap in step with the slide-out instead of after cleanup.
         QuickAccessWindow.reflowStack()
@@ -1886,7 +2131,7 @@ private final class QuickAccessWindow: NSWindow {
     private func throwOffEdgeAndDelete() {
         guard !isClosing else { return }
         isClosing = true
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
         // Reflow now (this card is already isClosing → excluded) so survivors
         // close the gap in step with the throw-off animation.
@@ -1978,7 +2223,7 @@ private final class QuickAccessWindow: NSWindow {
                       createHandle: Bool = true, onRestoreOverride: (() -> Void)? = nil) {
         guard !isClosing, !isParked, !isPreviewZoomed else { return }
         isParked = true
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
 
         let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) }) ?? NSScreen.main
@@ -2061,9 +2306,8 @@ private final class QuickAccessWindow: NSWindow {
         }
     }
 
-    /// Fades the waiting handoff card in once the fly-to-tray ghost lands on it
-    /// (delay ≈ ghost settling − crossfade). With no ghost (Reduce Motion, no
-    /// image) the delay is 0 and the card simply fades in at its slot.
+    /// Completes the initial handoff turn after the real card has been ordered at
+    /// its final slot. The body is already interactive; this only releases chrome.
     fileprivate static func revealPendingHandoff(after delay: TimeInterval) {
         guard let card = pendingHandoffCard else { return }
         pendingHandoffCard = nil
@@ -2071,24 +2315,8 @@ private final class QuickAccessWindow: NSWindow {
             guard let card, !card.isClosing, !card.isParked else { return }
             let underCursor = card.frame.contains(NSEvent.mouseLocation)
             card.mouseInsideOverlay = underCursor
-            card.updateHoverFocus(underCursor)
             if !underCursor { card.restartDismissTimer() }
-            if delay > 0 {
-                // The ghost is still fully opaque ON TOP of the card at this
-                // moment, so the card snaps to opaque underneath it and only the
-                // ghost fades out above. Cross-fading both at once dipped the
-                // luminance mid-blend (both layers half transparent over the
-                // desktop), which read as the "appears broken, then snaps" flick.
-                card.alphaValue = 1
-            } else {
-                // No ghost (Reduce Motion or no image): plain fade-in at the slot.
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.15
-                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    card.animator().alphaValue = 1
-                }
-            }
-            card.showSpaceHintOnce()
+            card.finishInitialPresentation()
         }
     }
 
@@ -2257,7 +2485,7 @@ private final class QuickAccessWindow: NSWindow {
     private func rebuildAtCurrentSize() {
         guard !isClosing, !isParked else { return }
         let wasHovered = isHovered
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
 
         // Kill any in-flight frame animation (entrance/reflow) first: rebuilding
@@ -2383,7 +2611,7 @@ private final class QuickAccessWindow: NSWindow {
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         // Capturable only under the UI-test harness (visual gate of the pill);
         // invisible to recordings and captures in production.
-        win.sharingType = ProcessInfo.processInfo.environment["KRIT_UI_TEST"] == "1" ? .readWrite : .none
+        win.sharingType = KritTestHarness.isEnabled ? .readWrite : .none
 
         let pill = NSView(frame: NSRect(x: 0, y: 0, width: round(pillW), height: pillH))
         pill.addSubview(ChromeFactory.backing(frame: pill.bounds, cornerRadius: pillH / 2))
@@ -2445,7 +2673,7 @@ private final class QuickAccessWindow: NSWindow {
         guard !isClosing, !isParked, !isPreviewZoomed else { return }
         isPreviewZoomed = true
         preZoomFrame = frame
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
         // The resting card aspect-FILLS (no letterbox); the zoom is a content
         // preview, so show the WHOLE shot while expanded.
@@ -2476,6 +2704,7 @@ private final class QuickAccessWindow: NSWindow {
         zoomOutsideClickMonitor = [localClick, globalClick].compactMap { $0 }
 
         let target = zoomTargetFrame()
+        controlsOverlay?.isInteractive = false
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = reduceMotion ? 0.15 : 0.32
@@ -2548,6 +2777,7 @@ private final class QuickAccessWindow: NSWindow {
         mouseInsideOverlay = inside
         // Clear the stale latch so setHovered actually runs for the real state.
         isHovered = false
+        controlsOverlay?.isInteractive = false
         updateHoverFocus(inside)
         if !inside { restartDismissTimer() }
     }
@@ -2565,7 +2795,7 @@ private final class QuickAccessWindow: NSWindow {
 
     @objc private func shareAction() {
         guard let view = contentView else { return }
-        dismissTimer?.invalidate()  // resume on next hover-exit (already wired)
+        invalidateDismissTimer()  // resume on next hover-exit (already wired)
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
         // Video shares the clip file; screenshot shares the image.
         let items: [Any] = videoPayload.map { [$0.url] } ?? [image]
@@ -2579,10 +2809,11 @@ private final class QuickAccessWindow: NSWindow {
     /// flow can refresh the drag-out payload. Not wired now (editing dismisses
     /// the overlay), so the drag always carries the freshest image we hold.
     func updateImage(_ newImage: NSImage) {
+        presentedArtifact = CaptureArtifact(image: newImage)
         image = newImage
         thumbView?.layer?.contents = newImage.bestCGImage
         thumbView?.dragImage = newImage
-        thumbView?.prepareForFileDrag()
+        thumbView?.prepareForFileDrag(artifact: presentedArtifact)
     }
 
     private var isClosing = false
@@ -2591,7 +2822,7 @@ private final class QuickAccessWindow: NSWindow {
     private func animatedClose() {
         guard !isClosing else { return }
         isClosing = true
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             self?.forceCleanup()
@@ -2621,6 +2852,7 @@ private final class QuickAccessWindow: NSWindow {
     private func forceCleanup() {
         guard !didCleanup else { return }
         didCleanup = true
+        cancelVisualEntrance()
         // Release O5 zoom ownership if this card closes while zoomed.
         if isPreviewZoomed { isPreviewZoomed = false }
         // P1: tear down the Space companion preview if this card owned it, and
@@ -2688,7 +2920,7 @@ private final class QuickAccessWindow: NSWindow {
         let ext = Settings.screenshotFormat
         let url = URL(fileURLWithPath: dir, isDirectory: true).appendingPathComponent("\(name).\(ext)")
 
-        guard ImageExporter.save(image: image, to: url) != nil else {
+        guard ImageExporter.save(image: image, to: url, collisionPolicy: .uniquify) != nil else {
             ToastWindow.show(message: "Could not save screenshot")
             return
         }
@@ -2700,7 +2932,7 @@ private final class QuickAccessWindow: NSWindow {
     /// lands, then copies the recording there. The original stays put (auto-saved
     /// recordings already live in the user's folder; this is an extra copy).
     private func saveVideoAs(_ source: URL) {
-        dismissTimer?.invalidate()
+        invalidateDismissTimer()
         timeoutProgressLayer?.removeAnimation(forKey: "timeoutProgress")
         let panel = NSSavePanel()
         panel.nameFieldStringValue = source.lastPathComponent
@@ -2858,14 +3090,14 @@ private final class QuickAccessWindow: NSWindow {
     }
 
     @objc private func showInFinderAction() {
-        let url = videoPayload?.url ?? historyItem.map { URL(fileURLWithPath: $0.imagePath) }
+        let url = videoPayload?.url ?? historyItem?.persistedPresentationFileURL
         guard let url else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     @objc private func openWithAction(_ sender: NSMenuItem) {
         guard let appURL = sender.representedObject as? URL else { return }
-        let fileURL = videoPayload?.url ?? historyItem.map { URL(fileURLWithPath: $0.imagePath) }
+        let fileURL = videoPayload?.url ?? historyItem?.persistedPresentationFileURL
         guard let fileURL else { return }
         NSWorkspace.shared.open(
             [fileURL],
@@ -2885,7 +3117,12 @@ private final class QuickAccessWindow: NSWindow {
     private func rotateImage(clockwise: Bool) {
         // Rotation rewrites the HistoryItem PNGs; it is a screenshot-only action and
         // the menu item never appears on a video card.
-        guard let historyItem else { return }
+        guard let currentHistoryItem = historyItem,
+              let historyManager,
+              historyManager.contains(currentHistoryItem) else {
+            animatedClose()
+            return
+        }
         guard !isClosing, !isParked else { return }
         if isPreviewZoomed { collapseZoom() }
         guard let cg = image.bestCGImage,
@@ -2896,6 +3133,15 @@ private final class QuickAccessWindow: NSWindow {
             size: NSSize(width: image.size.height, height: image.size.width)
         )
 
+        guard let updatedItem = historyManager.updatePresentedImage(rotatedImage, for: currentHistoryItem) else {
+            animatedClose()
+            return
+        }
+        historyItem = updatedItem
+        // BuildContent starts its background drag export immediately. Update the
+        // artifact first so a drag started before the async disk write is already
+        // the rotated image, never the prior orientation.
+        presentedArtifact = CaptureArtifact(image: rotatedImage)
         image = rotatedImage
         // Rebuild so the thumb, drag payload and blurred backdrop all pick up
         // the rotated image (buildContent reads `image` for every layer).
@@ -2905,32 +3151,6 @@ private final class QuickAccessWindow: NSWindow {
             ImageExporter.copyToClipboard(image: rotatedImage)
         }
 
-        // Serve the rotated image from memory right away (history panel reads
-        // through the cache), then rewrite the PNGs off the main thread,
-        // mirroring the HistoryManager.add persistence pattern.
-        HistoryImageCache.primeFull(rotatedImage, for: historyItem.imagePath)
-        HistoryImageCache.primeThumbnail(rotatedImage, for: historyItem.thumbnailPath)
-        let imagePath = historyItem.imagePath
-        let thumbPath = historyItem.thumbnailPath
-        let rect = historyItem.captureRect?.cgRect
-        Task.detached(priority: .userInitiated) {
-            guard let fullCG = rotatedImage.bestCGImage,
-                  let png = ImageExporter.pngData(from: fullCG) else {
-                print("[KRIT] Rotate persist failed: unable to encode rotated image")
-                return
-            }
-            do {
-                try png.write(to: URL(fileURLWithPath: imagePath), options: .atomic)
-                HistoryManager.applyScreenshotMetadata(to: imagePath, rect: rect)
-            } catch {
-                print("[KRIT] Rotate persist failed at \(imagePath): \(error)")
-                return
-            }
-            if let thumbCG = Self.downsampled(fullCG, maxDimension: 240),
-               let thumbPNG = ImageExporter.pngData(from: thumbCG) {
-                try? thumbPNG.write(to: URL(fileURLWithPath: thumbPath), options: .atomic)
-            }
-        }
     }
 
     /// Rotate a CGImage by 90°. CG positive angles run counterclockwise, so
@@ -2955,31 +3175,6 @@ private final class QuickAccessWindow: NSWindow {
         return ctx.makeImage()
     }
 
-    /// Downsample so the longest edge fits `maxDimension` (history thumbnail,
-    /// same 240pt budget HistoryManager uses for its own thumbnails).
-    nonisolated private static func downsampled(_ cg: CGImage, maxDimension: CGFloat) -> CGImage? {
-        let w = CGFloat(cg.width)
-        let h = CGFloat(cg.height)
-        let longest = max(w, h)
-        guard longest > maxDimension else { return cg }
-        let scale = maxDimension / longest
-        let newW = max(1, Int((w * scale).rounded()))
-        let newH = max(1, Int((h * scale).rounded()))
-        let colorSpace = cg.colorSpace ?? CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: newW,
-            height: newH,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        ctx.interpolationQuality = .high
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: newW, height: newH))
-        return ctx.makeImage()
-    }
-
     func show() {
         // SP1: ensure the screen-parameters observer is live (registered once).
         QuickAccessWindow.registerScreenObserverIfNeeded()
@@ -2993,9 +3188,10 @@ private final class QuickAccessWindow: NSWindow {
         QuickAccessWindow.openWindows.append(self)
         // First card installs the four shared monitors; a no-op for every card after.
         QuickAccessWindow.interactionCoordinator.installIfNeeded()
+        presentInitialOverlay()
         if hadSiblings {
-            // This card was placed by positionOverlay at the lone-card slot; reflow
-            // settles it and pushes the older cards up to their new slots.
+            // The new card is still entering, so reflow only moves the older cards
+            // up and leaves its initial flight headed for the bottom slot.
             QuickAccessWindow.reflowStack()
         }
     }
@@ -3009,6 +3205,8 @@ private final class QuickAccessWindow: NSWindow {
 // over that CGImage on any redraw, blanking the card. Drag and click handling
 // is all custom here, nothing from NSImageView was used.
 private final class DraggableImageView: NSView, NSDraggingSource {
+
+    nonisolated(unsafe) static var uiTestDragSessionStartCount = 0
 
     var dragImage: NSImage?
     var onDoubleClick: (() -> Void)?
@@ -3025,13 +3223,13 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     /// Returns true when the gesture was a card-owned gesture (delete/standby/cancel,
     /// the thumb does nothing more); false when it converted to a file drag (the card
     /// already invoked the begin-file-drag callback, so the thumb is done too).
-    var onCardGesture: ((_ initialEvent: NSEvent, _ beginFileDrag: (NSEvent) -> Bool) -> Bool)?
+    var onCardGesture: ((_ initialEvent: NSEvent, _ dragOrigin: NSPoint, _ beginFileDrag: (NSEvent) -> Bool) -> Bool)?
     /// A click while the card is zoomed (O5) collapses the preview instead of
     /// editing/dragging. Returns true when it consumed the click.
     var onClickWhileZoomed: (() -> Bool)?
-    /// Video card: drag the real clip on disk instead of materializing a temp PNG.
-    /// When set, the file-drag carries this URL directly (no promise, no cleanup,
-    /// the file is the user's saved recording, not a throwaway export).
+    /// A persisted recording that is ready for a direct file drag. Screenshot
+    /// cards always use a prepared export so their file type matches Settings and
+    /// their bytes match the current card image.
     var fileURLOverride: (() -> URL?)?
 
     private var dragOrigin: NSPoint?
@@ -3048,9 +3246,10 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     private var preparedDragFile: URL?
     private var dragFileGeneration = 0
 
-    /// Call after the card is fully configured (dragImage and fileURLOverride
-    /// set): video cards drag the real clip and need no temp export.
-    func prepareForFileDrag() {
+    /// Call after the card is fully configured. A concrete source file wins when
+    /// it already exists; otherwise screenshot cards prepare a temporary artifact
+    /// so a history write still in flight never leaves the gesture without a drag.
+    func prepareForFileDrag(artifact: CaptureArtifact? = nil) {
         if let stale = preparedDragFile, stale != activeDragFileURL {
             try? FileManager.default.removeItem(at: stale)
             Self.retainedDragFiles.remove(stale)
@@ -3058,8 +3257,34 @@ private final class DraggableImageView: NSView, NSDraggingSource {
         preparedDragFile = nil
         dragFileGeneration += 1
         let generation = dragFileGeneration
-        guard fileURLOverride == nil, let cg = dragImage?.bestCGImage else { return }
-        nonisolated(unsafe) let frame = cg
+        if let sourceURL = fileURLOverride?(),
+           FileManager.default.fileExists(atPath: sourceURL.path) {
+            return
+        }
+        if let artifact {
+            let preferred = ImageExporter.preferredFormat()
+            let encoding = CaptureEncoding.fileFormat(
+                extension: preferred.ext,
+                jpegQuality: Settings.jpegQuality
+            )
+            Task { [weak self] in
+                guard let export = await artifact.encoded(as: encoding) else { return }
+                let url = await Task.detached(priority: .utility) {
+                    Self.makeTemporaryDragFile(data: export.data, ext: export.ext)
+                }.value
+                guard let url else { return }
+                guard let self, self.dragFileGeneration == generation else {
+                    try? FileManager.default.removeItem(at: url)
+                    return
+                }
+                self.preparedDragFile = url
+                Self.retainedDragFiles.insert(url)
+            }
+            return
+        }
+
+        guard let cg = dragImage?.bestCGImage else { return }
+        let frame = cg
         let pts = dragImage?.size ?? CGSize(width: cg.width, height: cg.height)
         Task.detached(priority: .utility) {
             guard let export = ImageExporter.encodedForExport(cg: frame, pointSize: pts),
@@ -3089,12 +3314,13 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard dragOrigin != nil else { return }
+        guard let dragOrigin else { return }
         let current = event.locationInWindow
-        let dx = abs(current.x - (dragOrigin?.x ?? current.x))
-        let dy = abs(current.y - (dragOrigin?.y ?? current.y))
+        let dx = abs(current.x - dragOrigin.x)
+        let dy = abs(current.y - dragOrigin.y)
         guard dx > 3 || dy > 3 else { return }
-        dragOrigin = nil
+        self.dragOrigin = nil
+        let screenOrigin = window?.convertPoint(toScreen: dragOrigin) ?? NSEvent.mouseLocation
 
         // The card is PINNED to the anchor line; there is no free move. Hand the
         // whole gesture to the card's continuous direction classifier, which decides
@@ -3105,7 +3331,7 @@ private final class DraggableImageView: NSView, NSDraggingSource {
         // (shouldn't happen on a live card) fall back to an immediate file drag so the
         // gesture is never dead.
         if let handler = onCardGesture {
-            _ = handler(event) { [weak self] ev in
+            _ = handler(event, screenOrigin) { [weak self] ev in
                 guard let self else { return false }
                 self.beginFileDrag(with: ev)
                 return true
@@ -3124,11 +3350,12 @@ private final class DraggableImageView: NSView, NSDraggingSource {
 
         // Video: drag the real recording on disk (the file lives in the user's
         // folder, so no temp materialization, no cleanup, no promise fallback).
-        if let videoURL = fileURLOverride?() {
-            guard FileManager.default.fileExists(atPath: videoURL.path) else { return }
+        if let videoURL = fileURLOverride?(),
+           FileManager.default.fileExists(atPath: videoURL.path) {
             onDragStarted?()
             let item = NSDraggingItem(pasteboardWriter: videoURL as NSURL)
             item.setDraggingFrame(bounds, contents: dragImg)
+            if KritTestHarness.isEnabled { Self.uiTestDragSessionStartCount += 1 }
             beginDraggingSession(with: [item], event: event, source: self)
             return
         }
@@ -3163,6 +3390,7 @@ private final class DraggableImageView: NSView, NSDraggingSource {
         promiseItem.setDraggingFrame(bounds, contents: dragImg)
         items.append(promiseItem)
 
+        if KritTestHarness.isEnabled { Self.uiTestDragSessionStartCount += 1 }
         beginDraggingSession(with: items, event: event, source: self)
     }
 
@@ -3296,14 +3524,50 @@ private final class OverlayControlsView: NSView {
     // Backing view reference so hitTest can pass through it regardless of
     // its concrete type (NSGlassEffectView on 26+, NSVisualEffectView before).
     var glassBacking: NSView?
+    var isInteractive = false
 
     override var mouseDownCanMoveWindow: Bool { false }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isInteractive else { return nil }
         guard let hit = super.hitTest(point) else { return nil }
-        if hit === self || hit === glassBacking { return nil }
+        if hit === self { return nil }
+        if let glassBacking,
+           hit === glassBacking || hit.isDescendant(of: glassBacking) {
+            return nil
+        }
         return hit
     }
+}
+
+/// Preserves an action control's short-click behavior while routing a real drag
+/// through the card's single gesture machine. The card receives the original
+/// mouse-down location so its first drag sample is never discarded.
+@MainActor
+private func trackOverlayControlPress(
+    _ button: NSButton,
+    event: NSEvent,
+    onCardDrag: ((NSEvent, NSPoint) -> Void)?
+) -> Bool {
+    guard let window = button.window else { return false }
+    let origin = event.locationInWindow
+
+    while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+        if next.type == .leftMouseUp {
+            let release = button.convert(next.locationInWindow, from: nil)
+            return button.bounds.contains(release)
+        }
+
+        let dx = abs(next.locationInWindow.x - origin.x)
+        let dy = abs(next.locationInWindow.y - origin.y)
+        guard dx > 3 || dy > 3 else { continue }
+
+        let screenOrigin = window.convertPoint(toScreen: origin)
+        onCardDrag?(next, screenOrigin)
+        return false
+    }
+
+    return false
 }
 
 // MARK: - Corner button (glass circle, secondary action)
@@ -3313,11 +3577,13 @@ private final class OverlayCornerButton: NSButton {
 
     private var trackingArea: NSTrackingArea?
     private var isHovered = false
+    var onCardDrag: ((NSEvent, NSPoint) -> Void)?
 
     // Let the first click land on the button even if the overlay window
     // isn't key yet, otherwise the first click just activates the window
     // and the user has to click twice for anything to happen.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 
     // Suppress the default AppKit focus-ring line that paints under the
     // button when it becomes first responder.
@@ -3345,16 +3611,19 @@ private final class OverlayCornerButton: NSButton {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
         layer?.backgroundColor = KritColors.pillButtonPressed.cgColor
-        let scale = CATransform3DMakeScale(0.92, 0.92, 1)
-        layer?.transform = scale
+        layer?.transform = CATransform3DMakeScale(0.97, 0.97, 1)
+        let shouldActivate = trackOverlayControlPress(self, event: event, onCardDrag: onCardDrag)
+        restorePressAppearance()
+        guard shouldActivate else { return }
         NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
-        super.mouseDown(with: event)
+        _ = sendAction(action, to: target)
     }
 
-    override func mouseUp(with event: NSEvent) {
+    private func restorePressAppearance() {
         let spring = CASpringAnimation(keyPath: "transform.scale")
-        spring.fromValue = 0.92
+        spring.fromValue = 0.97
         spring.toValue = 1.0
         spring.mass = 1.0
         spring.stiffness = 300
@@ -3366,7 +3635,6 @@ private final class OverlayCornerButton: NSButton {
         layer?.backgroundColor = isHovered
             ? KritColors.pillButtonHover.cgColor
             : KritColors.pillButtonBackground.cgColor
-        super.mouseUp(with: event)
     }
 }
 
@@ -3374,6 +3642,7 @@ private final class OverlayCornerButton: NSButton {
 private final class OverlayPillButton: NSButton {
     private var trackingArea: NSTrackingArea?
     private var isHovered = false
+    var onCardDrag: ((NSEvent, NSPoint) -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -3413,9 +3682,27 @@ private final class OverlayPillButton: NSButton {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
         layer?.backgroundColor = KritColors.pillButtonPressed.cgColor
+        layer?.transform = CATransform3DMakeScale(0.97, 0.97, 1)
+        let shouldActivate = trackOverlayControlPress(self, event: event, onCardDrag: onCardDrag)
+        restorePressAppearance()
+        guard shouldActivate else { return }
         NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
-        super.mouseDown(with: event)
+        _ = sendAction(action, to: target)
+    }
+
+    private func restorePressAppearance() {
+        let spring = CASpringAnimation(keyPath: "transform.scale")
+        spring.fromValue = 0.97
+        spring.toValue = 1.0
+        spring.mass = 1.0
+        spring.stiffness = 300
+        spring.damping = 15
+        spring.initialVelocity = 0
+        spring.duration = spring.settlingDuration
+        layer?.add(spring, forKey: "bounceBack")
+        layer?.transform = CATransform3DIdentity
         layer?.backgroundColor = isHovered
             ? KritColors.pillButtonHover.cgColor
             : KritColors.pillButtonBackground.cgColor
@@ -3551,6 +3838,18 @@ extension QuickAccessOverlay {
         (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestGestureState ?? "none"
     }
 
+    @MainActor static func uiTestGestureEntryCount() -> Int {
+        QuickAccessWindow.uiTestGestureEntryCount
+    }
+
+    @MainActor static func uiTestDragSessionStartCount() -> Int {
+        DraggableImageView.uiTestDragSessionStartCount
+    }
+
+    @MainActor static func uiTestResetGestureEntryCount() {
+        QuickAccessWindow.uiTestGestureEntryCount = 0
+    }
+
     /// Hover/focus snapshot of the newest card, for the harness to assert that a
     /// SECOND hover still arms the card (the "interaction works once, then I have
     /// to click elsewhere" report): mouseInside, isKey, app active, controls alpha.
@@ -3559,6 +3858,28 @@ extension QuickAccessOverlay {
             return ["exists": false]
         }
         return card.uiTestHoverSnapshot()
+    }
+
+    /// Entrance state for the runtime gate. The target is computed from the
+    /// current stack rather than inferred from the animated frame, so a card
+    /// stranded at its off-edge start can be diagnosed without screenshots.
+    @MainActor static func uiTestEntranceState() -> [String: Any] {
+        guard let card = QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow else {
+            return ["exists": false]
+        }
+        return card.uiTestEntranceSnapshot()
+    }
+
+    @MainActor static func uiTestSetNewestHovered(_ hovered: Bool) {
+        (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestSetHovered(hovered)
+    }
+
+    @MainActor static func uiTestMarkNewestPresentationReady() {
+        (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestMarkPresentationReady()
+    }
+
+    @MainActor static func uiTestRotateNewest(clockwise: Bool) {
+        (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestRotate(clockwise: clockwise)
     }
 
     /// Drag-out materialization probe of the newest card (see
@@ -3609,17 +3930,38 @@ extension QuickAccessOverlay {
     @MainActor static func uiTestDismissTimersActive() -> [Bool] {
         QuickAccessWindow.openWindows.map { $0.uiTestDismissTimerActive }
     }
+    @MainActor static func uiTestDismissTimerStates() -> [[String: Bool]] {
+        QuickAccessWindow.openWindows.map {
+            [
+                "timerActive": $0.uiTestDismissTimerActive,
+                "cursorOwns": $0.uiTestCursorOwnsThisCard,
+            ]
+        }
+    }
+    /// Queues the same auto-dismiss close that a fired timer uses, without waiting
+    /// for the configured timeout. Tests can then begin a gesture before the main
+    /// queue drains it and prove the generation guard rejects stale close work.
+    @MainActor static func uiTestQueueNewestAutoDismiss() {
+        (QuickAccessWindow.openWindows.last)?.uiTestQueueCurrentAutoDismiss()
+    }
     @MainActor static func uiTestGestureBegin() {
         QuickAccessWindow.openWindows.last?.cardDragBegin()
     }
     @MainActor static func uiTestGestureEnd() {
         QuickAccessWindow.openWindows.last?.cardDragEnd()
     }
+    @MainActor static func uiTestGestureConvertToFileDrag() {
+        QuickAccessWindow.openWindows.last?.uiTestGestureConvertToFileDrag()
+    }
 }
 
 private extension QuickAccessWindow {
     var uiTestDismissTimerActive: Bool { dismissTimer?.isValid == true }
+    var uiTestCursorOwnsThisCard: Bool { cursorOwnsThisCard() }
     func uiTestArmDismissTimer() { restartDismissTimer() }
+    func uiTestQueueCurrentAutoDismiss() {
+        enqueueAutoDismiss(for: dismissEpoch.value)
+    }
     static var uiTestOpenWindows: [NSWindow] { openWindows }
     static func uiTestStackOrigins(on screen: NSScreen?) -> [[String: Double]] {
         orderedStack(on: screen).map { ["x": Double($0.frame.origin.x), "y": Double($0.frame.origin.y)] }
@@ -3640,6 +3982,10 @@ private extension QuickAccessWindow {
         springConveyorBack()
         conveyorSiblings = []
         cardDragStartOrigin = nil
+    }
+    func uiTestGestureConvertToFileDrag() {
+        cardDragBegin()
+        settleFileDragConversion()
     }
     func uiTestDragPrepProbe(forceInline: Bool) -> [String: Any] {
         thumbView?.uiTestDragPrep(forceInline: forceInline) ?? ["error": "no thumb"]
@@ -3663,6 +4009,24 @@ private extension QuickAccessWindow {
             "keyGateDrop": QuickAccessWindow.uiTestKeyGateDrop,
         ]
     }
+    func uiTestEntranceSnapshot() -> [String: Any] {
+        let target = slotFrame()
+        return [
+            "exists": true,
+            "isEntering": isEntering,
+            "controlsReady": controlsReadyForInteraction,
+            "frameX": frame.origin.x,
+            "frameY": frame.origin.y,
+            "targetX": target.origin.x,
+            "targetY": target.origin.y,
+            "alpha": alphaValue,
+        ]
+    }
+    func uiTestSetHovered(_ hovered: Bool) { setHovered(hovered) }
+    func uiTestMarkPresentationReady() {
+        finishInitialPresentation()
+    }
+    func uiTestRotate(clockwise: Bool) { rotateImage(clockwise: clockwise) }
     var uiTestIsParked: Bool { isParked }
     var uiTestIsZoomed: Bool { isPreviewZoomed }
     func uiTestForceCleanup() { forceCleanup() }
