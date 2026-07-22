@@ -28,6 +28,117 @@ enum ScreenImageCaptureBackend: Equatable {
     }
 }
 
+struct WindowCaptureDescriptor: Equatable {
+    let id: CGWindowID
+    let ownerProcessID: pid_t?
+    let ownerBundleIdentifier: String?
+    let layer: Int
+    let frame: CGRect
+    let title: String?
+}
+
+struct IsolatedWindowCapturePlan: Equatable {
+    struct PixelSize: Equatable {
+        let width: Int
+        let height: Int
+    }
+
+    let targetID: CGWindowID
+    let logicalSize: CGSize
+
+    func pixelSize(scale: CGFloat, maxEdge: Int) -> PixelSize {
+        PixelSize(
+            width: min(max(1, Int(logicalSize.width * scale)), maxEdge),
+            height: min(max(1, Int(logicalSize.height * scale)), maxEdge)
+        )
+    }
+}
+
+/// Aside publishes an untitled shadow window plus the real titled
+/// window as two separate ScreenCaptureKit entries. Resolve that exact geometry
+/// before capture instead of guessing from pixels and risking real alpha content.
+enum WindowCaptureTargetResolver {
+    private static let shadowHostBundleIdentifiers: Set<String> = [
+        "at.studio.AsideBrowser"
+    ]
+
+    static func targetID(
+        selected: WindowCaptureDescriptor,
+        candidates: [WindowCaptureDescriptor]
+    ) -> CGWindowID {
+        guard selected.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true,
+              let ownerProcessID = selected.ownerProcessID,
+              let ownerBundleIdentifier = selected.ownerBundleIdentifier,
+              shadowHostBundleIdentifiers.contains(ownerBundleIdentifier),
+              selected.frame.width > 0,
+              selected.frame.height > 0 else {
+            return selected.id
+        }
+
+        let replacements = candidates
+            .filter { candidate in
+                candidate.id != selected.id
+                    && candidate.ownerProcessID == ownerProcessID
+                    && candidate.layer == selected.layer
+                    && isCenteredContentWindow(candidate, inside: selected)
+            }
+        guard replacements.count == 1 else { return selected.id }
+        return replacements[0].id
+    }
+
+    static func capturePlan(
+        selectedID: CGWindowID,
+        candidates: [WindowCaptureDescriptor]
+    ) -> IsolatedWindowCapturePlan? {
+        guard let selected = candidates.first(where: { $0.id == selectedID }) else {
+            return nil
+        }
+        let targetID = targetID(selected: selected, candidates: candidates)
+        guard let target = candidates.first(where: { $0.id == targetID }) else {
+            return nil
+        }
+        return IsolatedWindowCapturePlan(targetID: target.id, logicalSize: target.frame.size)
+    }
+
+    private static func isCenteredContentWindow(
+        _ candidate: WindowCaptureDescriptor,
+        inside host: WindowCaptureDescriptor
+    ) -> Bool {
+        guard let title = candidate.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty,
+              candidate.frame.width >= 64,
+              candidate.frame.height >= 64 else {
+            return false
+        }
+
+        let left = candidate.frame.minX - host.frame.minX
+        let right = host.frame.maxX - candidate.frame.maxX
+        let top = candidate.frame.minY - host.frame.minY
+        let bottom = host.frame.maxY - candidate.frame.maxY
+        let insets = [left, right, top, bottom]
+        guard let minimumInset = insets.min(),
+              let maximumInset = insets.max(),
+              minimumInset >= 4,
+              maximumInset <= 128 else {
+            return false
+        }
+
+        let averageInset = insets.reduce(0, +) / CGFloat(insets.count)
+        let minimumHostEdge = min(host.frame.width, host.frame.height)
+        let insetRatio = averageInset / minimumHostEdge
+        guard insetRatio >= 0.02, insetRatio <= 0.15 else { return false }
+
+        let symmetryTolerance = max(2, averageInset * 0.03)
+        guard maximumInset - minimumInset <= symmetryTolerance else {
+            return false
+        }
+
+        let areaRatio = (candidate.frame.width * candidate.frame.height)
+            / (host.frame.width * host.frame.height)
+        return areaRatio >= 0.70 && areaRatio <= 0.95
+    }
+}
+
 struct AllInOneRestoredSelection: Equatable {
     let rect: CGRect
     let screenIndex: Int
@@ -1513,7 +1624,7 @@ final class CaptureEngine {
     /// Captures a single window in ISOLATION via ScreenCaptureKit's
     /// desktop-independent filter, the same path CleanShot/macOS use. Unlike a
     /// screen-rect crop, this returns ONLY the target window's pixels with its
-    /// real rounded corners and shadow as transparency (alpha), and is immune to
+    /// real rounded corners as transparency (alpha), and is immune to
     /// anything stacked on top of it. The countdown gate and the full finishing
     /// (sound/flash/overlay/history) match the common path exactly. Falls back to
     /// the rect crop when SCK is unavailable or the window can't be resolved.
@@ -1584,16 +1695,34 @@ final class CaptureEngine {
         )
     }
 
-    /// Grabs `windowID` in isolation as an NSImage with the window's native pixel
-    /// size and transparent corners/shadow preserved (no scaling, no background).
+    /// Grabs `windowID` in isolation as an NSImage with native pixel density and
+    /// transparent corners preserved (no scaling, no background).
     @available(macOS 14.0, *)
     private func isolatedWindowImage(windowID: CGWindowID) async -> NSImage? {
         lastCaptureFailureWasPermission = false
         do {
             let snapshot = try await ScreenCaptureCatalog.shared.windows(.visibleContent)
-            guard let window = snapshot.window(id: windowID) else {
+            let candidates = snapshot.windows.map {
+                WindowCaptureDescriptor(
+                    id: CGWindowID($0.windowID),
+                    ownerProcessID: $0.owningApplication?.processID,
+                    ownerBundleIdentifier: $0.owningApplication?.bundleIdentifier,
+                    layer: $0.windowLayer,
+                    frame: $0.frame,
+                    title: $0.title
+                )
+            }
+            guard let plan = WindowCaptureTargetResolver.capturePlan(
+                selectedID: windowID,
+                candidates: candidates
+            ), let window = snapshot.window(id: plan.targetID) else {
                 Self.captureLog.error("isolatedWindowImage: window \(windowID) not in shareable content; falling back")
                 return nil
+            }
+            if plan.targetID != windowID {
+                Self.captureLog.info(
+                    "isolatedWindowImage: resolved shadow host \(windowID, privacy: .public) to content window \(plan.targetID, privacy: .public)"
+                )
             }
 
             // Bring the target window forward so the grab catches it ACTIVE (colored
@@ -1607,7 +1736,7 @@ final class CaptureEngine {
                 await MainActor.run {
                     if pid == ProcessInfo.processInfo.processIdentifier {
                         NSApp.activate(ignoringOtherApps: true)
-                        NSApp.windows.first { $0.windowNumber == Int(windowID) }?.makeKeyAndOrderFront(nil)
+                        NSApp.windows.first { $0.windowNumber == Int(plan.targetID) }?.makeKeyAndOrderFront(nil)
                     } else {
                         NSRunningApplication(processIdentifier: pid)?.activate()
                     }
@@ -1616,7 +1745,7 @@ final class CaptureEngine {
             }
 
             let filter = SCContentFilter(desktopIndependentWindow: window)
-            let logicalSize = window.frame.size
+            let logicalSize = plan.logicalSize
             // Real backing scale of the display the window sits on, not
             // filter.pointPixelScale (which can report 2 on a 1x external display
             // and leave the grab anchored in a half-empty buffer). SCWindow.frame
@@ -1631,8 +1760,9 @@ final class CaptureEngine {
             // density, so upscaling it would only soften the result and bloat the
             // file, native is the sharpest a screen grab can be. scalesToFit stays
             // false so SCK never anchors the content inside a larger buffer.
-            config.width = min(max(1, Int(logicalSize.width * scale)), Self.maxCaptureEdge)
-            config.height = min(max(1, Int(logicalSize.height * scale)), Self.maxCaptureEdge)
+            let pixelSize = plan.pixelSize(scale: scale, maxEdge: Self.maxCaptureEdge)
+            config.width = pixelSize.width
+            config.height = pixelSize.height
             config.scalesToFit = false
             config.showsCursor = false
             config.captureResolution = .best
@@ -1640,12 +1770,8 @@ final class CaptureEngine {
             // shadow region with black; a clear color keeps them transparent so
             // the editor composites the window over its generated background.
             config.backgroundColor = .clear
-            // Drop the native window shadow from the grab. The buffer is sized
-            // from window.frame, which does NOT include the shadow margin: with
-            // the shadow kept, SCK shrinks the window to fit window+shadow into
-            // the buffer and the clipped shadow halo composes as a ghost rounded
-            // rect around every supersampled window shot ("invisible border").
-            // The template draws its own shadow, so the native one only doubles.
+            // Drop the native window shadow from the grab. The template draws
+            // its own shadow, so retaining the native one only doubles it.
             config.ignoreShadowsSingleWindow = true
 
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
