@@ -346,12 +346,22 @@ if [ -f "$CHANGELOG_FILE" ] && ! grep -q "^## $VERSION$" "$CHANGELOG_FILE"; then
     CL_TMP="$(mktemp -t krit-changelog)"
     {
         printf '# Changelog\n\nAll notable changes to KRIT, newest first.\n\n'
-        printf '## %s\n\n' "$VERSION"
-        sed 's/^## /### /' "$NOTES_TMP"
-        printf '\n'
-        # Everything after the existing header block (skip the first 4 lines:
-        # title, blank, intro, blank).
-        tail -n +5 "$CHANGELOG_FILE"
+        if grep -q '^## Unreleased$' "$CHANGELOG_FILE"; then
+            # Keep the empty Unreleased slot first, then move its existing
+            # details under the version being published.
+            printf '## Unreleased\n\n'
+            printf '## %s\n\n' "$VERSION"
+            sed 's/^## /### /' "$NOTES_TMP"
+            printf '\n'
+            tail -n +5 "$CHANGELOG_FILE" | sed '1{/^## Unreleased$/d;}'
+        else
+            printf '## %s\n\n' "$VERSION"
+            sed 's/^## /### /' "$NOTES_TMP"
+            printf '\n'
+            # Everything after the existing header block (skip the first 4 lines:
+            # title, blank, intro, blank).
+            tail -n +5 "$CHANGELOG_FILE"
+        fi
     } > "$CL_TMP"
     mv "$CL_TMP" "$CHANGELOG_FILE"
     ok "CHANGELOG.md updated for $VERSION"
