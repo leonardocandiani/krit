@@ -6,8 +6,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/v0.16.0/install.sh | bash
 #   VERSION=0.16.0 bash install.sh
 #
-# The script downloads the notarized DMG from GitHub Releases, mounts it, copies
-# KRIT.app to /Applications, and lets Gatekeeper validate the downloaded app.
+# The script downloads the published DMG from GitHub Releases, verifies its
+# checksum and app signature, then installs KRIT.app in /Applications.
 
 set -euo pipefail
 
@@ -41,7 +41,7 @@ fail() { printf "%b✖%b %s\n" "${RED}" "${RESET}" "$*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || fail "KRIT is a macOS app. This script only works on macOS."
 
-for cmd in curl hdiutil shasum; do
+for cmd in codesign curl ditto hdiutil shasum xattr; do
     command -v "$cmd" >/dev/null 2>&1 || fail "Required command not found: $cmd"
 done
 
@@ -119,17 +119,47 @@ hdiutil attach "$DMG_PATH" -nobrowse -quiet -mountpoint "$MOUNT_POINT" \
 trap 'hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null || true; rm -rf "$TMPDIR_INSTALL"' EXIT
 
 INSTALL_DIR="/Applications"
+SOURCE_APP="${MOUNT_POINT}/KRIT.app"
+DESTINATION_APP="${INSTALL_DIR}/KRIT.app"
+
+[ -d "$SOURCE_APP" ] || fail "Mounted DMG does not contain KRIT.app."
+
+info "Verifying KRIT.app signature…"
+codesign --verify --deep --strict "$SOURCE_APP" 2>/dev/null \
+    || fail "Downloaded KRIT.app has an invalid code signature."
+
+SIGNATURE_INFO="$(codesign -dv --verbose=4 "$SOURCE_APP" 2>&1 || true)"
+case "$SIGNATURE_INFO" in
+    *"Signature=adhoc"*) SIGNATURE_MODE="adhoc" ;;
+    *"Authority=Developer ID Application:"*) SIGNATURE_MODE="developer-id" ;;
+    *) fail "Downloaded KRIT.app has an unsupported code signature." ;;
+esac
+ok "App signature verified"
 
 info "Copying KRIT.app to ${INSTALL_DIR}…"
 
 # Replace any existing installation.
-if [ -d "${INSTALL_DIR}/KRIT.app" ]; then
+if [ -d "$DESTINATION_APP" ]; then
     warn "Existing KRIT.app found, replacing."
-    rm -rf "${INSTALL_DIR}/KRIT.app"
+    rm -rf "$DESTINATION_APP"
 fi
 
-cp -R "${MOUNT_POINT}/KRIT.app" "${INSTALL_DIR}/" \
+ditto --rsrc --extattr "$SOURCE_APP" "$DESTINATION_APP" \
     || fail "Failed to copy KRIT.app. You may need to run with sudo."
+
+codesign --verify --deep --strict "$DESTINATION_APP" 2>/dev/null \
+    || fail "Installed KRIT.app failed signature verification."
+
+if [ "$SIGNATURE_MODE" = "adhoc" ]; then
+    info "Applying legacy ad-hoc launch compatibility…"
+    xattr -rd com.apple.quarantine "$DESTINATION_APP" 2>/dev/null || true
+    if xattr -r "$DESTINATION_APP" 2>/dev/null | grep -Fq "com.apple.quarantine"; then
+        fail "Could not remove Gatekeeper quarantine from the legacy ad-hoc app."
+    fi
+    warn "Installed a legacy ad-hoc release. Gatekeeper quarantine was removed."
+else
+    ok "Developer ID signature detected; Gatekeeper quarantine preserved"
+fi
 
 info "Unmounting disk image…"
 hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null || true

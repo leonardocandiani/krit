@@ -18,9 +18,19 @@ scripts/release/release.sh 0.29.0 notas-0.29.0.md
 
 O script exige árvore limpa, `main` sincronizada, testes verdes, chave EdDSA do
 Sparkle, certificado `Developer ID Application`, credenciais de notarização e
-DMG com ticket stapled. Ele recusa assinatura ad-hoc para qualquer release
-pública e monta o bundle de release em `/tmp`, sem substituir o KRIT já
-instalado em `/Applications`.
+DMG com ticket stapled no modo padrão `notarized`. Ele monta o bundle de release
+em `/tmp`, sem substituir o KRIT já instalado em `/Applications`.
+
+Quando uma versão precisa manter compatibilidade com os artefatos públicos
+históricos, o maintainer pode selecionar o modo legado explicitamente:
+
+```bash
+KRIT_RELEASE_MODE=adhoc scripts/release/release.sh 0.28.2 notas-0.28.2.md
+```
+
+Esse modo preserva os gates de testes, bundle universal, checksum, assinatura
+EdDSA do Sparkle, tag e publicação atômica. Apenas a assinatura Apple e a
+notarização são omitidas. O modo padrão continua sendo `notarized`.
 
 ---
 
@@ -49,6 +59,9 @@ script oficial, depois de todos os gates acima.
 | Variável | Script(s) | Valor padrão | Descrição |
 |---|---|---|---|
 | `KRIT_CODESIGN_IDENTITY` | build-app.sh, make-dmg.sh | `-` (ad-hoc) | Identidade de assinatura do codesign |
+| `KRIT_CODESIGN_IDENTITY_OVERRIDE` | build-app.sh | não definido | Override interno usado pelo pipeline para sobrepor `.env.local` |
+| `KRIT_DMG_SIGN_IDENTITY` | make-dmg.sh | valor de `KRIT_CODESIGN_IDENTITY` | Override explícito da assinatura do DMG; vazio mantém o DMG sem assinatura |
+| `KRIT_RELEASE_MODE` | release.sh | `notarized` | Use `adhoc` apenas para uma release legada aprovada |
 | `KRIT_DISABLE_SWIFTPM_SANDBOX` | build-app.sh | `0` | Use `1` apenas dentro de outra sandbox que impeça o SwiftPM de criar a própria |
 | `KRIT_APP_PATH` | make-dmg.sh | `/Applications/KRIT.app` | Caminho do bundle já compilado |
 | `KRIT_NOTARY_PROFILE` | notarize-dmg.sh | — | Nome do perfil no Keychain |
@@ -60,9 +73,10 @@ script oficial, depois de todos os gates acima.
 
 ### Ad-hoc (`-`)
 
-O padrão. Produz um `.app` funcionando localmente mas **não distribu&iacute;vel via
-Gatekeeper**. Não pode ser notarizado. Suficiente para desenvolvimento e testes
-internos.
+O padrão de desenvolvimento. Produz um `.app` funcional, mas sem identidade
+Apple verificável e sem possibilidade de notarização. Também existe como modo
+legado explícito no pipeline para manter compatibilidade com releases antigas.
+Não deve substituir o fluxo `Developer ID` em versões futuras.
 
 ### Developer ID Application
 
@@ -136,15 +150,17 @@ Qualquer divergência faz o `brew install` baixar uma URL 404.
 
 ### sha256
 
-O script oficial calcula o SHA-256 do DMG notarizado e atualiza
+O script oficial calcula o SHA-256 do DMG publicado e atualiza
 `Casks/krit.rb` no commit de release. O tap externo, se usado, deve receber a
 mesma alteração depois que a tag e o asset público existirem.
 
 ### Nota sobre Gatekeeper
 
-O cask e `install.sh` preservam o atributo de quarantine para que o Gatekeeper
-valide a assinatura e o ticket stapled. Por isso, distribuição pública só pode
-apontar para um DMG notarizado.
+O cask e `install.sh` verificam a assinatura do bundle antes de concluir. Para
+uma assinatura `Developer ID`, eles preservam o atributo de quarantine para que
+o Gatekeeper valide a identidade e o ticket stapled. Para uma release legada
+ad-hoc, removem quarantine somente depois de confirmar `Signature=adhoc`,
+replicando o comportamento necessário dos instaladores históricos.
 
 ---
 

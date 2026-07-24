@@ -18,6 +18,26 @@ cask "krit" do
 
   app "KRIT.app"
 
+  postflight do
+    signature_policy = <<~EOS
+      /usr/bin/codesign --verify --deep --strict "$1" || exit 1
+      signature=$(/usr/bin/codesign -dv --verbose=4 "$1" 2>&1)
+      case "$signature" in
+        *"Signature=adhoc"*)
+          /usr/bin/xattr -rd com.apple.quarantine "$1" 2>/dev/null || true
+          if /usr/bin/xattr -r "$1" 2>/dev/null | /usr/bin/grep -Fq com.apple.quarantine; then
+            echo "Could not remove Gatekeeper quarantine from KRIT.app." >&2
+            exit 1
+          fi
+          ;;
+        *"Authority=Developer ID Application:"*) ;;
+        *) echo "KRIT.app has an unsupported code signature." >&2; exit 1 ;;
+      esac
+    EOS
+    system_command "/bin/sh",
+                   args: ["-c", signature_policy, "krit-postflight", "#{appdir}/KRIT.app"]
+  end
+
   zap trash: [
     "~/Library/Preferences/com.krit.app.plist",
     "~/Library/Caches/com.krit.app",

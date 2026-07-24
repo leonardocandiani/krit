@@ -14,14 +14,15 @@
 #   echo "release notes here" | scripts/release/release.sh 0.16.0
 #
 # What it does, in order:
-#   1. Verifies the working tree, GitHub access, and Apple distribution
-#      credentials before mutating release metadata.
+#   1. Verifies the working tree, GitHub access, and selected distribution mode
+#      before mutating release metadata.
 #   2. Reads the target version from the first argument (e.g. 0.16.0).
 #   3. Bumps CFBundleShortVersionString in app/Info.plist to that version.
 #   4. Runs tests, builds and verifies the signed app bundle.
-#   5. Packages and notarizes the DMG -> app/KRIT-v<version>-macOS.dmg.
+#   5. Packages the DMG -> app/KRIT-v<version>-macOS.dmg and notarizes it in
+#      the default distribution mode.
 #   6. Creates an annotated git tag v<version>.
-#   7. Publishes the release    (gh release create) with the notarized DMG attached and
+#   7. Publishes the release (gh release create) with the DMG attached and
 #      notes from the notes-file argument, stdin, or an auto-generated stub.
 #
 # The DMG artifact name is KRIT-v<version>-macOS.dmg. That suffix is fixed by
@@ -52,9 +53,12 @@ APPCAST_FILE="$REPO_ROOT/appcast.xml"
 INSTALL_SCRIPT="$REPO_ROOT/install.sh"
 BUNDLE_LAYOUT_TEST="$SCRIPT_DIR/test-app-bundle-layout.sh"
 
-# A public release must not silently use the ad-hoc development default. Load
-# local credentials early so their absence fails before the version bump changes
-# any tracked source file.
+# Distribution mode is a per-invocation decision. Capture it before loading
+# credentials so a forgotten .env.local value cannot downgrade future releases.
+REQUESTED_RELEASE_MODE="${KRIT_RELEASE_MODE:-notarized}"
+
+# Load local credentials early so their absence fails before the version bump
+# changes any tracked source file.
 if [ -f "$APP_DIR/.env.local" ]; then
     set -a
     # shellcheck source=/dev/null
@@ -69,6 +73,23 @@ fi
 info() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+
+RELEASE_MODE="$REQUESTED_RELEASE_MODE"
+case "$RELEASE_MODE" in
+    notarized)
+        RELEASE_CODESIGN_IDENTITY="${KRIT_CODESIGN_IDENTITY:-}"
+        RELEASE_DMG_SIGN_IDENTITY="$RELEASE_CODESIGN_IDENTITY"
+        ;;
+    adhoc)
+        # Compatibility mode mirrors the historical public artifacts. It must
+        # be selected explicitly and never becomes the release default.
+        RELEASE_CODESIGN_IDENTITY="-"
+        RELEASE_DMG_SIGN_IDENTITY=""
+        ;;
+    *)
+        fail "KRIT_RELEASE_MODE must be 'notarized' or 'adhoc', got: $RELEASE_MODE"
+        ;;
+esac
 
 assert_universal_binary() {
     local label="$1" path="$2" archs required
@@ -114,7 +135,7 @@ TAG="v$VERSION"
 DMG_NAME="KRIT-v$VERSION-macOS.dmg"
 DMG_PATH="$APP_DIR/$DMG_NAME"
 # Keep release assembly isolated from the running development install. A failed
-# release must not overwrite /Applications/KRIT.app before its DMG is notarized.
+# release must not overwrite /Applications/KRIT.app before its DMG is published.
 RELEASE_APP_PATH="/tmp/krit-release-$VERSION/KRIT.app"
 
 # ---------------------------------------------------------------------------
@@ -164,31 +185,36 @@ if [ "$GIT_EMAIL" != "$MAINTAINER_EMAIL" ]; then
     fail "git user.email is '${GIT_EMAIL:-unset}'; the release commit must be authored as $MAINTAINER_EMAIL. Run: git config user.email $MAINTAINER_EMAIL"
 fi
 
-# Public releases require a Developer ID signature and notarization. An ad-hoc
-# bundle is useful for local development, but it cannot be a GitHub or Sparkle
-# release artifact.
-case "${KRIT_CODESIGN_IDENTITY:-}" in
-    "Developer ID Application:"*) ;;
-    *) fail "KRIT_CODESIGN_IDENTITY must name a Developer ID Application certificate. Ad-hoc signing is local-development only." ;;
-esac
+if [ "$RELEASE_MODE" = "notarized" ]; then
+    case "$RELEASE_CODESIGN_IDENTITY" in
+        "Developer ID Application:"*) ;;
+        *) fail "KRIT_CODESIGN_IDENTITY must name a Developer ID Application certificate. Use KRIT_RELEASE_MODE=adhoc only for an explicitly approved legacy release." ;;
+    esac
 
-if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$KRIT_CODESIGN_IDENTITY"; then
-    fail "Developer ID identity not available in this keychain: $KRIT_CODESIGN_IDENTITY"
-fi
-
-if [ -n "${KRIT_NOTARY_APPLE_ID:-}" ] || [ -n "${KRIT_NOTARY_PASSWORD:-}" ] || [ -n "${KRIT_NOTARY_TEAM_ID:-}" ]; then
-    if [ -z "${KRIT_NOTARY_APPLE_ID:-}" ] || [ -z "${KRIT_NOTARY_PASSWORD:-}" ] || [ -z "${KRIT_NOTARY_TEAM_ID:-}" ]; then
-        fail "Set all of KRIT_NOTARY_APPLE_ID, KRIT_NOTARY_PASSWORD, and KRIT_NOTARY_TEAM_ID, or use KRIT_NOTARY_PROFILE."
+    if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$RELEASE_CODESIGN_IDENTITY"; then
+        fail "Developer ID identity not available in this keychain: $RELEASE_CODESIGN_IDENTITY"
     fi
-elif [ -z "${KRIT_NOTARY_PROFILE:-}" ]; then
-    fail "Set KRIT_NOTARY_PROFILE or the full direct notarization credential set before releasing."
-elif ! security find-generic-password -l "$KRIT_NOTARY_PROFILE" >/dev/null 2>&1; then
-    fail "Notarization profile not found in this keychain: $KRIT_NOTARY_PROFILE"
+
+    if [ -n "${KRIT_NOTARY_APPLE_ID:-}" ] || [ -n "${KRIT_NOTARY_PASSWORD:-}" ] || [ -n "${KRIT_NOTARY_TEAM_ID:-}" ]; then
+        if [ -z "${KRIT_NOTARY_APPLE_ID:-}" ] || [ -z "${KRIT_NOTARY_PASSWORD:-}" ] || [ -z "${KRIT_NOTARY_TEAM_ID:-}" ]; then
+            fail "Set all of KRIT_NOTARY_APPLE_ID, KRIT_NOTARY_PASSWORD, and KRIT_NOTARY_TEAM_ID, or use KRIT_NOTARY_PROFILE."
+        fi
+    elif [ -z "${KRIT_NOTARY_PROFILE:-}" ]; then
+        fail "Set KRIT_NOTARY_PROFILE or the full direct notarization credential set before releasing."
+    elif ! security find-generic-password -l "$KRIT_NOTARY_PROFILE" >/dev/null 2>&1; then
+        fail "Notarization profile not found in this keychain: $KRIT_NOTARY_PROFILE"
+    fi
+
+else
+    info "Legacy ad-hoc release mode explicitly enabled for $TAG"
 fi
 
-if grep -Fq "com.apple.quarantine" "$CASK_FILE" "$INSTALL_SCRIPT"; then
-    fail "Public release still removes the Gatekeeper quarantine attribute. Remove the legacy workaround first."
-fi
+for installer in "$INSTALL_SCRIPT" "$CASK_FILE"; do
+    grep -Fq "Signature=adhoc" "$installer" || \
+        fail "Ad-hoc installer compatibility policy missing from $installer"
+    grep -Fq "Authority=Developer ID Application:" "$installer" || \
+        fail "Developer ID installer policy missing from $installer"
+done
 
 # The EdDSA private key must be in the login keychain BEFORE we spend minutes
 # building; without it the DMG cannot be signed and the updater ignores the release.
@@ -379,6 +405,7 @@ info "Building KRIT.app (release)"
 RELEASE_BUILD_STAMP="$(date +%Y%m%d.%H%M.%S)"
 KRIT_ARCHS="arm64 x86_64" \
 KRIT_APP_DESTINATION="$RELEASE_APP_PATH" \
+KRIT_CODESIGN_IDENTITY_OVERRIDE="$RELEASE_CODESIGN_IDENTITY" \
     bash "$BUILD_SCRIPT" --build-stamp "$RELEASE_BUILD_STAMP"
 ok "App built at $RELEASE_APP_PATH"
 
@@ -404,14 +431,29 @@ ok "Resource bundle independence verified."
 rm -f "$DMG_PATH"
 
 info "Packaging $DMG_NAME"
-KRIT_APP_PATH="$RELEASE_APP_PATH" bash "$DMG_SCRIPT"
+KRIT_APP_PATH="$RELEASE_APP_PATH" \
+KRIT_DMG_SIGN_IDENTITY="$RELEASE_DMG_SIGN_IDENTITY" \
+    bash "$DMG_SCRIPT"
 
 [ -f "$DMG_PATH" ] || fail "Expected DMG not produced: $DMG_PATH"
 
-info "Notarizing and stapling $DMG_NAME"
-bash "$NOTARIZE_SCRIPT" "$DMG_PATH"
-xcrun stapler validate "$DMG_PATH"
-ok "DMG notarization verified."
+if [ "$RELEASE_MODE" = "notarized" ]; then
+    info "Notarizing and stapling $DMG_NAME"
+    bash "$NOTARIZE_SCRIPT" "$DMG_PATH"
+    xcrun stapler validate "$DMG_PATH"
+    ok "DMG notarization verified."
+else
+    RELEASE_SIGNATURE_INFO="$(codesign -dv --verbose=4 "$RELEASE_APP_PATH" 2>&1)" || \
+        fail "Could not inspect the legacy release bundle signature."
+    case "$RELEASE_SIGNATURE_INFO" in
+        *"Signature=adhoc"*) ;;
+        *) fail "Legacy release bundle is not ad-hoc signed." ;;
+    esac
+    if codesign -d "$DMG_PATH" >/dev/null 2>&1; then
+        fail "Legacy release DMG was signed unexpectedly."
+    fi
+    ok "Legacy ad-hoc bundle verified; notarization intentionally skipped."
+fi
 
 DMG_SHA="$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')"
 ok "DMG packaged: $DMG_PATH"
@@ -493,6 +535,7 @@ git commit -m "chore: release $TAG
 - bump CFBundleShortVersionString to $VERSION
 - appcast entry for the Sparkle in-app update
 - cask digest $DMG_SHA
+- distribution mode $RELEASE_MODE
 
 Autor: Leonardo Candiani"
 RELEASE_COMMITTED=true
@@ -537,4 +580,5 @@ printf '\n'
 printf '  Release:  https://github.com/leonardocandiani/krit/releases/tag/%s\n' "$TAG"
 printf '  DMG:      %s\n' "$DMG_NAME"
 printf '  sha256:   %s\n' "$DMG_SHA"
+printf '  mode:     %s\n' "$RELEASE_MODE"
 printf '  appcast:  entry for %s pushed to main (in-app updates live)\n' "$TAG"

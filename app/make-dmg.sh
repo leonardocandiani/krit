@@ -13,7 +13,9 @@ if [ -f "$SCRIPT_DIR/.env.local" ]; then
     set +a
 fi
 
-SIGN_IDENTITY="${KRIT_CODESIGN_IDENTITY:-}"
+# An explicitly empty KRIT_DMG_SIGN_IDENTITY keeps legacy DMGs unsigned even
+# when .env.local contains a Developer ID identity for normal releases.
+SIGN_IDENTITY="${KRIT_DMG_SIGN_IDENTITY-${KRIT_CODESIGN_IDENTITY:-}}"
 
 if [ ! -d "$APP_PATH" ]; then
     echo "Error: $APP_PATH not found. Run build-app.sh first."

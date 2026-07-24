@@ -72,7 +72,9 @@ if [ -f "$SCRIPT_DIR/.env.local" ]; then
     set +a
 fi
 
-SIGN_IDENTITY="${KRIT_CODESIGN_IDENTITY:--}"
+# The release pipeline can override .env.local explicitly for a selected
+# distribution mode. Normal local builds continue to use KRIT_CODESIGN_IDENTITY.
+SIGN_IDENTITY="${KRIT_CODESIGN_IDENTITY_OVERRIDE-${KRIT_CODESIGN_IDENTITY:--}}"
 
 # Universal binary: build for BOTH Apple Silicon (arm64) and Intel (x86_64) so
 # the shipped app runs natively on every Mac. A multi-arch `swift build --arch …`
