@@ -1,13 +1,19 @@
-version: 0.28.1
-## KRIT v0.28.1
+version: 0.28.2
+KRIT v0.28.2 is a major reliability and visual polish release for capture, recording, editing, and distribution.
 
-Security and polish release.
+### Capture workflows that stay out of your way
+- Quick Access accepts a drag immediately from the full preview surface, including controls and fast first movement, without dead spots.
+- All-in-One reopens with your last valid capture area already selected and ready.
+- Aside window captures now select the real content window instead of its transparent shadow host, removing the dark extra frame without cropping legitimate pixels.
+- Capture delivery shares one rendition across history, clipboard, autosave, and Quick Access, keeping large screenshots responsive.
 
-### Automation is now off by default
-- The local command port and the `krit://` URL scheme no longer start on their own. A default install exposes no scriptable capture surface at all, so no other app on your Mac can screenshot the screen or read the accessibility tree through KRIT without you asking.
-- Turn it on deliberately in Preferences ▸ General ▸ Automation when you want the bundled `krit` CLI, Shortcuts, or an agent to drive KRIT.
+### A stronger native macOS experience
+- Preferences use a fast native source list, cleaner hierarchy, better keyboard and VoiceOver behavior, and live permission state.
+- The Precision Monolith system ships a new KRIT icon, installer art, and eight original high-resolution wallpaper backgrounds.
+- Recording uses a consistent setup, live HUD, result flow, and corrected pause and resume timeline.
+- OCR, QR, Smart Redact, wallpaper decoding, and history storage move heavy work away from the main interface.
 
-### Fixes
-- Pressing a capture shortcut and then Esc no longer leaves the next shortcut feeling laggy: cancelling area selection now hands focus straight back to the app you were in
-- Presentation zoom: a zoom-in pressed the instant you arm the mode is honored, gliding into the zoom instead of being dropped at 1x
-- Hardening: hidden toolbar controls can't be driven through automation, and the automation job table is bounded
+### Safer updates
+- This compatibility release preserves the established ad-hoc distribution model while requiring a universal bundle, SHA-256 checksum, and Sparkle EdDSA signature before the appcast or public branch is updated.
+- The installer verifies the app signature before replacing an existing installation and applies legacy Gatekeeper compatibility only to confirmed ad-hoc bundles.
+- Local automation remains opt-in, test artifacts stay in temporary storage, and history file operations reject unsafe paths.
