@@ -70,20 +70,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // shortcut, and release-note windows would cover that surface and make
         // the result depend on whichever preferences domain the temp bundle uses.
         guard !KritTestHarness.isEnabled else { return }
-        // Feature Tour only follows the welcome wizard on a genuine first run
-        // (the branch where showIfNeeded actually presented it and later
-        // closes); the "already launched before" branch below keeps calling
-        // promptForNativeShortcuts() alone, so normal launches and updates
-        // never see the tour (WhatsNew already covers updates).
         let onWelcomeClose = { [weak self] in
-            self?.promptForNativeShortcuts()
-            // Match the capture actions: drop any live overlay (presentation zoom
-            // or live-annotation draw mode, both at `.screenSaver` level) before
-            // presenting, so the tour's `.floating` window can't open behind and be
-            // input-blocked by a full-screen overlay left engaged.
-            self?.presentationZoom.exitForCapture()
-            self?.liveAnnotation.exitDrawModeKeepingAnnotations()
-            self?.featureTour.showOnFirstRunIfNeeded()
+            guard let self else { return }
+            self.promptForNativeShortcuts()
         }
         let isFirstLaunch = welcomeController.showIfNeeded(onClose: onWelcomeClose)
         if !isFirstLaunch {
@@ -394,7 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         about.target = self
         menu.addItem(about)
 
-        let updates = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        let updates = NSMenuItem(title: "Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
         updates.target = self
         menu.addItem(updates)
 

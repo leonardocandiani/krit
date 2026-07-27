@@ -29,10 +29,87 @@ final class AnnotationChromeInteractionTests: XCTestCase {
         XCTAssertFalse(FlatToolButton(tool: .arrow, target: nil, action: nil).mouseDownCanMoveWindow)
     }
 
+    func testEditorToolbarUsesOneBandAndGroupsSecondaryToolsByIntent() {
+        let toolbar = AnnotationToolbar(frame: NSRect(
+            x: 0,
+            y: 0,
+            width: 1_000,
+            height: AnnotationToolbar.totalHeight
+        ))
+
+        XCTAssertEqual(AnnotationToolbar.totalHeight, AnnotationToolbar.mainBarHeight)
+        XCTAssertEqual(descendants(of: ToolFamilyButton.self, in: toolbar).count, 3)
+        XCTAssertEqual(descendants(of: FlatToolButton.self, in: toolbar).count, 6)
+        toolbar.layoutSubtreeIfNeeded()
+        XCTAssertLessThanOrEqual(
+            toolbar.fittingWidth - AnnotationToolbar.trailingInset,
+            AnnotationToolbar.requiredWidth + 20
+        )
+    }
+
+    func testBottomBarDragPillAcceptsFirstMouseAndUsesProfessionalHitArea() throws {
+        let pill = BottomBarDragPill(frame: NSRect(x: 0, y: 0, width: 116, height: 22))
+        let event = try mouseEvent(type: .leftMouseDown, location: NSPoint(x: 58, y: 11))
+
+        XCTAssertTrue(pill.acceptsFirstMouse(for: event))
+        XCTAssertTrue(pill.mouseDownCanMoveWindow == false)
+        XCTAssertTrue(pill.hitTest(NSPoint(x: 58, y: -6)) === pill)
+    }
+
+    func testBottomBarDragPillDoesNotRequestImageBeforeDragThreshold() throws {
+        let pill = BottomBarDragPill(frame: NSRect(x: 0, y: 0, width: 116, height: 22))
+        var providerCalls = 0
+        pill.imageProvider = {
+            providerCalls += 1
+            return NSImage(size: NSSize(width: 80, height: 40))
+        }
+
+        pill.mouseDown(with: try mouseEvent(type: .leftMouseDown, location: NSPoint(x: 10, y: 10)))
+        pill.mouseDragged(with: try mouseEvent(type: .leftMouseDragged, location: NSPoint(x: 12, y: 11)))
+
+        XCTAssertEqual(providerCalls, 0)
+    }
+
+    func testBottomBarDragPillPreviewFrameUsesPreviewAspectAndSize() {
+        let wide = BottomBarDragPill.previewSize(for: NSSize(width: 400, height: 200))
+        XCTAssertEqual(wide.width, 120, accuracy: 0.001)
+        XCTAssertEqual(wide.height, 60, accuracy: 0.001)
+
+        let tall = BottomBarDragPill.previewSize(for: NSSize(width: 100, height: 400))
+        XCTAssertEqual(tall.width, 30, accuracy: 0.001)
+        XCTAssertEqual(tall.height, 120, accuracy: 0.001)
+
+        let frame = BottomBarDragPill.draggingFrame(centeredAt: NSPoint(x: 20, y: 30), previewSize: tall)
+        XCTAssertEqual(frame.size, tall)
+        XCTAssertEqual(frame.midX, 20, accuracy: 0.001)
+        XCTAssertEqual(frame.midY, 30, accuracy: 0.001)
+    }
+
     private func assertPointerFeedback(on view: NSView) {
         XCTAssertTrue(view.trackingAreas.contains { area in
             area.options.contains(.mouseEnteredAndExited)
                 && area.options.contains(.activeAlways)
         })
+    }
+
+    private func descendants<T: NSView>(of type: T.Type, in root: NSView) -> [T] {
+        root.subviews.flatMap { view -> [T] in
+            let current = (view as? T).map { [$0] } ?? []
+            return current + descendants(of: type, in: view)
+        }
+    }
+
+    private func mouseEvent(type: NSEvent.EventType, location: NSPoint) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(
+            with: type,
+            location: location,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ))
     }
 }

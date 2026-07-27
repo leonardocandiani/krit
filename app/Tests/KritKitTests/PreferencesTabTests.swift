@@ -13,7 +13,7 @@ final class PreferencesTabTests: XCTestCase {
         XCTAssertTrue(tabs.allSatisfy { !$0.subtitle.isEmpty })
         XCTAssertEqual(
             PreferencesTab.capture.subtitle,
-            "Screenshots that land exactly where you need them."
+            "File format, timer, window background, and save location."
         )
     }
 }

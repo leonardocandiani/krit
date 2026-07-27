@@ -5,7 +5,7 @@ import XCTest
 final class NativePreferencesSidebarTests: XCTestCase {
     func testUsesACompleteAccessibleSourceListWithStableSelection() {
         var callbacks: [PreferencesTab] = []
-        let sidebar = NativePreferencesSidebar(width: 220, height: 680) {
+        let sidebar = NativePreferencesSidebar(width: 196, height: 620) {
             callbacks.append($0)
         }
 

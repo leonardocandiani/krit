@@ -67,9 +67,6 @@ final class FeatureTourController {
     }
 
     /// Presents the tour once per install, gated on `Settings.hasSeenFeatureTour`.
-    /// Called right after the welcome wizard closes on a genuine first run;
-    /// a no-op on every later launch (including after an update, which
-    /// `WhatsNewWindowController` already covers).
     func showOnFirstRunIfNeeded() {
         guard !Settings.hasSeenFeatureTour else { return }
         present()

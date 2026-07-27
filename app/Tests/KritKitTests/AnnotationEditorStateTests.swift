@@ -75,6 +75,75 @@ final class AnnotationEditorStateTests: XCTestCase {
         XCTAssertFalse(canvas.subviews.contains { $0 is NSTextView })
     }
 
+    func testSavedCheckpointTracksUndoDepthInsteadOfObjectPresence() {
+        let controller = AnnotationWindowController(
+            image: makeSolidImage(size: NSSize(width: 320, height: 200)),
+            historyItem: nil,
+            historyManager: nil
+        )
+        defer { closeWithoutPrompt(controller.window) }
+
+        let canvas = controller.uiTestCanvas
+        let object = RectangleAnnotation(rect: CGRect(x: 20, y: 20, width: 80, height: 40))
+        canvas.objects = [object]
+        canvas.pushUndo()
+        controller.uiTestMarkCurrentDocumentClean()
+
+        XCTAssertFalse(controller.uiTestHasUnsavedChanges)
+
+        canvas.pushUndo()
+        object.move(by: CGPoint(x: 10, y: 0))
+        XCTAssertTrue(controller.uiTestHasUnsavedChanges)
+
+        canvas.performUndo()
+        XCTAssertFalse(controller.uiTestHasUnsavedChanges)
+    }
+
+    func testSelectionMetricsStayConstantInScreenPointsAcrossZoomRange() {
+        for magnification in [CGFloat(0.1), 0.25, 1, 2] {
+            let metrics = AnnotationSelectionMetrics(magnification: magnification)
+
+            XCTAssertEqual(
+                metrics.cornerHandleRadius * magnification,
+                AnnotationSelectionMetrics.cornerHandleRadiusScreenPoints,
+                accuracy: 0.001
+            )
+            XCTAssertEqual(
+                metrics.edgeHandleRadius * magnification,
+                AnnotationSelectionMetrics.edgeHandleRadiusScreenPoints,
+                accuracy: 0.001
+            )
+            XCTAssertEqual(
+                metrics.resizeHitRadius * magnification,
+                AnnotationSelectionMetrics.resizeHitRadiusScreenPoints,
+                accuracy: 0.001
+            )
+            XCTAssertEqual(
+                metrics.outlineStrokeWidth * magnification,
+                AnnotationSelectionMetrics.outlineStrokeScreenPoints,
+                accuracy: 0.001
+            )
+            XCTAssertEqual(
+                metrics.outlineDashLengths[0] * magnification,
+                AnnotationSelectionMetrics.dashOnScreenPoints,
+                accuracy: 0.001
+            )
+            XCTAssertEqual(
+                metrics.outlineDashLengths[1] * magnification,
+                AnnotationSelectionMetrics.dashOffScreenPoints,
+                accuracy: 0.001
+            )
+        }
+    }
+
+    func testSelectionMetricsClampMagnificationToCanvasZoomLimits() {
+        let tooSmall = AnnotationSelectionMetrics(magnification: 0.001)
+        let tooLarge = AnnotationSelectionMetrics(magnification: 80)
+
+        XCTAssertEqual(tooSmall.magnification, AnnotationSelectionMetrics.minimumMagnification)
+        XCTAssertEqual(tooLarge.magnification, AnnotationSelectionMetrics.maximumMagnification)
+    }
+
     private func keyEvent(
         characters: String,
         keyCode: UInt16,

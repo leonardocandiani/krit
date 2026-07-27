@@ -82,10 +82,11 @@ curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/main/install.
 2. Open the DMG and drag **KRIT** to Applications.
 3. Launch KRIT normally from Applications or Spotlight.
 
-Public releases are signed with Developer ID and notarized by Apple. Keep the
-download quarantine intact so Gatekeeper can verify both the signature and the
-stapled notarization ticket. If macOS rejects a release, stop and report the
-artifact instead of bypassing Gatekeeper.
+Current public releases use an ad-hoc app signature and are not notarized by
+Apple. Sparkle verifies update payloads with EdDSA, and every release includes a
+SHA-256 checksum. The shell installer verifies both the checksum and the app
+signature before removing quarantine for this compatibility build. Prefer the
+shell installer if a manual DMG installation is blocked by Gatekeeper.
 
 ## Shortcuts
 

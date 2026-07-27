@@ -48,6 +48,8 @@ enum WhatsNewStore {
 @MainActor
 final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
     private static var shared: WhatsNewWindowController?
+    private let notesVersion: String
+    private let notesMarkdown: String
 
     /// Pure decision: show once per version, only after an update (never on a fresh
     /// install, where the welcome runs instead) and never for stale/mismatched notes.
@@ -89,6 +91,8 @@ final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
 
     private init(notes: WhatsNewStore.Notes) {
         let version = notes.version.isEmpty ? WhatsNewStore.appVersion : notes.version
+        notesVersion = version
+        notesMarkdown = notes.body
         let root = WhatsNewView(version: version, markdown: notes.body) { Self.shared?.close() }
         let window = NSWindow(contentViewController: NSHostingController(rootView: root))
         window.title = "What's New"
@@ -96,7 +100,7 @@ final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
-        window.setContentSize(NSSize(width: 520, height: 600))
+        window.setContentSize(NSSize(width: 600, height: 640))
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
@@ -113,49 +117,161 @@ final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
     static var uiTestIsOpen: Bool { shared?.window?.isVisible == true }
     static var uiTestWindow: NSWindow? { shared?.window }
     static func uiTestClose() { shared?.close() }
+
+    static func uiTestRenderSnapshot(to path: String) -> Bool {
+        guard let controller = shared else { return false }
+        let root = WhatsNewView(
+            version: controller.notesVersion,
+            markdown: controller.notesMarkdown,
+            onClose: {}
+        )
+        let renderer = ImageRenderer(content: root.snapshotBody.environment(\.colorScheme, .dark))
+        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+        renderer.proposedSize = ProposedViewSize(width: 600, height: 640)
+        guard let image = renderer.nsImage,
+              let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let data = rep.representation(using: .png, properties: [:]) else { return false }
+        do {
+            try data.write(to: URL(fileURLWithPath: path))
+            return true
+        } catch {
+            return false
+        }
+    }
 }
 
 // MARK: - View
 
 struct WhatsNewDocument: Equatable {
+    enum Block: Equatable {
+        case paragraph(String)
+        case bullet(String)
+        case code(language: String?, body: String)
+
+        var text: String {
+            switch self {
+            case .paragraph(let text), .bullet(let text): return text
+            case .code(_, let body): return body
+            }
+        }
+    }
+
     struct Section: Equatable, Identifiable {
         let title: String
-        let items: [String]
+        let blocks: [Block]
 
         var id: String { title }
+
+        var items: [String] {
+            blocks.compactMap {
+                if case .bullet(let item) = $0 { return item }
+                return nil
+            }
+        }
+
+        func bulletNumber(at blockIndex: Int) -> Int {
+            blocks.prefix(blockIndex + 1).reduce(0) { count, block in
+                if case .bullet = block { return count + 1 }
+                return count
+            }
+        }
     }
 
     let introduction: [String]
     let sections: [Section]
 
+    var summary: String {
+        introduction.first ?? sections.first?.blocks.first?.text ?? "A focused KRIT update."
+    }
+
+    var supportingIntroduction: [String] {
+        Array(introduction.dropFirst())
+    }
+
+    var chapterTitles: [String] {
+        sections.map(\.title)
+    }
+
     static func parse(_ markdown: String) -> WhatsNewDocument {
         var introduction: [String] = []
         var sections: [Section] = []
         var title: String?
-        var items: [String] = []
+        var blocks: [Block] = []
+        var paragraphLines: [String] = []
+        var isInCodeBlock = false
+        var codeLanguage: String?
+        var codeLines: [String] = []
 
         func flushSection() {
+            flushParagraph()
             guard let title else { return }
-            sections.append(Section(title: title, items: items))
-            items.removeAll(keepingCapacity: true)
+            sections.append(Section(title: title, blocks: blocks))
+            blocks.removeAll(keepingCapacity: true)
+        }
+
+        func flushParagraph() {
+            let paragraph = paragraphLines.joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            paragraphLines.removeAll(keepingCapacity: true)
+            guard !paragraph.isEmpty else { return }
+            if title == nil {
+                introduction.append(paragraph)
+            } else {
+                blocks.append(.paragraph(paragraph))
+            }
+        }
+
+        func flushCode() {
+            let body = codeLines.joined(separator: "\n").trimmingCharacters(in: .newlines)
+            codeLines.removeAll(keepingCapacity: true)
+            isInCodeBlock = false
+            defer { codeLanguage = nil }
+            guard !body.isEmpty else { return }
+            blocks.append(.code(language: codeLanguage, body: body))
         }
 
         for rawLine in markdown.components(separatedBy: "\n") {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty else { continue }
+            if isInCodeBlock {
+                if line.hasPrefix("```") {
+                    flushCode()
+                } else {
+                    codeLines.append(rawLine)
+                }
+                continue
+            }
+
+            if line.hasPrefix("```") {
+                flushParagraph()
+                isInCodeBlock = true
+                codeLanguage = String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if codeLanguage?.isEmpty == true { codeLanguage = nil }
+                continue
+            }
+
+            guard !line.isEmpty else {
+                flushParagraph()
+                continue
+            }
 
             if line.hasPrefix("### ") || line.hasPrefix("## ") {
                 flushSection()
                 title = String(line.drop(while: { $0 == "#" || $0 == " " }))
             } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
+                flushParagraph()
                 let item = String(line.dropFirst(2))
-                if title == nil { introduction.append(item) } else { items.append(item) }
+                if title == nil { introduction.append(item) } else { blocks.append(.bullet(item)) }
             } else if title == nil {
-                introduction.append(line)
+                paragraphLines.append(line)
             } else {
-                items.append(line)
+                paragraphLines.append(line)
             }
         }
+        if isInCodeBlock {
+            flushCode()
+        }
+        flushParagraph()
         flushSection()
         return WhatsNewDocument(introduction: introduction, sections: sections)
     }
@@ -166,91 +282,206 @@ private struct WhatsNewView: View {
     let markdown: String
     let onClose: () -> Void
 
+    private enum Metrics {
+        static let windowWidth: CGFloat = 600
+        static let windowHeight: CGFloat = 640
+        static let readingWidth: CGFloat = 456
+        static let iconSize: CGFloat = 38
+    }
+
     private var document: WhatsNewDocument { .parse(markdown) }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: KritSpacing.l) {
-                Image(nsImage: NSApp.applicationIconImage ?? NSImage())
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 54, height: 54)
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: KritSpacing.xxs) {
-                    Text("What's New")
-                        .kritType(.largeTitle)
-                    Text("KRIT \(version)")
-                        .kritType(.callout)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-            }
-            .padding(.horizontal, KritSpacing.xxxl)
-            .padding(.top, KritSpacing.xxxl)
-            .padding(.bottom, KritSpacing.xxl)
+            header
 
             ZStack(alignment: .top) {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: KritSpacing.l) {
-                        ForEach(Array(document.introduction.enumerated()), id: \.offset) { _, paragraph in
-                            inlineText(paragraph)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        ForEach(document.sections) { section in
-                            releaseSection(section)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, KritSpacing.xxxl)
-                    .padding(.top, KritSpacing.m)
-                    .padding(.bottom, KritSpacing.xxl)
+                    documentContent
                 }
 
                 KritEdgeDissolve()
             }
 
-            ZStack(alignment: .top) {
-                KritEdgeDissolve(.up)
-                    .offset(y: -10)
-
-                HStack {
-                    Text("Release notes for this update")
-                        .kritType(.caption)
-                        .foregroundStyle(.tertiary)
-                    Spacer()
-                    Button("Continue", action: onClose)
-                        .controlSize(.large)
-                        .keyboardShortcut(.defaultAction)
-                }
-                .padding(.horizontal, KritSpacing.xxxl)
-                .padding(.vertical, KritSpacing.l)
-            }
+            footer
         }
-        .frame(width: 520, height: 600)
+        .frame(width: Metrics.windowWidth, height: Metrics.windowHeight)
         .kritTheme()
     }
 
-    private func releaseSection(_ section: WhatsNewDocument.Section) -> some View {
-        KritInsetCard {
-            VStack(alignment: .leading, spacing: KritSpacing.m) {
-                Text(section.title)
-                    .kritType(.heading)
+    var snapshotBody: some View {
+        VStack(spacing: 0) {
+            header
+            documentContent
+                .frame(height: 470, alignment: .top)
+                .clipped()
+            footer
+        }
+        .frame(width: Metrics.windowWidth, height: Metrics.windowHeight, alignment: .top)
+        .kritTheme()
+    }
 
-                ForEach(Array(section.items.enumerated()), id: \.offset) { _, item in
-                    HStack(alignment: .top, spacing: KritSpacing.m) {
-                        Circle()
-                            .fill(Color.kritAccent)
-                            .frame(width: 5, height: 5)
-                            .padding(.top, 6)
-                        inlineText(item)
-                            .foregroundStyle(.primary.opacity(0.9))
+    private var documentContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            digestLead
+
+            if !document.supportingIntroduction.isEmpty {
+                VStack(alignment: .leading, spacing: KritSpacing.m) {
+                    ForEach(Array(document.supportingIntroduction.enumerated()), id: \.offset) { _, paragraph in
+                        inlineText(paragraph)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                }
+                .padding(.top, KritSpacing.xl)
+            }
+
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(document.sections.enumerated()), id: \.offset) { index, section in
+                    if index > 0 {
+                        hairline
+                            .padding(.vertical, KritSpacing.xxl)
+                    } else {
+                        Spacer()
+                            .frame(height: KritSpacing.xxl)
+                    }
+                    releaseSection(section)
                 }
             }
         }
+        .frame(maxWidth: Metrics.readingWidth, alignment: .leading)
+        .frame(maxWidth: .infinity)
+        .padding(.top, KritSpacing.xl)
+        .padding(.bottom, KritSpacing.xxxl)
+    }
+
+    private var footer: some View {
+        ZStack(alignment: .top) {
+            KritEdgeDissolve(.up)
+                .offset(y: -10)
+
+            HStack {
+                Text("KRIT \(version) release digest")
+                    .kritType(.caption)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button("Continue", action: onClose)
+                    .controlSize(.large)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityLabel("Close what's new")
+            }
+            .padding(.horizontal, KritSpacing.xxxl)
+            .padding(.vertical, KritSpacing.l)
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: KritSpacing.l) {
+            Image(nsImage: NSApp.applicationIconImage ?? NSImage())
+                .resizable()
+                .interpolation(.high)
+                .frame(width: Metrics.iconSize, height: Metrics.iconSize)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: KritSpacing.xxs) {
+                Text("What's New")
+                    .kritType(.title)
+                Text("KRIT \(version)")
+                    .kritType(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, KritSpacing.xxxl)
+        .padding(.top, KritSpacing.xxl)
+        .padding(.bottom, KritSpacing.l)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var digestLead: some View {
+        VStack(alignment: .leading, spacing: KritSpacing.m) {
+            Text("Release digest")
+                .kritType(.caption)
+                .foregroundStyle(.tertiary)
+                .textCase(.uppercase)
+            inlineText(document.summary)
+                .kritType(.largeTitle)
+                .foregroundStyle(.primary)
+                .lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var hairline: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.09))
+            .frame(height: 1)
+            .accessibilityHidden(true)
+    }
+
+    private func releaseSection(_ section: WhatsNewDocument.Section) -> some View {
+        VStack(alignment: .leading, spacing: KritSpacing.l) {
+            Text(section.title)
+                .kritType(.heading)
+                .foregroundStyle(.primary)
+
+            VStack(alignment: .leading, spacing: KritSpacing.m) {
+                ForEach(Array(section.blocks.enumerated()), id: \.offset) { index, block in
+                    sectionBlock(block, bulletNumber: section.bulletNumber(at: index))
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private func sectionBlock(_ block: WhatsNewDocument.Block, bulletNumber: Int) -> some View {
+        switch block {
+        case .paragraph(let paragraph):
+            inlineText(paragraph)
+                .foregroundStyle(.secondary)
+                .lineSpacing(1)
+                .fixedSize(horizontal: false, vertical: true)
+        case .bullet(let item):
+            HStack(alignment: .firstTextBaseline, spacing: KritSpacing.l) {
+                Text(String(format: "%02d", bulletNumber))
+                    .kritType(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 24, alignment: .leading)
+                    .accessibilityHidden(true)
+                inlineText(item)
+                    .foregroundStyle(.primary.opacity(0.92))
+                    .lineSpacing(1)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case .code(_, let body):
+            codeBlock(body)
+        }
+    }
+
+    private func codeBlock(_ body: String) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Text(body)
+                .font(KritType.mono.font)
+                .foregroundStyle(.primary.opacity(0.88))
+                .lineSpacing(2)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(KritSpacing.m)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: ChromeFactory.Radius.card, style: .continuous)
+                .fill(Color.kritInsetSurface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: ChromeFactory.Radius.card, style: .continuous)
+                .stroke(Color.kritInsetSurfaceStroke, lineWidth: 1)
+        )
     }
 
     private func inlineText(_ s: String) -> Text {

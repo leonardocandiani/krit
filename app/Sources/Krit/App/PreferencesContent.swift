@@ -14,6 +14,7 @@ import ServiceManagement
 /// close/reopen cycle.
 @MainActor
 enum PreferencesContent {
+    static let formMaxWidth: CGFloat = 640
 
     static func makeRootView(for tab: PreferencesTab) -> AnyView {
         let root: AnyView
@@ -79,7 +80,8 @@ private struct PreferencesSection<Content: View>: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .padding(.top, KritSpacing.m)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: PreferencesContent.formMaxWidth, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
@@ -87,14 +89,7 @@ private struct PreferencesHeader: View {
     let tab: PreferencesTab
 
     var body: some View {
-        HStack(spacing: KritSpacing.l) {
-            Image(systemName: tab.symbol)
-                .symbolRenderingMode(.hierarchical)
-                .font(KritType.title.font)
-                .foregroundStyle(Color.kritAccent)
-                .frame(width: 30, height: 30)
-                .accessibilityHidden(true)
-
+        HStack(alignment: .firstTextBaseline, spacing: KritSpacing.l) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(tab.title)
                     .kritType(.largeTitle)
@@ -102,16 +97,19 @@ private struct PreferencesHeader: View {
                 Text(tab.subtitle)
                     .kritType(.callout)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Spacer(minLength: 16)
 
             if tab == .capture { CaptureReadinessBadge() }
         }
+        .frame(maxWidth: PreferencesContent.formMaxWidth, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, KritSpacing.xxxl)
-        .padding(.top, KritSpacing.xxxl)
-        .padding(.bottom, KritSpacing.l)
+        .padding(.top, KritSpacing.xxl)
+        .padding(.bottom, KritSpacing.m)
     }
 }
 
@@ -1016,8 +1014,8 @@ private struct PresetRow: View {
 
 // MARK: - About
 
-/// A colored rounded-square glyph, the Settings-style icon chip that gives each
-/// About row a bit of life.
+/// A neutral Settings-style glyph. KRIT coral stays reserved for selected rows
+/// and actions, not repeated inside every setting row.
 private struct SettingIcon: View {
     let symbol: String
 
@@ -1035,8 +1033,7 @@ private struct SettingIcon: View {
     }
 }
 
-/// A settings row label with a leading colored icon chip, the look every
-/// Preferences row shares.
+/// A settings row label with a leading neutral glyph.
 @ViewBuilder
 private func rowLabel(_ title: String, _ symbol: String, _ color: Color) -> some View {
     Label { Text(title) } icon: { SettingIcon(symbol: symbol, color: color) }
@@ -1076,9 +1073,9 @@ private struct AboutForm: View {
 
         Section("Updates") {
             LabeledContent {
-                Button("Check Now") { UpdaterManager.shared.checkForUpdates() }
+                Button("Open Updates") { UpdaterManager.shared.checkForUpdates() }
             } label: {
-                Label { Text("Check for Updates") } icon: { SettingIcon(symbol: "arrow.triangle.2.circlepath", color: .blue) }
+                Label { Text("Software Updates") } icon: { SettingIcon(symbol: "arrow.triangle.2.circlepath", color: .blue) }
             }
 
             Toggle(isOn: $autoCheck) {

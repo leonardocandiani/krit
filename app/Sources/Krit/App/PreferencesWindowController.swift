@@ -22,7 +22,7 @@ enum PreferencesTab: Int, CaseIterable {
         case .general:     return "General"
         case .capture:     return "Capture"
         case .recording:   return "Recording"
-        case .preview:     return "Preview Overlay"
+        case .preview:     return "Preview"
         case .editor:      return "Editor"
         case .shortcuts:   return "Shortcuts"
         case .presets:     return "Presets"
@@ -47,15 +47,15 @@ enum PreferencesTab: Int, CaseIterable {
 
     var subtitle: String {
         switch self {
-        case .general:     return "Make KRIT feel at home on this Mac."
-        case .capture:     return "Screenshots that land exactly where you need them."
-        case .recording:   return "Crisp screen recordings with the right inputs."
-        case .preview:     return "Choose how completed captures stay within reach."
-        case .editor:      return "Set the defaults for fast, focused annotation."
-        case .shortcuts:   return "Keep every capture tool one keystroke away."
-        case .presets:     return "Turn repeated capture workflows into one action."
-        case .permissions: return "See what KRIT can access and why it needs it."
-        case .about:       return "Version, updates, support, and project links."
+        case .general:     return "Launch, appearance, and capture defaults."
+        case .capture:     return "File format, timer, window background, and save location."
+        case .recording:   return "Video, audio, camera, cursor, and GIF defaults."
+        case .preview:     return "Preview size, timeout, and screen position."
+        case .editor:      return "Annotation thickness and capture templates."
+        case .shortcuts:   return "Global shortcuts for capture, recording, and tools."
+        case .presets:     return "Saved regions, formats, actions, and hotkeys."
+        case .permissions: return "Screen, accessibility, camera, and microphone access."
+        case .about:       return "Version, updates, license, and project links."
         }
     }
 }
@@ -68,8 +68,8 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
 
     static let shared = PreferencesWindowController()
 
-    private let windowSize = NSSize(width: 980, height: 680)
-    private let sidebarWidth: CGFloat = 220
+    private let windowSize = NSSize(width: 860, height: 620)
+    private let sidebarWidth: CGFloat = 196
 
     private var sidebar: NativePreferencesSidebar!
     private var contentHostingView: NSHostingView<AnyView>!
@@ -89,7 +89,7 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         window.isMovableByWindowBackground = true
         window.center()
         window.isReleasedWhenClosed = false
-        window.contentMinSize = NSSize(width: 860, height: 620)
+        window.contentMinSize = NSSize(width: 760, height: 540)
         // Settings follows the app appearance (System / Light / Dark) like a native
         // macOS settings window, instead of forcing dark. AppearanceMode.applyCurrent
         // sets NSApp.appearance; this window inherits it.
@@ -468,4 +468,6 @@ extension PreferencesWindowController {
 
     /// Test-only teardown.
     func uiTestClose() { window?.close() }
+
+    var uiTestSidebarWidth: CGFloat { sidebarWidth }
 }

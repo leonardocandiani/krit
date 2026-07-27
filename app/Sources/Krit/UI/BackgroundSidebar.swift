@@ -86,7 +86,9 @@ final class BackgroundSidebar: NSView {
         static let sectionGap: CGFloat = 18
         static let topInset: CGFloat = 14
         static let bottomInset: CGFloat = 18
+        static let pairedControlSpacing: CGFloat = 12
         static var innerWidth: CGFloat { BackgroundSidebar.preferredWidth - sidePadding * 2 }
+        static var pairedControlWidth: CGFloat { BackgroundSidebar.pairedControlWidth(innerWidth: innerWidth, spacing: pairedControlSpacing) }
         static var thumbSize: CGFloat {
             (innerWidth - thumbSpacing * CGFloat(thumbColumns - 1)) / CGFloat(thumbColumns)
         }
@@ -167,11 +169,74 @@ final class BackgroundSidebar: NSView {
 
     // Presets: a CleanShot-style named dropdown at the top of the column. The popup
     // shows the active preset (swatch + name) and lists every saved preset plus the
-    // "Apply Previous Settings", "Default Preset" and "Add New Preset..." actions; a
-    // trash button deletes the active preset and a "+" saves the current canvas
-    // config under a name.
+    // previous, built-in background and add-preset actions. Removal stays in the
+    // menu so it can target one saved preset ID and ask for confirmation first.
     private let presetPopup = NSPopUpButton(frame: .zero, pullsDown: true)
-    private let presetDeleteButton = NSButton()
+    struct PresetManagementState: Equatable {
+        let title: String
+        let titleBackground: ScreenshotBackgroundOptions?
+        let saveChangesPresetID: UUID?
+        let defaultPresetID: UUID?
+        let removePresetID: UUID?
+        let isDefault: Bool
+    }
+
+    static func pairedControlWidth(innerWidth: CGFloat, spacing: CGFloat) -> CGFloat {
+        max(0, (innerWidth - spacing) / 2)
+    }
+
+    static func presetMenuTitle(name: String, isDefault: Bool) -> String {
+        isDefault ? "\(name) (default)" : name
+    }
+
+    static func presetManagementState(
+        options: ScreenshotBackgroundOptions,
+        active: EditTemplate?,
+        editingBase: EditTemplate?,
+        isDefault: (UUID) -> Bool
+    ) -> PresetManagementState {
+        if let active {
+            return PresetManagementState(
+                title: active.name,
+                titleBackground: active.background,
+                saveChangesPresetID: nil,
+                defaultPresetID: active.id,
+                removePresetID: active.id,
+                isDefault: isDefault(active.id)
+            )
+        }
+
+        if let editingBase, editingBase.background != options {
+            return PresetManagementState(
+                title: "\(editingBase.name) (edited)",
+                titleBackground: options,
+                saveChangesPresetID: editingBase.id,
+                defaultPresetID: nil,
+                removePresetID: nil,
+                isDefault: false
+            )
+        }
+
+        if let editingBase, editingBase.background == options {
+            return PresetManagementState(
+                title: editingBase.name,
+                titleBackground: editingBase.background,
+                saveChangesPresetID: nil,
+                defaultPresetID: editingBase.id,
+                removePresetID: editingBase.id,
+                isDefault: isDefault(editingBase.id)
+            )
+        }
+
+        return PresetManagementState(
+            title: "Custom",
+            titleBackground: nil,
+            saveChangesPresetID: nil,
+            defaultPresetID: nil,
+            removePresetID: nil,
+            isDefault: false
+        )
+    }
 
     // MARK: Init
 
@@ -253,7 +318,7 @@ final class BackgroundSidebar: NSView {
         wallpaperSection = makeSection(title: "Wallpapers", grid: wallpaperGrid(), accessory: makeImportButton())
         contentStack.addArrangedSubview(wallpaperSection!)
         contentStack.addArrangedSubview(makeSection(title: "Blurred", grid: blurredGrid()))
-        contentStack.addArrangedSubview(makeSection(title: "Plain Color", grid: plainColorGrid()))
+        contentStack.addArrangedSubview(makeSection(title: "Plain color", grid: plainColorGrid()))
         contentStack.addArrangedSubview(makeDivider())
         contentStack.addArrangedSubview(makeControls())
         reloadPresetBar()
@@ -275,8 +340,8 @@ final class BackgroundSidebar: NSView {
     // MARK: Presets bar (named dropdown, like CleanShot)
 
     /// The preset dropdown row at the top of the column: a pull-down NSPopUpButton
-    /// showing the active preset (swatch + name), a trash button that deletes the
-    /// active preset and a "+" that saves the current canvas config under a name.
+    /// showing the active preset (swatch + name) and a "+" that saves the current
+    /// canvas config under a name.
     /// The popup's menu is rebuilt on every change by `reloadPresetBar`.
     private func makePresetBar() -> NSView {
         let row = NSStackView()
@@ -292,15 +357,6 @@ final class BackgroundSidebar: NSView {
         presetPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
         presetPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        presetDeleteButton.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete preset")
-        presetDeleteButton.isBordered = false
-        presetDeleteButton.contentTintColor = .secondaryLabelColor
-        presetDeleteButton.toolTip = "Delete the selected preset"
-        presetDeleteButton.target = self
-        presetDeleteButton.action = #selector(deleteActivePresetTapped)
-        presetDeleteButton.translatesAutoresizingMaskIntoConstraints = false
-        presetDeleteButton.setContentHuggingPriority(.required, for: .horizontal)
-
         let addButton = NSButton(title: "", target: self, action: #selector(addPresetTapped))
         addButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add preset")
         addButton.isBordered = false
@@ -310,51 +366,47 @@ final class BackgroundSidebar: NSView {
         addButton.setContentHuggingPriority(.required, for: .horizontal)
 
         row.addArrangedSubview(presetPopup)
-        row.addArrangedSubview(presetDeleteButton)
         row.addArrangedSubview(addButton)
         row.widthAnchor.constraint(equalToConstant: Style.innerWidth).isActive = true
         return row
     }
 
     /// Rebuilds the popup's menu from the saved presets plus the standard actions,
-    /// and reflects the currently selected preset (swatch + name + checkmark). The
-    /// trash button is disabled when no named preset is selected.
+    /// and reflects the currently selected preset (swatch + name + checkmark).
     private func reloadPresetBar() {
         let menu = NSMenu()
-        // Manage item enablement by hand so "Apply Previous Settings" can read as
+        // Manage item enablement by hand so "Apply previous settings" can read as
         // disabled when there is nothing to restore (NSMenu's auto-enabling would
         // otherwise force every item with a valid target on).
         menu.autoenablesItems = false
         let active = TemplateStore.activePreset
         let base = TemplateStore.editingBase
-        // "Edited" = the user picked a saved preset and then hand-tweaked it, so the
-        // live background no longer matches what's stored. We keep the base preset's
-        // identity (unlike `active`, which already dropped to nil) so we can offer to
-        // save the changes back into it.
-        let isEdited = active == nil && base != nil && base!.background != options
+        let state = Self.presetManagementState(
+            options: options,
+            active: active,
+            editingBase: base,
+            isDefault: { TemplateStore.isDefault(id: $0) }
+        )
         // The pull-down's title item (index 0) is what shows when the menu is shut:
         // the active preset's swatch + name, "<name> (edited)" with the live swatch
         // when tweaked, or a neutral "Custom" when there's no base at all.
         let titleItem = NSMenuItem()
-        if isEdited, let base {
-            titleItem.title = "\(base.name) (edited)"
-            titleItem.image = swatchImage(for: options)
-        } else {
-            titleItem.title = active?.name ?? "Custom"
-            titleItem.image = active.map { swatchImage(for: $0.background) }
-        }
+        titleItem.title = state.title
+        titleItem.image = state.titleBackground.map { swatchImage(for: $0) }
         titleItem.isEnabled = true
         menu.addItem(titleItem)
 
         // Save the hand-edits back into the preset they came from. Top of the menu so
         // "I tweaked my preset, now save it" is the first thing the user sees.
-        if isEdited, let base {
+        if let saveChangesPresetID = state.saveChangesPresetID,
+           let base = TemplateStore.all().first(where: { $0.id == saveChangesPresetID }) {
             menu.addItem(.separator())
             // No key equivalent: the editor already owns Cmd+S for saving the image
             // to disk, so this stays a click-only action to avoid a clash.
-            let save = NSMenuItem(title: "Save Changes to \u{201C}\(base.name)\u{201D}",
-                                  action: #selector(saveChangesToBaseTapped), keyEquivalent: "")
+            let save = NSMenuItem(title: "Save changes to \u{201C}\(base.name)\u{201D}",
+                                  action: #selector(saveChangesToBaseTapped(_:)), keyEquivalent: "")
             save.target = self
+            save.representedObject = saveChangesPresetID
             save.isEnabled = true
             menu.addItem(save)
         }
@@ -365,64 +417,61 @@ final class BackgroundSidebar: NSView {
             // so "which one is the default" reads at a glance; the checkmark stays
             // reserved for the currently-selected preset.
             let isDefault = TemplateStore.isDefault(id: preset.id)
-            let item = NSMenuItem(title: isDefault ? "\(preset.name)  \u{1F4CC} Default" : preset.name,
+            let item = NSMenuItem(title: Self.presetMenuTitle(name: preset.name, isDefault: isDefault),
                                   action: #selector(selectPresetMenu(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = preset.id
             item.image = swatchImage(for: preset.background)
-            item.state = (preset.name.caseInsensitiveCompare(active?.name ?? "") == .orderedSame) ? .on : .off
+            item.toolTip = isDefault ? "Default preset" : nil
+            item.state = (preset.id == active?.id) ? .on : .off
             item.isEnabled = true
             menu.addItem(item)
         }
         if !presets.isEmpty { menu.addItem(.separator()) }
 
-        // Manage the selected preset right where it's created: pin it as the default
-        // for every new capture, or remove it. These act on the selected preset, or
-        // on the edit base while it's tweaked; only the true "Custom" (no base) state
-        // disables them.
-        let managed = active ?? base
-        let activeIsDefault = managed.map { TemplateStore.isDefault(id: $0.id) } ?? false
+        // Management actions only receive an explicit preset ID. An edited base can
+        // be saved back, but it cannot be removed or pinned from that ambiguous state.
         let setDefault = NSMenuItem(
-            title: activeIsDefault ? "Unset as Default" : "Set as Default for New Captures",
-            action: #selector(toggleActivePresetDefaultMenu), keyEquivalent: "")
+            title: state.isDefault ? "Unset as default" : "Set as default for new captures",
+            action: #selector(toggleActivePresetDefaultMenu(_:)), keyEquivalent: "")
         setDefault.target = self
-        setDefault.isEnabled = managed != nil
-        setDefault.state = activeIsDefault ? .on : .off
+        setDefault.representedObject = state.defaultPresetID
+        setDefault.isEnabled = state.defaultPresetID != nil
+        setDefault.state = state.isDefault ? .on : .off
         menu.addItem(setDefault)
 
-        let removeItem = NSMenuItem(title: "Remove Preset", action: #selector(deleteActivePresetTapped), keyEquivalent: "")
+        let removeItem = NSMenuItem(title: "Remove preset", action: #selector(deletePresetMenu(_:)), keyEquivalent: "")
         removeItem.target = self
-        removeItem.isEnabled = managed != nil
+        removeItem.representedObject = state.removePresetID
+        removeItem.isEnabled = state.removePresetID != nil
         menu.addItem(removeItem)
 
         menu.addItem(.separator())
 
-        let previous = NSMenuItem(title: "Apply Previous Settings", action: #selector(applyPreviousSettingsMenu), keyEquivalent: "")
+        let previous = NSMenuItem(title: "Apply previous settings", action: #selector(applyPreviousSettingsMenu), keyEquivalent: "")
         previous.target = self
         previous.isEnabled = TemplateStore.previousOptions != nil
         menu.addItem(previous)
 
-        let defaultPreset = NSMenuItem(title: "Apply Built-in Background", action: #selector(applyDefaultPresetMenu), keyEquivalent: "")
+        let defaultPreset = NSMenuItem(title: "Apply built-in background", action: #selector(applyDefaultPresetMenu), keyEquivalent: "")
         defaultPreset.target = self
         defaultPreset.isEnabled = true
         menu.addItem(defaultPreset)
 
         menu.addItem(.separator())
 
-        let addItem = NSMenuItem(title: "Add New Preset\u{2026}", action: #selector(addPresetTapped), keyEquivalent: "")
+        let addItem = NSMenuItem(title: "Add new preset\u{2026}", action: #selector(addPresetTapped), keyEquivalent: "")
         addItem.target = self
         addItem.isEnabled = true
         menu.addItem(addItem)
 
         presetPopup.menu = menu
         presetPopup.selectItem(at: 0)
-        presetDeleteButton.isEnabled = managed != nil
-        presetDeleteButton.contentTintColor = managed != nil ? .secondaryLabelColor : .tertiaryLabelColor
     }
 
     /// Test hook: rebuild the preset dropdown from the live state and return its
     /// item titles, so a scenario can assert the "(edited)" badge and the
-    /// "Save Changes to <name>" action appear when a saved preset is hand-edited.
+    /// "Save changes to <name>" action appear when a saved preset is hand-edited.
     func uiTestPresetMenuTitles() -> [String] {
         reloadPresetBar()
         return presetPopup.menu?.items.map { $0.title } ?? []
@@ -473,7 +522,7 @@ final class BackgroundSidebar: NSView {
 
     // MARK: Preset actions
 
-    /// The background config behind "Default Preset": the brand gradient KRIT ships
+    /// The background config behind "Apply built-in background": the brand gradient KRIT ships
     /// with (Sunset Coral), enabled, with the editor's default framing.
     private var defaultPresetOptions: ScreenshotBackgroundOptions {
         var options = ScreenshotBackgroundOptions.editorDefault
@@ -487,7 +536,7 @@ final class BackgroundSidebar: NSView {
         TemplateStore.recordPrevious(options)
         TemplateStore.setActive(name: preset.name)
         // Remember this preset as the edit base so later hand-edits can be saved
-        // back into it ("Save Changes to <name>"), not only forked into a copy.
+        // back into it ("Save changes to <name>"), not only forked into a copy.
         TemplateStore.setEditingBase(name: preset.name)
         commit(preset.background)
         reloadPresetBar()
@@ -512,12 +561,12 @@ final class BackgroundSidebar: NSView {
         reloadPresetBar()
     }
 
-    /// "+" / "Add New Preset...": names the current canvas config and saves it as a
+    /// "+" / "Add new preset...": names the current canvas config and saves it as a
     /// new preset, which becomes the selected one.
     @objc private func addPresetTapped() {
         let suggested = "Preset \(TemplateStore.all().count + 1)"
         guard let name = promptForName(
-            title: "Add New Preset",
+            title: "Add new preset",
             message: "Name this preset. It saves the current background settings.",
             placeholder: suggested,
             initial: ""
@@ -531,12 +580,13 @@ final class BackgroundSidebar: NSView {
         reloadPresetBar()
     }
 
-    /// "Save Changes to <name>": writes the current (hand-edited) background back
+    /// "Save changes to <name>": writes the current (hand-edited) background back
     /// into the preset the user started from, so editing a preset updates it in
     /// place. Only shown while editing a saved preset; a built-in gradient has no
-    /// template to update and saves via "Add New Preset" instead.
-    @objc private func saveChangesToBaseTapped() {
-        guard let base = TemplateStore.editingBase else { return }
+    /// template to update and saves via "Add new preset" instead.
+    @objc private func saveChangesToBaseTapped(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let base = TemplateStore.all().first(where: { $0.id == id }) else { return }
         _ = TemplateStore.update(id: base.id, background: options)
         // Options now match the saved config, so the dropdown re-selects the preset
         // and the "(edited)" state clears.
@@ -544,22 +594,34 @@ final class BackgroundSidebar: NSView {
         reloadPresetBar()
     }
 
-    /// Trash button / "Remove Preset": deletes the selected preset (no-op when the
-    /// dropdown is on a custom, unsaved state).
-    @objc private func deleteActivePresetTapped() {
-        guard let active = TemplateStore.activePreset ?? TemplateStore.editingBase else { return }
-        TemplateStore.delete(id: active.id)
+    /// "Remove preset": deletes only the explicitly selected preset ID.
+    @objc private func deletePresetMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let preset = TemplateStore.all().first(where: { $0.id == id }),
+              confirmPresetDeletion(preset) else { return }
+        TemplateStore.delete(id: id)
         TemplateStore.setEditingBase(name: nil)
         reloadPresetBar()
+    }
+
+    private func confirmPresetDeletion(_ preset: EditTemplate) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove preset?"
+        alert.informativeText = "This removes \u{201C}\(preset.name)\u{201D} from saved background presets."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// Pins the selected preset as the default applied to every new capture, or
     /// clears the default when it is already the one pinned. Mirrors the Default
     /// template picker in Preferences (same `Settings.defaultTemplateName`).
-    @objc private func toggleActivePresetDefaultMenu() {
-        guard let active = TemplateStore.activePreset ?? TemplateStore.editingBase else { return }
-        let alreadyDefault = TemplateStore.isDefault(id: active.id)
-        TemplateStore.setDefault(name: alreadyDefault ? nil : active.name)
+    @objc private func toggleActivePresetDefaultMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let preset = TemplateStore.all().first(where: { $0.id == id }) else { return }
+        let alreadyDefault = TemplateStore.isDefault(id: id)
+        TemplateStore.setDefault(name: alreadyDefault ? nil : preset.name)
         reloadPresetBar()
     }
 
@@ -663,9 +725,7 @@ final class BackgroundSidebar: NSView {
     }
 
     private func makeSectionLabel(_ text: String) -> NSTextField {
-        // Mesma voz tipográfica dos headers de "Layout": uppercase discreto, pra
-        // sidebar e dock lerem como um único produto.
-        let label = NSTextField(labelWithString: text.uppercased())
+        let label = NSTextField(labelWithString: text)
         label.font = .systemFont(ofSize: 10, weight: .semibold)
         label.textColor = .tertiaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -771,6 +831,21 @@ final class BackgroundSidebar: NSView {
         button.tag = tag
         button.target = self
         button.action = action
+        button.setAccessibilityElement(true)
+        button.setAccessibilityRole(.button)
+        if action == #selector(selectCurrentDesktop(_:)) {
+            button.identifier = NSUserInterfaceItemIdentifier("background-current-desktop")
+            button.setAccessibilityLabel("Current desktop wallpaper")
+        } else if action == #selector(selectWallpaper(_:)) {
+            button.identifier = NSUserInterfaceItemIdentifier("background-wallpaper-\(tag)")
+            button.setAccessibilityLabel("Wallpaper \(tag + 1)")
+        } else if action == #selector(selectGradient(_:)) {
+            button.identifier = NSUserInterfaceItemIdentifier("background-gradient-\(tag)")
+            button.setAccessibilityLabel("Gradient \(tag + 1)")
+        } else if action == #selector(selectBlurLevel(_:)) {
+            button.identifier = NSUserInterfaceItemIdentifier("background-blur-\(tag)")
+            button.setAccessibilityLabel(["Light blur", "Medium blur", "Strong blur"][safe: tag] ?? "Blur")
+        }
         button.translatesAutoresizingMaskIntoConstraints = false
         button.widthAnchor.constraint(equalToConstant: Style.thumbSize).isActive = true
         button.heightAnchor.constraint(equalToConstant: Style.thumbSize).isActive = true
@@ -837,7 +912,7 @@ final class BackgroundSidebar: NSView {
         row.orientation = .horizontal
         row.alignment = .top
         row.distribution = .fillEqually
-        row.spacing = 12
+        row.spacing = Style.pairedControlSpacing
         row.translatesAutoresizingMaskIntoConstraints = false
         row.addArrangedSubview(left)
         row.addArrangedSubview(right)
@@ -897,7 +972,7 @@ final class BackgroundSidebar: NSView {
     /// Section header for the controls column: matches the thumbnail-section
     /// label weight so the whole panel reads as one document.
     private func makeSectionHeader(_ text: String) -> NSTextField {
-        let label = NSTextField(labelWithString: text.uppercased())
+        let label = NSTextField(labelWithString: text)
         label.font = .systemFont(ofSize: 10, weight: .semibold)
         label.textColor = .tertiaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -976,7 +1051,7 @@ final class BackgroundSidebar: NSView {
         for preset in BackgroundAspectPreset.allCases {
             ratioPopup.addItem(withTitle: preset.displayName)
         }
-        ratioPopup.widthAnchor.constraint(equalToConstant: Style.innerWidth).isActive = true
+        ratioPopup.widthAnchor.constraint(equalToConstant: Style.pairedControlWidth).isActive = true
         return ratioPopup
     }
 

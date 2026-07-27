@@ -1,5 +1,51 @@
 import AppKit
 
+struct AnnotationSelectionMetrics: Equatable {
+    static let minimumMagnification: CGFloat = 0.1
+    static let maximumMagnification: CGFloat = 8
+
+    static let outlineInsetScreenPoints: CGFloat = 4
+    static let outlineStrokeScreenPoints: CGFloat = 1.25
+    static let dashOnScreenPoints: CGFloat = 5
+    static let dashOffScreenPoints: CGFloat = 4
+    static let cornerHandleRadiusScreenPoints: CGFloat = 5.5
+    static let edgeHandleRadiusScreenPoints: CGFloat = 4.5
+    static let endpointHandleRadiusScreenPoints: CGFloat = 6.5
+    static let controlHandleRadiusScreenPoints: CGFloat = 7.5
+    static let handleStrokeScreenPoints: CGFloat = 1.5
+    static let resizeHitRadiusScreenPoints: CGFloat = 10
+    static let arrowEndpointHitRadiusScreenPoints: CGFloat = 12
+    static let arrowControlHitRadiusScreenPoints: CGFloat = 13
+    static let bodyHitOutsetScreenPoints: CGFloat = 4
+    static let redrawPaddingScreenPoints: CGFloat = 18
+
+    let magnification: CGFloat
+
+    init(magnification: CGFloat) {
+        self.magnification = min(max(magnification, Self.minimumMagnification), Self.maximumMagnification)
+    }
+
+    func canvasPoints(for screenPoints: CGFloat) -> CGFloat {
+        screenPoints / magnification
+    }
+
+    var outlineInset: CGFloat { canvasPoints(for: Self.outlineInsetScreenPoints) }
+    var outlineStrokeWidth: CGFloat { canvasPoints(for: Self.outlineStrokeScreenPoints) }
+    var outlineDashLengths: [CGFloat] {
+        [canvasPoints(for: Self.dashOnScreenPoints), canvasPoints(for: Self.dashOffScreenPoints)]
+    }
+    var cornerHandleRadius: CGFloat { canvasPoints(for: Self.cornerHandleRadiusScreenPoints) }
+    var edgeHandleRadius: CGFloat { canvasPoints(for: Self.edgeHandleRadiusScreenPoints) }
+    var endpointHandleRadius: CGFloat { canvasPoints(for: Self.endpointHandleRadiusScreenPoints) }
+    var controlHandleRadius: CGFloat { canvasPoints(for: Self.controlHandleRadiusScreenPoints) }
+    var handleStrokeWidth: CGFloat { canvasPoints(for: Self.handleStrokeScreenPoints) }
+    var resizeHitRadius: CGFloat { canvasPoints(for: Self.resizeHitRadiusScreenPoints) }
+    var arrowEndpointHitRadius: CGFloat { canvasPoints(for: Self.arrowEndpointHitRadiusScreenPoints) }
+    var arrowControlHitRadius: CGFloat { canvasPoints(for: Self.arrowControlHitRadiusScreenPoints) }
+    var bodyHitOutset: CGFloat { canvasPoints(for: Self.bodyHitOutsetScreenPoints) }
+    var redrawPadding: CGFloat { canvasPoints(for: Self.redrawPaddingScreenPoints) }
+}
+
 /// The main drawing surface for the annotation editor.
 /// Handles tool interaction, renders all annotation objects, and manages undo.
 @MainActor
@@ -1161,18 +1207,19 @@ final class AnnotationCanvas: NSView {
     }
 
     private func drawSelectionHandle(for obj: any AnnotationObject, ctx: CGContext) {
+        let metrics = selectionMetrics
         if let arrow = obj as? ArrowAnnotation {
-            drawArrowSelection(for: arrow, ctx: ctx)
+            drawArrowSelection(for: arrow, metrics: metrics, ctx: ctx)
             return
         }
 
         if let line = obj as? LineAnnotation {
-            drawEndpointSelection(start: line.startPoint, end: line.endPoint, ctx: ctx)
+            drawEndpointSelection(start: line.startPoint, end: line.endPoint, metrics: metrics, ctx: ctx)
             return
         }
 
         if let highlighter = obj as? HighlighterAnnotation {
-            drawEndpointSelection(start: highlighter.startPoint, end: highlighter.endPoint, ctx: ctx)
+            drawEndpointSelection(start: highlighter.startPoint, end: highlighter.endPoint, metrics: metrics, ctx: ctx)
             return
         }
 
@@ -1184,56 +1231,67 @@ final class AnnotationCanvas: NSView {
             ctx.saveGState()
             let accent = KritColors.accent
             ctx.setStrokeColor(accent.withAlphaComponent(0.72).cgColor)
-            ctx.setLineWidth(1.25)
-            ctx.setLineDash(phase: 0, lengths: [5, 4])
-            ctx.stroke(obj.bounds.insetBy(dx: -3, dy: -3))
+            ctx.setLineWidth(metrics.outlineStrokeWidth)
+            ctx.setLineDash(phase: 0, lengths: metrics.outlineDashLengths)
+            let inset = metrics.canvasPoints(for: 3)
+            ctx.stroke(obj.bounds.insetBy(dx: -inset, dy: -inset))
             ctx.restoreGState()
             return
         }
 
-        let inset: CGFloat = 4
+        let inset = metrics.outlineInset
         let expanded = obj.bounds.insetBy(dx: -inset, dy: -inset)
 
         ctx.saveGState()
 
         let accent = KritColors.accent
-        ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 4, color: NSColor.black.withAlphaComponent(0.18).cgColor)
+        ctx.setShadow(
+            offset: CGSize(width: 0, height: metrics.canvasPoints(for: 1)),
+            blur: metrics.canvasPoints(for: 4),
+            color: NSColor.black.withAlphaComponent(0.18).cgColor
+        )
         ctx.setStrokeColor(accent.withAlphaComponent(0.9).cgColor)
-        ctx.setLineWidth(1.25)
-        ctx.setLineDash(phase: 0, lengths: [5, 4])
+        ctx.setLineWidth(metrics.outlineStrokeWidth)
+        ctx.setLineDash(phase: 0, lengths: metrics.outlineDashLengths)
         ctx.stroke(expanded)
         ctx.setLineDash(phase: 0, lengths: [])
         ctx.setShadow(offset: .zero, blur: 0)
 
         for handle in ResizeHandle.allCases {
-            drawResizeHandle(at: resizeHandleCenter(for: expanded, handle: handle), handle: handle, accent: accent, ctx: ctx)
+            drawResizeHandle(
+                at: resizeHandleCenter(for: expanded, handle: handle),
+                handle: handle,
+                metrics: metrics,
+                accent: accent,
+                ctx: ctx
+            )
         }
 
         ctx.restoreGState()
     }
 
-    private func drawEndpointSelection(start: CGPoint, end: CGPoint, ctx: CGContext) {
+    private func drawEndpointSelection(start: CGPoint, end: CGPoint, metrics: AnnotationSelectionMetrics, ctx: CGContext) {
         ctx.saveGState()
         let accent = KritColors.accent
         ctx.setStrokeColor(accent.withAlphaComponent(0.72).cgColor)
-        ctx.setLineWidth(1.25)
-        ctx.setLineDash(phase: 0, lengths: [5, 4])
+        ctx.setLineWidth(metrics.outlineStrokeWidth)
+        ctx.setLineDash(phase: 0, lengths: metrics.outlineDashLengths)
         ctx.move(to: start)
         ctx.addLine(to: end)
         ctx.strokePath()
         ctx.setLineDash(phase: 0, lengths: [])
-        drawRoundHandle(at: start, radius: 6.5, fill: .white, stroke: accent, ctx: ctx)
-        drawRoundHandle(at: end, radius: 6.5, fill: .white, stroke: accent, ctx: ctx)
+        drawRoundHandle(at: start, radius: metrics.endpointHandleRadius, fill: .white, stroke: accent, metrics: metrics, ctx: ctx)
+        drawRoundHandle(at: end, radius: metrics.endpointHandleRadius, fill: .white, stroke: accent, metrics: metrics, ctx: ctx)
         ctx.restoreGState()
     }
 
-    private func drawArrowSelection(for arrow: ArrowAnnotation, ctx: CGContext) {
+    private func drawArrowSelection(for arrow: ArrowAnnotation, metrics: AnnotationSelectionMetrics, ctx: CGContext) {
         ctx.saveGState()
 
         let accent = KritColors.accent
         ctx.setStrokeColor(accent.withAlphaComponent(0.72).cgColor)
-        ctx.setLineWidth(1.25)
-        ctx.setLineDash(phase: 0, lengths: [5, 4])
+        ctx.setLineWidth(metrics.outlineStrokeWidth)
+        ctx.setLineDash(phase: 0, lengths: metrics.outlineDashLengths)
         ctx.move(to: arrow.startPoint)
         if let controlPoint = arrow.controlPoint {
             ctx.addQuadCurve(to: arrow.endPoint, control: controlPoint)
@@ -1243,27 +1301,44 @@ final class AnnotationCanvas: NSView {
         ctx.strokePath()
         ctx.setLineDash(phase: 0, lengths: [])
 
-        drawRoundHandle(at: arrow.handlePoint(.start), radius: 6.5, fill: .white, stroke: accent, ctx: ctx)
-        drawRoundHandle(at: arrow.handlePoint(.end), radius: 6.5, fill: .white, stroke: accent, ctx: ctx)
-        drawRoundHandle(at: arrow.handlePoint(.control), radius: 7.5, fill: accent, stroke: .white, ctx: ctx)
+        drawRoundHandle(at: arrow.handlePoint(.start), radius: metrics.endpointHandleRadius, fill: .white, stroke: accent, metrics: metrics, ctx: ctx)
+        drawRoundHandle(at: arrow.handlePoint(.end), radius: metrics.endpointHandleRadius, fill: .white, stroke: accent, metrics: metrics, ctx: ctx)
+        drawRoundHandle(at: arrow.handlePoint(.control), radius: metrics.controlHandleRadius, fill: accent, stroke: .white, metrics: metrics, ctx: ctx)
 
         ctx.restoreGState()
     }
 
-    private func drawRoundHandle(at point: CGPoint, radius: CGFloat, fill: NSColor, stroke: NSColor, ctx: CGContext) {
+    private func drawRoundHandle(
+        at point: CGPoint,
+        radius: CGFloat,
+        fill: NSColor,
+        stroke: NSColor,
+        metrics: AnnotationSelectionMetrics,
+        ctx: CGContext
+    ) {
         let rect = CGRect(x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2)
-        ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 3, color: NSColor.black.withAlphaComponent(0.22).cgColor)
+        ctx.setShadow(
+            offset: CGSize(width: 0, height: metrics.canvasPoints(for: 1)),
+            blur: metrics.canvasPoints(for: 3),
+            color: NSColor.black.withAlphaComponent(0.22).cgColor
+        )
         ctx.setFillColor(fill.cgColor)
         ctx.fillEllipse(in: rect)
         ctx.setShadow(offset: .zero, blur: 0)
         ctx.setStrokeColor(stroke.cgColor)
-        ctx.setLineWidth(1.5)
+        ctx.setLineWidth(metrics.handleStrokeWidth)
         ctx.strokeEllipse(in: rect)
     }
 
-    private func drawResizeHandle(at point: CGPoint, handle: ResizeHandle, accent: NSColor, ctx: CGContext) {
-        let radius: CGFloat = isCornerHandle(handle) ? 5.5 : 4.5
-        drawRoundHandle(at: point, radius: radius, fill: .white, stroke: accent, ctx: ctx)
+    private func drawResizeHandle(
+        at point: CGPoint,
+        handle: ResizeHandle,
+        metrics: AnnotationSelectionMetrics,
+        accent: NSColor,
+        ctx: CGContext
+    ) {
+        let radius = isCornerHandle(handle) ? metrics.cornerHandleRadius : metrics.edgeHandleRadius
+        drawRoundHandle(at: point, radius: radius, fill: .white, stroke: accent, metrics: metrics, ctx: ctx)
     }
 
     private func resizeHandleCenter(for rect: CGRect, handle: ResizeHandle) -> CGPoint {
@@ -1287,6 +1362,7 @@ final class AnnotationCanvas: NSView {
     }
 
     private func drawCropOverlay(_ crop: CGRect, ctx: CGContext) {
+        let metrics = selectionMetrics
         ctx.saveGState()
         // Dim everything outside the region.
         ctx.setFillColor(NSColor.black.withAlphaComponent(0.45).cgColor)
@@ -1302,13 +1378,13 @@ final class AnnotationCanvas: NSView {
 
         // Thin white border.
         ctx.setStrokeColor(NSColor.white.cgColor)
-        ctx.setLineWidth(1)
+        ctx.setLineWidth(metrics.canvasPoints(for: 1))
         ctx.stroke(crop)
 
         // Rule-of-thirds grid, once the region is big enough to read it.
         if crop.width > 32, crop.height > 32 {
             ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.35).cgColor)
-            ctx.setLineWidth(1)
+            ctx.setLineWidth(metrics.canvasPoints(for: 1))
             for i in 1...2 {
                 let x = crop.minX + crop.width * CGFloat(i) / 3
                 ctx.move(to: CGPoint(x: x, y: crop.minY))
@@ -1322,10 +1398,15 @@ final class AnnotationCanvas: NSView {
 
         // 8 resize handles: 4 corners + 4 edge midpoints.
         for handle in ResizeHandle.allCases {
-            let radius: CGFloat = isCornerHandle(handle) ? 5.5 : 4.5
-            drawRoundHandle(at: resizeHandleCenter(for: crop, handle: handle),
-                            radius: radius, fill: .white,
-                            stroke: NSColor.black.withAlphaComponent(0.35), ctx: ctx)
+            let radius = isCornerHandle(handle) ? metrics.cornerHandleRadius : metrics.edgeHandleRadius
+            drawRoundHandle(
+                at: resizeHandleCenter(for: crop, handle: handle),
+                radius: radius,
+                fill: .white,
+                stroke: NSColor.black.withAlphaComponent(0.35),
+                metrics: metrics,
+                ctx: ctx
+            )
         }
         ctx.restoreGState()
     }
@@ -1735,8 +1816,9 @@ final class AnnotationCanvas: NSView {
         }
         selectDragStart = point
         let currentRects = selectedObjects.map(\.bounds)
+        let padding = selectionMetrics.redrawPadding
         for rect in previousRects + currentRects {
-            setNeedsDisplay(rect.insetBy(dx: -12, dy: -12).intersection(bounds))
+            setNeedsDisplay(rect.insetBy(dx: -padding, dy: -padding).intersection(bounds))
         }
         if !activeGuides.isEmpty { setNeedsDisplay(bounds) }
     }
@@ -1971,12 +2053,13 @@ final class AnnotationCanvas: NSView {
     }
 
     private func editHandleHit(at point: CGPoint) -> (object: (any AnnotationObject)?, action: SelectDragAction)? {
+        let metrics = selectionMetrics
         for obj in selectedObjects.reversed() {
             if let arrow = obj as? ArrowAnnotation {
                 for handle in [ArrowHandle.control, .end, .start] {
                     let center = arrow.handlePoint(handle)
-                    let radius = handle == .control ? CGFloat(9) : CGFloat(8)
-                    if hit(point, center: center, radius: radius + 4) {
+                    let radius = handle == .control ? metrics.arrowControlHitRadius : metrics.arrowEndpointHitRadius
+                    if hit(point, center: center, radius: radius) {
                         return (arrow, .arrowHandle(arrow, handle))
                     }
                 }
@@ -1984,14 +2067,14 @@ final class AnnotationCanvas: NSView {
             }
 
             if let line = obj as? LineAnnotation {
-                if hit(point, center: line.startPoint, radius: 10) { return (line, .lineEndpoint(line, .start)) }
-                if hit(point, center: line.endPoint, radius: 10) { return (line, .lineEndpoint(line, .end)) }
+                if hit(point, center: line.startPoint, radius: metrics.resizeHitRadius) { return (line, .lineEndpoint(line, .start)) }
+                if hit(point, center: line.endPoint, radius: metrics.resizeHitRadius) { return (line, .lineEndpoint(line, .end)) }
                 continue
             }
 
             if let highlighter = obj as? HighlighterAnnotation {
-                if hit(point, center: highlighter.startPoint, radius: 10) { return (highlighter, .highlighterEndpoint(highlighter, .start)) }
-                if hit(point, center: highlighter.endPoint, radius: 10) { return (highlighter, .highlighterEndpoint(highlighter, .end)) }
+                if hit(point, center: highlighter.startPoint, radius: metrics.resizeHitRadius) { return (highlighter, .highlighterEndpoint(highlighter, .start)) }
+                if hit(point, center: highlighter.endPoint, radius: metrics.resizeHitRadius) { return (highlighter, .highlighterEndpoint(highlighter, .end)) }
                 continue
             }
 
@@ -2000,9 +2083,9 @@ final class AnnotationCanvas: NSView {
             // move grip via the regular selection path.
             if obj is TextHighlightAnnotation { continue }
 
-            let expanded = obj.bounds.insetBy(dx: -4, dy: -4)
+            let expanded = obj.bounds.insetBy(dx: -metrics.outlineInset, dy: -metrics.outlineInset)
             for handle in ResizeHandle.allCases {
-                if hit(point, center: resizeHandleCenter(for: expanded, handle: handle), radius: 10) {
+                if hit(point, center: resizeHandleCenter(for: expanded, handle: handle), radius: metrics.resizeHitRadius) {
                     return (obj, .resize(obj, handle))
                 }
             }
@@ -2023,7 +2106,7 @@ final class AnnotationCanvas: NSView {
     // instead of grabbing the bounding rect; for everything else the visible
     // interior (plus a few px of slop) is draggable.
     private func selectedObjectInterior(at point: CGPoint) -> (any AnnotationObject)? {
-        let slop: CGFloat = 4
+        let slop = selectionMetrics.bodyHitOutset
         for obj in selectedObjects.reversed() {
             switch obj {
             case is ArrowAnnotation, is LineAnnotation, is HighlighterAnnotation:
@@ -2690,6 +2773,7 @@ final class AnnotationCanvas: NSView {
 
     var canUndo: Bool { !undoSnapshots.isEmpty }
     var canRedo: Bool { !redoSnapshots.isEmpty }
+    var undoDepth: Int { undoSnapshots.count }
 
     private func currentSnapshot() -> EditorSnapshot {
         EditorSnapshot(
@@ -2926,6 +3010,9 @@ final class AnnotationCanvas: NSView {
     }
 
     private var currentMagnification: CGFloat { enclosingScrollView?.magnification ?? 1 }
+    private var selectionMetrics: AnnotationSelectionMetrics {
+        AnnotationSelectionMetrics(magnification: currentMagnification)
+    }
 
     /// ES7: current canvas magnification, for the bottom-bar zoom popup.
     var zoomLevel: CGFloat { currentMagnification }
@@ -3101,8 +3188,9 @@ final class AnnotationCanvas: NSView {
     }
 
     private func cropHandleHit(at point: CGPoint, crop: CGRect) -> ResizeHandle? {
+        let metrics = selectionMetrics
         for handle in ResizeHandle.allCases
-        where hit(point, center: resizeHandleCenter(for: crop, handle: handle), radius: 10) {
+        where hit(point, center: resizeHandleCenter(for: crop, handle: handle), radius: metrics.resizeHitRadius) {
             return handle
         }
         return nil

@@ -15,9 +15,8 @@ final class AnnotationWindowController: NSWindowController {
     private static let initialScreenEdgeInset: CGFloat = 24
 
     // Shared stage metrics: used both at init and on every relayout so the header,
-    // canvas, sidebar and bottom bar stay registered with one another. The header
-    // is now two bands (main tools + contextual properties); the toolbar owns the
-    // canonical height.
+    // canvas, sidebar and bottom bar stay registered with one another. The toolbar
+    // owns the canonical height of the single command band.
     private static let toolbarHeight: CGFloat = AnnotationToolbar.totalHeight
     private static let stageInset: CGFloat = 18
     /// ES4: height of the editor's bottom bar (zoom · Drag me · Share/Pin/Copy/Save).
@@ -49,6 +48,10 @@ final class AnnotationWindowController: NSWindowController {
     /// this flag rather than comparing against editorDefault.
     private var hasUserBackgroundEdit = false
     private var hasUserCropEdit = false
+    private var cleanUndoDepth = 0
+    private var hasUnsavedChanges: Bool {
+        canvas.undoDepth != cleanUndoDepth || hasUserBackgroundEdit || hasUserCropEdit
+    }
     // R1: distingue resize programático (auto-fit) de resize manual do usuário.
     private var isProgrammaticResize = false
     private var userManuallyResized = false
@@ -59,6 +62,7 @@ final class AnnotationWindowController: NSWindowController {
     // escolher "Fit". A janela é sempre do usuário (abertura + resize manual).
     private var fitMode = true
     private var sidebarWasVisibleBeforePreview = false
+    private var sidebarAnimationGeneration: UInt = 0
 
     // Strong references so controllers aren't deallocated while their window is open
     private static var openControllers: [AnnotationWindowController] = []
@@ -357,11 +361,11 @@ final class AnnotationWindowController: NSWindowController {
             self.toolbar.setBackplateActive(preset.backplate == .pill)
         }
         toolbar.onSaveAs          = { [weak self] in self?.saveAs() }
-        toolbar.onDone            = { [weak self] in self?.window?.performClose(nil) }
+        toolbar.onDone            = { [weak self] in self?.copyAndClose() }
         toolbar.onApplyCrop       = { [weak self] in self?.applyCrop() }
         toolbar.onCancelCrop      = { [weak self] in
             // Same path as Esc inside the crop tool: drop the staged region,
-            // restore the Save as/Done pair, stay on the crop tool.
+            // restore the delivery actions, stay on the crop tool.
             self?.canvas.cropRect = nil
             self?.canvas.setNeedsDisplay(self?.canvas.bounds ?? .zero)
             self?.toolbar.setCropApplyVisible(false)
@@ -421,7 +425,12 @@ final class AnnotationWindowController: NSWindowController {
         // resync the document when an undo/redo restores a different image/size
         // (crop and background changes), then refit the window to it.
         canvas.onUndoStateChanged = { [weak self] canUndo, canRedo in
-            self?.toolbar.setUndoRedoEnabled(canUndo: canUndo, canRedo: canRedo)
+            guard let self else { return }
+            self.toolbar.setUndoRedoEnabled(canUndo: canUndo, canRedo: canRedo)
+            if self.canvas.undoDepth == self.cleanUndoDepth {
+                self.hasUserBackgroundEdit = false
+                self.hasUserCropEdit = false
+            }
         }
         canvas.onDocumentRestored = { [weak self] in self?.syncDocumentFromCanvas() }
 
@@ -658,6 +667,7 @@ final class AnnotationWindowController: NSWindowController {
         }
         // Non-destructive edits also land in Capture History as their own entry.
         historyManager?.add(image: flat, rect: historyItem?.captureRect?.cgRect)
+        markCurrentDocumentClean()
         ToastWindow.show(message: Self.savedScreenshotMessage(for: url), duration: 3.0)
     }
 
@@ -695,6 +705,7 @@ final class AnnotationWindowController: NSWindowController {
             self.bringEditorToFront()
             guard case .saved(let url) = result else { return }
             self.historyManager?.add(image: flat, rect: self.historyItem?.captureRect?.cgRect)
+            self.markCurrentDocumentClean()
             ToastWindow.show(message: Self.savedScreenshotMessage(for: url), duration: 3.0)
         }
     }
@@ -711,6 +722,21 @@ final class AnnotationWindowController: NSWindowController {
         ImageExporter.copyToClipboard(image: flat)
         SoundManager.play(.copy)
         ToastWindow.show(message: "Copied to clipboard")
+    }
+
+    /// The primary completion action has concrete delivery semantics. It copies
+    /// exactly what Preview shows, records that state as handled, then closes
+    /// without presenting a contradictory unsaved-changes alert.
+    private func copyAndClose() {
+        copyToClipboard()
+        markCurrentDocumentClean()
+        window?.performClose(nil)
+    }
+
+    private func markCurrentDocumentClean() {
+        cleanUndoDepth = canvas.undoDepth
+        hasUserBackgroundEdit = false
+        hasUserCropEdit = false
     }
 
     /// ES4: Share from the bottom-bar cluster. Prefers a real file URL (AirDrop/
@@ -765,6 +791,8 @@ final class AnnotationWindowController: NSWindowController {
 
     private func toggleBackgroundSidebar() {
         guard let sidebar = backgroundSidebar, let window else { return }
+        sidebarAnimationGeneration &+= 1
+        let animationGeneration = sidebarAnimationGeneration
         let showing = !sidebarVisible
         sidebarVisible = showing
 
@@ -814,13 +842,13 @@ final class AnnotationWindowController: NSWindowController {
             chromeBackdrop?.update(leftArmWidth: 0, bottomArmHeight: Self.bottomBarHeight, topArmHeight: Self.toolbarHeight)
         }
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.24
+            ctx.duration = Motion.reduced ? 0 : Motion.Duration.standard
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             ctx.allowsImplicitAnimation = true
             layoutStage(sidebarVisible: showing, animated: true)
         }, completionHandler: { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.sidebarAnimationGeneration == animationGeneration else { return }
                 if !showing { self.backgroundSidebar?.isHidden = true }
                 if showing {
                     self.chromeBackdrop?.update(leftArmWidth: Self.sidebarWidth,
@@ -1149,11 +1177,11 @@ extension AnnotationWindowController: NSWindowDelegate {
         // A user background/template change is a real exportable edit even with no
         // annotations, so a styled-then-undrawn editor still warns. The auto-applied
         // default template does NOT count (hasUserBackgroundEdit stays false).
-        guard !canvas.objects.isEmpty || hasUserBackgroundEdit || hasUserCropEdit else { return true }
+        guard hasUnsavedChanges else { return true }
         let alert = NSAlert()
-        alert.messageText = "Unsaved Annotations"
-        alert.informativeText = "You have annotations that haven't been saved. Close without saving?"
-        alert.addButton(withTitle: "Close")
+        alert.messageText = "Unsaved Changes"
+        alert.informativeText = "This screenshot has changes that have not been saved or copied. Close anyway?"
+        alert.addButton(withTitle: "Close Anyway")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
         return alert.runModal() == .alertFirstButtonReturn
@@ -1383,21 +1411,16 @@ final class EditorKeyWindow: NSWindow {
 @MainActor
 final class AnnotationToolbar: NSView {
 
-    // Conservative window-width floor before the live `fittingWidth` exists at
-    // init time. The two-band header is far leaner per band than the old single
-    // row (color + context controls moved to the properties band), so the editor
-    // window can now get much narrower.
-    static let requiredWidth: CGFloat = 840
+    // Conservative floor before the live fitting width exists. The editor uses
+    // one command band, with related tools grouped behind native menus and the
+    // active tool's properties inline.
+    static let requiredWidth: CGFloat = 960
     /// Main band: tools and window actions. 52pt so the system-centered traffic
     /// lights (unified toolbar style) sit on the same vertical ruler as the
     /// controls, no frame hacks on the standard window buttons.
     static let mainBarHeight: CGFloat = 52
-    /// Contextual properties band under the main band (the Snapzy/CleanShot
-    /// pattern): shows ONLY the active tool's options, so each band stays light
-    /// and the window minimum stays small.
-    static let propertiesBarHeight: CGFloat = 48
-    /// Total chrome height the controller reserves for the header.
-    static let totalHeight: CGFloat = mainBarHeight + propertiesBarHeight
+    /// Total chrome height the controller reserves for the single command band.
+    static let totalHeight: CGFloat = mainBarHeight
 
     /// Leading inset of the main band, large enough to clear the traffic lights
     /// so the first action group never slides under the close button (R6).
@@ -1423,7 +1446,7 @@ final class AnnotationToolbar: NSView {
     /// The preset to ring as active when the style popover opens. Read at present
     /// time so the popover reflects the current text (or the active default).
     var currentStylePreset: TextStylePreset = .regular
-    /// Top toolbar carries only "Save as…" and the primary "Done" (close). Copy /
+    /// Top toolbar carries "Save as…" and the primary "Copy & Close". Copy /
     /// Pin / Share / quick Save live in the bottom bar (ES4), so those closures are
     /// gone from here, one place per action.
     var onSaveAs: (() -> Void)?
@@ -1439,11 +1462,10 @@ final class AnnotationToolbar: NSView {
     /// content and stage a redaction preview).
     var onSmartRedact: (() -> Void)?
 
-    /// Every tool is its own flat button in the strip (the CleanShot pattern):
-    /// bare glyph when inactive, a monochrome rounded pad behind the SELECTED one.
-    /// Selection is exclusive across the whole strip, so selectTool lights one
-    /// button and clears the rest; this registry holds every tool button.
+    /// Direct tools stay one click away. Related shape, drawing and privacy tools
+    /// live in three native menus so the image remains the visual priority.
     private var toolButtons: [AnnotationTool: FlatToolButton] = [:]
+    private var toolFamilyButtons: [ToolFamilyButton] = []
     private var selectedTool: AnnotationTool = .arrow
     private var colorWell: ColorWellButton?
     private var colorPopover: NSPopover?
@@ -1467,12 +1489,11 @@ final class AnnotationToolbar: NSView {
     private var stylePopover: NSPopover?
     private var currentBackplate: TextBackplate = .none
     private var backgroundOptions = ScreenshotBackgroundOptions.editorDefault
-    /// The main band's horizontal flow (tools + actions). The properties band
-    /// below it has its own stack; fittingWidth takes the wider of the two.
+    /// Horizontal flow for canvas commands, tools, contextual properties and
+    /// delivery actions.
     private var rootStack: NSStackView?
     private var propertiesStack: NSStackView?
-    private var toolChipIcon: NSImageView?
-    private var toolChipLabel: NSTextField?
+    private var propertiesDivider: NSView?
     private var contextWidthRow: NSView?
     private var contextFontRow: NSView?
     private var secureBlurButton: NSButton?
@@ -1496,15 +1517,9 @@ final class AnnotationToolbar: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     private func buildUI() {
-        // ES3: in the editor the header is the TOP ARM of the continuous chrome
-        // frame (EditorChromeBackdrop provides the material). Two bands, the
-        // Snapzy/CleanShot hierarchy:
-        //   main band (52): canvas group | tool strip | flexible gap | Save as/Done
-        //   properties band (48): the ACTIVE tool's options only
-        // Splitting the old single 76pt row in two is what makes the header truly
-        // responsive: the main band ends in a flexible gap (it absorbs narrowing
-        // instead of forcing the window wider), and the properties band only ever
-        // holds one tool's controls.
+        // The header is the top arm of the continuous editor chrome. One 52pt
+        // command band keeps the stage dominant: canvas commands, grouped tools,
+        // the active tool's compact properties, then delivery actions.
         wantsLayer = true
 
         let main = NSStackView()
@@ -1533,15 +1548,17 @@ final class AnnotationToolbar: NSView {
         main.addArrangedSubview(leadingDivider)
         headerDivider = leadingDivider
 
-        // Tool strip: one flat button per tool (bare glyph when inactive, a mono
-        // pad behind the selected one), in the CleanShot order.
-        let strip = makeToolStrip([
-            .select, .rectangle, .filledRectangle, .ellipse, .line, .arrow,
-            .text, .pixelate, .blur, .numberedStep, .freehand, .highlighter,
-            .eyedropper,
-        ])
+        let strip = makeIntentToolStrip()
         main.addArrangedSubview(strip)
         toolStripView = strip
+
+        let contextDivider = makeHeaderDivider()
+        main.addArrangedSubview(contextDivider)
+        propertiesDivider = contextDivider
+
+        let properties = makePropertiesControls()
+        main.addArrangedSubview(properties)
+        propertiesStack = properties
 
         // Flexible gap: this is the band's shock absorber. It has no minimum
         // beyond a hair of breathing room and zero hugging, so the band tracks
@@ -1553,14 +1570,14 @@ final class AnnotationToolbar: NSView {
         gap.widthAnchor.constraint(greaterThanOrEqualToConstant: 8).isActive = true
         main.addArrangedSubview(gap)
 
-        // Window actions on the right: Save as… + the primary Done (native
+        // Window actions on the right: Save as… + Copy & Close (native
         // bezels, coral on the emphasized action). Copy/Pin/Share live ONCE in
         // the bottom bar. While a crop region is staged the pair swaps for
         // Cancel/Apply (the Snapzy/CleanShot contextual action slot).
         let saveBtn = makeActionButton(title: "Save as\u{2026}", action: #selector(saveAsTapped))
         main.addArrangedSubview(saveBtn)
         saveAsButton = saveBtn
-        let doneBtn = makeActionButton(title: "Done", action: #selector(doneTapped), isPrimary: true)
+        let doneBtn = makeActionButton(title: "Copy & Close", action: #selector(doneTapped), isPrimary: true)
         main.addArrangedSubview(doneBtn)
         doneButton = doneBtn
 
@@ -1585,22 +1602,15 @@ final class AnnotationToolbar: NSView {
             dissolve.heightAnchor.constraint(equalToConstant: 8),
         ])
 
-        // Properties band: tool chip + color + the active tool's controls.
-        buildPropertiesBar()
-
         selectTool(.arrow)
     }
 
-    /// Width the header needs to fit its content, used by the controller to size
-    /// the window (ensureWindowFitsToolbar). The wider of the two bands wins;
-    /// the flexible gap contributes only its 8pt minimum to the main band.
+    /// Width the command band needs to fit its visible controls. The flexible
+    /// gap contributes only its minimum and absorbs wider windows.
     var fittingWidth: CGFloat {
         rootStack?.layoutSubtreeIfNeeded()
-        propertiesStack?.layoutSubtreeIfNeeded()
         let mainContent = rootStack?.fittingSize.width ?? Self.requiredWidth
-        let propsContent = propertiesStack?.fittingSize.width ?? 0
-        return max(Self.leadingInset + mainContent + Self.trailingInset,
-                   16 + propsContent + Self.trailingInset)
+        return max(Self.requiredWidth, Self.leadingInset + mainContent + Self.trailingInset)
     }
 
     /// A 1x20 vertical separator for the main band's group splits.
@@ -1614,41 +1624,15 @@ final class AnnotationToolbar: NSView {
         return divider
     }
 
-    /// Builds the contextual properties band: a chip naming the active tool, the
-    /// color well, then the stroke-size or font controls, only what the active
-    /// tool actually uses, in one light always-fitting row.
-    private func buildPropertiesBar() {
+    /// Builds the compact properties island inserted in the command band. It is
+    /// removed entirely for tools with no configurable property.
+    private func makePropertiesControls() -> NSStackView {
         let props = NSStackView()
         props.orientation = .horizontal
         props.alignment = .centerY
-        props.spacing = 12
+        props.spacing = 8
         props.detachesHiddenViews = true
         props.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(props)
-        NSLayoutConstraint.activate([
-            props.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-            props.topAnchor.constraint(equalTo: topAnchor, constant: Self.mainBarHeight + 1),
-            props.heightAnchor.constraint(equalToConstant: Self.propertiesBarHeight - 1),
-            props.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -Self.trailingInset),
-        ])
-        propertiesStack = props
-
-        // Tool chip: icon + name of the active tool (the Snapzy context chip),
-        // so the band always says what it is configuring.
-        let chipIcon = NSImageView()
-        chipIcon.contentTintColor = .secondaryLabelColor
-        chipIcon.translatesAutoresizingMaskIntoConstraints = false
-        toolChipIcon = chipIcon
-        let chipLabel = NSTextField(labelWithString: "")
-        chipLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        chipLabel.textColor = .secondaryLabelColor
-        toolChipLabel = chipLabel
-        let chip = NSStackView(views: [chipIcon, chipLabel])
-        chip.orientation = .horizontal
-        chip.alignment = .centerY
-        chip.spacing = 5
-        props.addArrangedSubview(chip)
-        props.addArrangedSubview(makeHeaderDivider())
 
         // Color well: the CleanShot closed swatch + chevron, opens the embedded
         // ColorPickerPanel popover.
@@ -1664,6 +1648,7 @@ final class AnnotationToolbar: NSView {
         let (widthRow, fontRow) = makeContextRows()
         props.addArrangedSubview(widthRow)
         props.addArrangedSubview(fontRow)
+        return props
     }
 
     /// Appends the canvas group (crop, backgrounds toggle, smart redact) as the
@@ -1691,6 +1676,7 @@ final class AnnotationToolbar: NSView {
         // drives the fill.
         let backgroundBtn = makeChromeToggleButton(symbol: "photo.on.rectangle", action: #selector(backgroundTapped(_:)))
         backgroundBtn.toolTip = "Background"
+        backgroundBtn.setAccessibilityLabel("Background")
         group.addArrangedSubview(backgroundBtn)
         backgroundButton = backgroundBtn
 
@@ -1699,6 +1685,7 @@ final class AnnotationToolbar: NSView {
         // overlays the glyph while the local detection pass runs.
         let redactBtn = makeChromeToggleButton(symbol: "eye.slash", action: #selector(smartRedactTapped(_:)))
         redactBtn.toolTip = "Smart redact (auto-detect sensitive content)"
+        redactBtn.setAccessibilityLabel("Smart redact")
         group.addArrangedSubview(redactBtn)
         smartRedactButton = redactBtn
 
@@ -1720,22 +1707,51 @@ final class AnnotationToolbar: NSView {
         canvasGroup = group
     }
 
-    /// Builds the flat tool strip: one `FlatToolButton` per tool, tightly and
-    /// uniformly spaced, no bezel when inactive and a monochrome pad behind the
-    /// selected one (the CleanShot strip). Each button is registered in
-    /// `toolButtons`, and selection stays exclusive across the whole strip via
-    /// selectTool, which lights one and clears the rest.
-    private func makeToolStrip(_ tools: [AnnotationTool]) -> NSStackView {
+    /// Common tasks remain direct. Less frequent variants are grouped by intent,
+    /// but keyboard shortcuts continue to select every tool immediately.
+    private func makeIntentToolStrip() -> NSStackView {
         let strip = NSStackView()
         strip.orientation = .horizontal
         strip.alignment = .centerY
         strip.spacing = 4
         strip.translatesAutoresizingMaskIntoConstraints = false
-        for tool in tools {
-            let button = makeFlatToolButton(tool)
-            strip.addArrangedSubview(button)
-        }
+
+        strip.addArrangedSubview(makeFlatToolButton(.select))
+        strip.addArrangedSubview(makeFlatToolButton(.arrow))
+        strip.addArrangedSubview(makeToolFamilyButton(
+            symbol: "square.on.circle",
+            label: "Shapes",
+            tools: [.rectangle, .filledRectangle, .ellipse, .line]
+        ))
+        strip.addArrangedSubview(makeToolFamilyButton(
+            symbol: "pencil.and.outline",
+            label: "Draw",
+            tools: [.freehand, .highlighter]
+        ))
+        strip.addArrangedSubview(makeFlatToolButton(.text))
+        strip.addArrangedSubview(makeFlatToolButton(.numberedStep))
+        strip.addArrangedSubview(makeToolFamilyButton(
+            symbol: "eye.slash",
+            label: "Privacy",
+            tools: [.blur, .pixelate]
+        ))
+        strip.addArrangedSubview(makeFlatToolButton(.eyedropper))
         return strip
+    }
+
+    private func makeToolFamilyButton(
+        symbol: String,
+        label: String,
+        tools: [AnnotationTool]
+    ) -> ToolFamilyButton {
+        let button = ToolFamilyButton(symbol: symbol, label: label, tools: tools)
+        button.onSelect = { [weak self] tool in
+            guard let self else { return }
+            self.selectTool(tool)
+            self.onToolChanged?(tool)
+        }
+        toolFamilyButtons.append(button)
+        return button
     }
 
     /// A flat tool button for the strip (bare glyph, mono pad when selected).
@@ -1756,7 +1772,7 @@ final class AnnotationToolbar: NSView {
         return button
     }
 
-    /// Builds the stroke-size row and the font row for the properties band.
+    /// Builds the stroke-size row and the font row for inline properties.
     /// They sit side by side as arranged views; selectTool toggles visibility
     /// and the band's detachesHiddenViews collapses the hidden one. No fixed
     /// width container anymore: the band has the whole window width to itself.
@@ -1794,7 +1810,7 @@ final class AnnotationToolbar: NSView {
         let strength = NSSlider(value: blurRadius, minValue: 4, maxValue: 40, target: self, action: #selector(redactStrengthChanged))
         strength.trackFillColor = KritColors.accent
         strength.isHidden = true
-        strength.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        strength.widthAnchor.constraint(equalToConstant: 104).isActive = true
         strengthSlider = strength
 
         let widthRow = NSStackView(views: [label, slider, strengthCaption, strength, secureBtn])
@@ -1802,7 +1818,7 @@ final class AnnotationToolbar: NSView {
         widthRow.alignment = .centerY
         widthRow.spacing = 8
         widthRow.translatesAutoresizingMaskIntoConstraints = false
-        slider.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        slider.widthAnchor.constraint(equalToConstant: 104).isActive = true
 
         // Font controls (text tool).
         let familyPopup = NSPopUpButton()
@@ -1811,7 +1827,7 @@ final class AnnotationToolbar: NSView {
         familyPopup.target = self
         familyPopup.action = #selector(fontFamilyChanged(_:))
         familyPopup.translatesAutoresizingMaskIntoConstraints = false
-        familyPopup.widthAnchor.constraint(equalToConstant: 88).isActive = true
+        familyPopup.widthAnchor.constraint(equalToConstant: 80).isActive = true
         fontFamilyPopup = familyPopup
 
         let sizeField = NSTextField(labelWithString: "24")
@@ -1923,38 +1939,38 @@ final class AnnotationToolbar: NSView {
 
     private func selectTool(_ tool: AnnotationTool) {
         let isText = tool == .text
-        contextWidthRow?.isHidden = isText
+        let isRedact = tool == .blur || tool == .pixelate
+        let usesStroke = [
+            AnnotationTool.arrow, .rectangle, .filledRectangle, .ellipse,
+            .line, .freehand, .highlighter,
+        ].contains(tool)
+        let usesColor = usesStroke || isText || tool == .numberedStep
+        let hasProperties = usesColor || isRedact
+
+        propertiesStack?.isHidden = !hasProperties
+        propertiesDivider?.isHidden = !hasProperties
+        colorWell?.isHidden = !usesColor
+        contextWidthRow?.isHidden = !(usesStroke || isRedact)
         contextFontRow?.isHidden = !isText
-        // The secure toggle only makes sense for the blur tool; the width slider
-        // is shared with the other drawing tools.
         secureBlurButton?.isHidden = (tool != .blur)
-        // Blur/pixelate have no stroke width: swap the shared Size slider for a
-        // Strength slider driving the redaction radius (blur) / block size
-        // (pixelate). The stack collapses whichever pair is hidden.
-        let isRedact = (tool == .blur || tool == .pixelate)
-        widthLabel?.isHidden = isRedact
-        widthSlider?.isHidden = isRedact
+        widthLabel?.isHidden = !usesStroke
+        widthSlider?.isHidden = !usesStroke
         strengthLabel?.isHidden = !isRedact
         strengthSlider?.isHidden = !isRedact
         if isRedact {
             strengthSlider?.doubleValue = (tool == .pixelate) ? pixelateScale : blurRadius
         }
-        // Properties band chip: name the tool the band is configuring.
-        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
-        toolChipIcon?.image = NSImage(systemSymbolName: tool.icon, accessibilityDescription: nil)?
-            .withSymbolConfiguration(config)
-        toolChipLabel?.stringValue = String(tool.tooltip.split(separator: "(").first ?? "")
-            .trimmingCharacters(in: .whitespaces)
         selectedTool = tool
-        // Exclusive selection across the whole strip (and the bordered crop in the
-        // canvas group): light the active tool's button, clear every other one.
         for (candidate, button) in toolButtons {
             button.isSelectedTool = (candidate == tool)
         }
+        for button in toolFamilyButtons {
+            button.setSelectedTool(tool)
+        }
     }
 
-    /// Preview mode (the Snapzy editor-mode toggle): hides every editing
-    /// control in both bands, keeping only Save as/Done, so the header reads
+    /// Preview mode hides every editing control, keeping only delivery actions,
+    /// so the header reads
     /// as plain chrome while the user inspects the final result.
     func setPreviewMode(_ on: Bool) {
         Motion.animate(0.15) { context in
@@ -1963,10 +1979,12 @@ final class AnnotationToolbar: NSView {
             headerDivider?.animator().isHidden = on
             toolStripView?.animator().isHidden = on
             propertiesStack?.animator().isHidden = on
+            propertiesDivider?.animator().isHidden = on
         }
+        if !on { selectTool(selectedTool) }
     }
 
-    /// Contextual action slot: while a crop region is staged, Save as/Done fade
+    /// Contextual action slot: while a crop region is staged, delivery actions fade
     /// out and Cancel/Apply fade in (NSStackView collapses the hidden pair).
     func setCropApplyVisible(_ visible: Bool) {
         Motion.animate(0.15) { context in
@@ -2191,7 +2209,12 @@ final class FlatToolButton: EditorChromeButton {
     /// Draw a chrome pad even when not selected (canvas-group crop). The flat
     /// strip tools leave this false, so they show only the bare glyph.
     var isBorderedTool = false { didSet { needsDisplay = true } }
-    var isSelectedTool = false { didSet { needsDisplay = true } }
+    var isSelectedTool = false {
+        didSet {
+            setAccessibilityValue(isSelectedTool ? "Selected" : "Not selected")
+            needsDisplay = true
+        }
+    }
 
     private let glyph: NSImage?
 
@@ -2208,6 +2231,10 @@ final class FlatToolButton: EditorChromeButton {
         imagePosition = .imageOnly
         toolTip = tool.tooltip
         wantsLayer = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(tool.tooltip)
+        setAccessibilityValue("Not selected")
         translatesAutoresizingMaskIntoConstraints = false
         // 28x28 flat hit target, the CleanShot strip footprint.
         widthAnchor.constraint(equalToConstant: 28).isActive = true
@@ -2252,6 +2279,114 @@ final class FlatToolButton: EditorChromeButton {
     }
 }
 
+/// A compact native menu for a family of related tools. The active member is
+/// reflected in the glyph and selection pad, while every member keeps its own
+/// keyboard shortcut through the canvas command path.
+@MainActor
+final class ToolFamilyButton: EditorChromeButton {
+    let tools: [AnnotationTool]
+    var onSelect: ((AnnotationTool) -> Void)?
+
+    private let fallbackSymbol: String
+    private let familyLabel: String
+    private var selectedTool: AnnotationTool?
+    private var isActiveFamily = false
+
+    init(symbol: String, label: String, tools: [AnnotationTool]) {
+        fallbackSymbol = symbol
+        familyLabel = label
+        self.tools = tools
+        super.init(frame: .zero)
+        target = self
+        action = #selector(presentToolMenu)
+        title = ""
+        isBordered = false
+        imagePosition = .imageOnly
+        toolTip = "\(label) tools"
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 34).isActive = true
+        heightAnchor.constraint(equalToConstant: 28).isActive = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("\(label) tools")
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setSelectedTool(_ tool: AnnotationTool) {
+        let member = tools.contains(tool)
+        isActiveFamily = member
+        if member { selectedTool = tool }
+        setAccessibilityValue(member ? "Selected, \(toolName(tool))" : familyLabel)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let selected = isActiveFamily
+        let pad = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: pad, xRadius: 6, yRadius: 6)
+        if selected {
+            KritColors.toolSelectedFill.setFill()
+            path.fill()
+        } else if isPointerPressed || isPointerInside {
+            (isPointerPressed ? KritColors.editorToolPressedFill : KritColors.editorToolHoverFill).setFill()
+            path.fill()
+        }
+
+        let symbol = selectedTool?.icon ?? fallbackSymbol
+        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+        if let glyph = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) {
+            let tint = selected ? KritColors.toolSelectedGlyph : KritColors.toolInactiveGlyph
+            let tinted = glyph.tinted(with: tint)
+            let origin = NSPoint(x: 5, y: bounds.midY - tinted.size.height / 2)
+            tinted.draw(at: origin, from: .zero, operation: .sourceOver, fraction: 1)
+        }
+
+        let chevronConfig = NSImage.SymbolConfiguration(pointSize: 7, weight: .semibold)
+        if let chevron = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
+            .withSymbolConfiguration(chevronConfig) {
+            let tint = selected ? KritColors.toolSelectedGlyph : KritColors.toolInactiveGlyph
+            let tinted = chevron.tinted(with: tint.withAlphaComponent(0.72))
+            tinted.draw(
+                at: NSPoint(x: bounds.maxX - tinted.size.width - 3, y: bounds.midY - tinted.size.height / 2),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1
+            )
+        }
+    }
+
+    @objc private func presentToolMenu() {
+        let menu = NSMenu(title: familyLabel)
+        menu.autoenablesItems = false
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        for tool in tools {
+            let item = NSMenuItem(title: toolName(tool), action: #selector(toolMenuItemSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = tool.rawValue
+            item.state = selectedTool == tool ? .on : .off
+            item.image = NSImage(systemSymbolName: tool.icon, accessibilityDescription: nil)?
+                .withSymbolConfiguration(config)
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.minY - 2), in: self)
+    }
+
+    @objc private func toolMenuItemSelected(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let tool = AnnotationTool(rawValue: rawValue) else { return }
+        selectedTool = tool
+        onSelect?(tool)
+    }
+
+    private func toolName(_ tool: AnnotationTool) -> String {
+        String(tool.tooltip.split(separator: "(").first ?? "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+}
+
 // MARK: - Chrome toggle button (canvas group)
 
 /// A bordered toggle in the canvas group (background panel, smart redact). It
@@ -2260,7 +2395,12 @@ final class FlatToolButton: EditorChromeButton {
 /// the active state is a real fill, not just a tint over a native bezel.
 @MainActor
 final class ChromeToggleButton: EditorChromeButton {
-    var isActive = false { didSet { needsDisplay = true } }
+    var isActive = false {
+        didSet {
+            setAccessibilityValue(isActive ? "On" : "Off")
+            needsDisplay = true
+        }
+    }
     /// Hides the glyph while the redact spinner overlays it.
     var hidesGlyph = false { didSet { needsDisplay = true } }
 
@@ -2277,6 +2417,9 @@ final class ChromeToggleButton: EditorChromeButton {
         isBordered = false
         imagePosition = .imageOnly
         wantsLayer = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityValue("Off")
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -2556,7 +2699,7 @@ final class EditorBottomBar: NSView {
 /// material, not floating over the content stage. Glass over material is
 /// forbidden, so it keeps a flat fill that matches the other footer controls.
 @MainActor
-private final class BottomBarDragPill: NSView, NSDraggingSource {
+final class BottomBarDragPill: NSView, NSDraggingSource {
 
     var imageProvider: (() -> NSImage?)?
     /// Fired when a drag-out lands on a real drop target (operation != []).
@@ -2570,6 +2713,8 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
 
     static let fullWidth: CGFloat = 116
     static let compactWidth: CGFloat = 36
+    static let dragThreshold: CGFloat = 4
+    static let previewMaxSize = NSSize(width: 120, height: 120)
 
     func setMode(_ newMode: PillMode) {
         guard newMode != mode else { return }
@@ -2589,6 +2734,33 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
 
     override var mouseDownCanMoveWindow: Bool { false }
 
+    private var enlargedHitBounds: NSRect {
+        bounds.insetBy(dx: -6, dy: -8)
+    }
+
+    static func exceedsDragThreshold(from origin: NSPoint, to current: NSPoint, threshold: CGFloat? = nil) -> Bool {
+        let threshold = threshold ?? dragThreshold
+        return hypot(current.x - origin.x, current.y - origin.y) >= threshold
+    }
+
+    static func previewSize(for imageSize: NSSize, maxSize: NSSize? = nil) -> NSSize {
+        let maxSize = maxSize ?? previewMaxSize
+        guard imageSize.width > 0, imageSize.height > 0, maxSize.width > 0, maxSize.height > 0 else {
+            return maxSize
+        }
+        let scale = min(maxSize.width / imageSize.width, maxSize.height / imageSize.height)
+        return NSSize(width: imageSize.width * scale, height: imageSize.height * scale)
+    }
+
+    static func draggingFrame(centeredAt point: NSPoint, previewSize: NSSize) -> NSRect {
+        NSRect(
+            x: point.x - previewSize.width / 2,
+            y: point.y - previewSize.height / 2,
+            width: previewSize.width,
+            height: previewSize.height
+        )
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -2601,6 +2773,10 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
         widthConstraint = width
         heightAnchor.constraint(equalToConstant: 22).isActive = true
         toolTip = "Drag the edited image out"
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Drag edited image")
+        setAccessibilityHelp("Drag this control to another app or Finder")
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -2608,13 +2784,25 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseEnteredAndExited], owner: self)
+        let area = NSTrackingArea(rect: enlargedHitBounds, options: [.activeAlways, .mouseEnteredAndExited], owner: self)
         addTrackingArea(area)
         trackingArea = area
     }
 
     override func mouseEntered(with event: NSEvent) { hovering = true }
     override func mouseExited(with event: NSEvent) { hovering = false }
+
+    override func resetCursorRects() {
+        discardCursorRects()
+        addCursorRect(bounds, cursor: pressed ? .closedHand : .openHand)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, enlargedHitBounds.contains(point) else { return nil }
+        return self
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         // 6pt corner matches the native rounded button bezel beside it; the fill
@@ -2668,15 +2856,20 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
 
     override func mouseDown(with event: NSEvent) {
         pressed = true
+        NSCursor.closedHand.set()
+        window?.invalidateCursorRects(for: self)
         dragOrigin = event.locationInWindow
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let origin = dragOrigin, let dragImg = imageProvider?() else { return }
+        guard let origin = dragOrigin else { return }
         let current = event.locationInWindow
-        guard abs(current.x - origin.x) > 3 || abs(current.y - origin.y) > 3 else { return }
+        guard Self.exceedsDragThreshold(from: origin, to: current) else { return }
         dragOrigin = nil
         pressed = false
+        window?.invalidateCursorRects(for: self)
+
+        guard let dragImg = imageProvider?() else { return }
 
         guard let export = ImageExporter.encodedForExport(dragImg),
               let fileURL = DragFileVault.makeFile(data: export.data, ext: export.ext) else { return }
@@ -2685,7 +2878,8 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
         // The drag preview reads as a file card, not a raw bitmap: rounded
         // corners and a hairline keep a dark screenshot from looking like a
         // broken black rectangle while it rides the cursor.
-        let preview = NSImage(size: NSSize(width: 120, height: 120 * (dragImg.size.height / max(dragImg.size.width, 1))))
+        let previewSize = Self.previewSize(for: dragImg.size)
+        let preview = NSImage(size: previewSize)
         preview.lockFocus()
         let previewRect = NSRect(origin: .zero, size: preview.size)
         let previewClip = NSBezierPath(roundedRect: previewRect.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
@@ -2696,11 +2890,13 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
         previewClip.stroke()
         preview.unlockFocus()
 
+        let localDragPoint = convert(event.locationInWindow, from: nil)
+        let draggingFrame = Self.draggingFrame(centeredAt: localDragPoint, previewSize: preview.size)
         let fileItem = NSDraggingItem(pasteboardWriter: fileURL as NSURL)
-        fileItem.setDraggingFrame(bounds, contents: preview)
+        fileItem.setDraggingFrame(draggingFrame, contents: preview)
         let promise = NSFilePromiseProvider(fileType: export.uti, delegate: BottomBarFilePromiseDelegate(image: dragImg))
         let promiseItem = NSDraggingItem(pasteboardWriter: promise)
-        promiseItem.setDraggingFrame(bounds, contents: preview)
+        promiseItem.setDraggingFrame(draggingFrame, contents: preview)
 
         beginDraggingSession(with: [fileItem, promiseItem], event: event, source: self)
     }
@@ -2708,6 +2904,7 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
     override func mouseUp(with event: NSEvent) {
         dragOrigin = nil
         pressed = false
+        window?.invalidateCursorRects(for: self)
     }
 
     nonisolated func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
@@ -2769,9 +2966,8 @@ private final class BottomBarFilePromiseDelegate: NSObject, NSFilePromiseProvide
 extension AnnotationWindowController {
     static var uiTestLastController: AnnotationWindowController? { openControllers.last }
     var uiTestCanvas: AnnotationCanvas { canvas }
-    var uiTestHasUnsavedChanges: Bool {
-        !canvas.objects.isEmpty || hasUserBackgroundEdit || hasUserCropEdit
-    }
+    var uiTestHasUnsavedChanges: Bool { hasUnsavedChanges }
+    func uiTestMarkCurrentDocumentClean() { markCurrentDocumentClean() }
     /// Nova verdade (fit-to-stage): o canvas, NA ESCALA ATUAL, cabe dentro do
     /// palco visível (o viewport do scroll view), tolerância 2pt. A janela não
     /// acompanha mais o canvas; é o canvas que re-escala pra caber. Em modo fit a

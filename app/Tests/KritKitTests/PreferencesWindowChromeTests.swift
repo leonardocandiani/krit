@@ -29,8 +29,21 @@ final class PreferencesWindowChromeTests: XCTestCase {
         }
     }
 
+    func testWindowUsesFocusedSettingsDimensions() throws {
+        try withPreferencesWindow { controller, window in
+            let contentSize = try XCTUnwrap(window.contentView?.frame.size)
+
+            XCTAssertEqual(contentSize.width, 860, accuracy: 0.5)
+            XCTAssertEqual(contentSize.height, 620, accuracy: 0.5)
+            XCTAssertEqual(window.contentMinSize.width, 760, accuracy: 0.5)
+            XCTAssertEqual(window.contentMinSize.height, 540, accuracy: 0.5)
+            XCTAssertEqual(controller.uiTestSidebarWidth, 196, accuracy: 0.5)
+            XCTAssertEqual(PreferencesContent.formMaxWidth, 640, accuracy: 0.5)
+        }
+    }
+
     func testSidebarHasNoStaticBrandLabelAndKeepsSourceListAccessible() {
-        let sidebar = NativePreferencesSidebar(width: 220, height: 680) { _ in }
+        let sidebar = NativePreferencesSidebar(width: 196, height: 620) { _ in }
         let labels = descendants(of: sidebar.view, as: NSTextField.self)
         let sourceLists = descendants(of: sidebar.view, as: NSTableView.self)
 

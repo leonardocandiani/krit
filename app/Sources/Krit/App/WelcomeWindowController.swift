@@ -18,6 +18,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     private var pageIndex = 0
     private var pageContainer: NSView!
     private var dotLayers: [CALayer] = []
+    private var pageIndicator: NSView!
     private var backButton: NSButton!
     private var continueButton: NSButton!
     private var skipButton: NSButton!
@@ -33,9 +34,12 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     private let cardHeight: CGFloat = 470
     private let footerHeight: CGFloat = 64
 
-    private var reduceMotion: Bool {
-        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-    }
+    private let pageTitles = [
+        "Capture, polish, and deliver screen work",
+        "Allow Screen Recording",
+        "Capture from anywhere",
+        "Automate capture when the job calls for it",
+    ]
 
     @discardableResult
     func showIfNeeded(onClose: (() -> Void)? = nil) -> Bool {
@@ -52,6 +56,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
+        win.title = "Welcome to KRIT"
         win.titleVisibility = .hidden
         win.titlebarAppearsTransparent = true
         win.isMovableByWindowBackground = true
@@ -124,6 +129,8 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             width: dotsWidth, height: dotSize
         ))
         dotsHost.wantsLayer = true
+        dotsHost.setAccessibilityElement(true)
+        dotsHost.setAccessibilityRole(.group)
         for i in 0..<4 {
             let dot = CALayer()
             dot.frame = CGRect(x: CGFloat(i) * (dotSize + dotGap), y: 0, width: dotSize, height: dotSize)
@@ -131,15 +138,18 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             dotsHost.layer?.addSublayer(dot)
             dotLayers.append(dot)
         }
+        pageIndicator = dotsHost
         container.addSubview(dotsHost)
 
         backButton = NSButton(title: "Back", target: self, action: #selector(backClicked))
         backButton.bezelStyle = .rounded
+        backButton.setAccessibilityLabel("Previous welcome page")
         backButton.frame = NSRect(x: cardWidth - 24 - 132 - 8 - 76, y: (footerHeight - 32) / 2, width: 76, height: 32)
         container.addSubview(backButton)
 
         continueButton = makeCoralButton(title: "Continue", action: #selector(continueClicked))
         continueButton.keyEquivalent = "\r"
+        continueButton.setAccessibilityLabel("Continue welcome")
         continueButton.frame = NSRect(x: cardWidth - 24 - 132, y: (footerHeight - 34) / 2, width: 132, height: 34)
         container.addSubview(continueButton)
     }
@@ -153,12 +163,12 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         incoming.frame = pageContainer.bounds
         pageContainer.addSubview(incoming)
 
-        if animated, !reduceMotion, let outgoing, outgoing !== incoming {
+        if animated, !Motion.reduced, let outgoing, outgoing !== incoming {
             let shift: CGFloat = 36
             incoming.alphaValue = 0
             incoming.frame.origin.x = forward ? shift : -shift
             NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.28
+                ctx.duration = Self.pageTransitionDuration(reduceMotion: Motion.reduced)
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 ctx.allowsImplicitAnimation = true
                 incoming.animator().alphaValue = 1
@@ -177,6 +187,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         }
 
         refreshChrome()
+        updateAccessibilityForCurrentPage()
         if index == 1 { startPermissionPolling() } else { stopPermissionPolling() }
     }
 
@@ -190,6 +201,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         case 2: page = makeShortcutsPage()
         default: page = makeAgentPage()
         }
+        configureAccessibility(for: page, index: index)
         pages[index] = page
         return page
     }
@@ -204,6 +216,8 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         backButton.isHidden = pageIndex == 0
         skipButton.isHidden = pageIndex == pages.count - 1
         setCoralTitle(continueButton, pageIndex == pages.count - 1 ? "Start Capturing" : "Continue")
+        continueButton.setAccessibilityLabel(pageIndex == pages.count - 1 ? "Start capturing" : "Continue welcome")
+        pageIndicator.setAccessibilityLabel(accessibilityPageSummary(for: pageIndex))
     }
 
     // MARK: - Pages
@@ -212,65 +226,67 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         NSRect(x: 0, y: 0, width: cardWidth, height: cardHeight - footerHeight)
     }
 
-    /// Page 1, hero icon, title, and a 2×3 grid of feature rows.
+    /// Page 1, app identity plus the three real workflows KRIT supports.
     private func makeWelcomePage() -> NSView {
         let page = NSView(frame: pageBounds)
         page.wantsLayer = true
         let w = page.bounds.width
-        var y = page.bounds.height - 28
+        let contentX: CGFloat = 64
+        let contentW = w - contentX * 2
+        var y = page.bounds.height - 36
 
-        let iconSize: CGFloat = 76
-        let iconView = NSImageView(frame: NSRect(x: (w - iconSize) / 2, y: y - iconSize, width: iconSize, height: iconSize))
+        let iconSize: CGFloat = 54
+        let iconView = NSImageView(frame: NSRect(x: contentX, y: y - iconSize, width: iconSize, height: iconSize))
         iconView.image = NSApp.applicationIconImage
         iconView.imageScaling = .scaleProportionallyUpOrDown
         iconView.identifier = NSUserInterfaceItemIdentifier("onboarding-hero-icon")
+        iconView.setAccessibilityLabel("KRIT app icon")
         page.addSubview(iconView)
-        y -= iconSize + 10
 
-        let title = NSTextField(labelWithString: "Welcome to KRIT")
-        title.font = .systemFont(ofSize: 26, weight: .semibold)
-        title.alignment = .center
-        title.frame = NSRect(x: 20, y: y - 30, width: w - 40, height: 30)
+        let title = NSTextField(wrappingLabelWithString: pageTitles[0])
+        title.font = .systemFont(ofSize: 24, weight: .semibold)
+        title.alignment = .left
+        title.frame = NSRect(x: contentX + iconSize + 18, y: y - 30, width: contentW - iconSize - 18, height: 30)
         page.addSubview(title)
-        y -= 36
 
-        let tagline = NSTextField(labelWithString: "Beautiful screenshots, built for you and your AI agent.")
-        tagline.font = KritType.body.nsFont
-        tagline.textColor = .secondaryLabelColor
-        tagline.alignment = .center
-        tagline.frame = NSRect(x: 20, y: y - 18, width: w - 40, height: 18)
-        page.addSubview(tagline)
-        y -= 40
+        let summary = NSTextField(wrappingLabelWithString: "KRIT keeps the messy screen-to-share loop in one native Mac tool: precise capture, built-in cleanup, and output that lands where the work continues.")
+        summary.font = KritType.body.nsFont
+        summary.textColor = .secondaryLabelColor
+        summary.alignment = .left
+        summary.frame = NSRect(x: contentX + iconSize + 18, y: y - 90, width: contentW - iconSize - 18, height: 54)
+        page.addSubview(summary)
+        y -= 120
 
-        let features: [(String, String)] = [
-            ("viewfinder",                "Area, window & full-screen capture"),
-            ("record.circle",             "Screen recording, GIF & webcam"),
-            ("text.viewfinder",           "OCR: copy text from anything"),
-            ("qrcode.viewfinder",         "QR code scanning"),
-            ("pin",                       "Pin shots floating anywhere"),
-            ("clock.arrow.circlepath",    "Local capture history"),
+        let surfaceH: CGFloat = 214
+        let surface = makeInsetSurface(frame: NSRect(x: contentX, y: y - surfaceH, width: contentW, height: surfaceH))
+        surface.identifier = NSUserInterfaceItemIdentifier("onboarding-workflow-list")
+        page.addSubview(surface)
+
+        let workflows: [(String, String, String)] = [
+            ("01", "Capture", "Area, window, full screen, scrolling, OCR, and QR without leaving the keyboard."),
+            ("02", "Polish", "Annotate, crop, blur sensitive text, pin results, and keep the original in history."),
+            ("03", "Deliver", "Copy, save, paste into the next app, or hand the same capture flow to the CLI.")
         ]
-        let colWidth = (w - 96) / 2
-        let rowHeight: CGFloat = 34
-        for (i, feature) in features.enumerated() {
-            let col = i % 2
-            let row = i / 2
-            let x = 48 + CGFloat(col) * colWidth
-            let rowY = y - CGFloat(row + 1) * rowHeight
-
-            let iconSize: CGFloat = 18
-            let icon = NSImageView(frame: NSRect(x: x + 3, y: rowY + (rowHeight - iconSize) / 2 - 2, width: iconSize, height: iconSize))
-            icon.image = NSImage(systemSymbolName: feature.0, accessibilityDescription: nil)
-            icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-            icon.contentTintColor = .secondaryLabelColor
-            page.addSubview(icon)
-
-            let label = NSTextField(labelWithString: feature.1)
-            label.font = KritType.callout.nsFont
-            label.textColor = .labelColor
-            label.lineBreakMode = .byTruncatingTail
-            label.frame = NSRect(x: x + iconSize + 12, y: rowY + (rowHeight - 16) / 2 - 2, width: colWidth - iconSize - 16, height: 16)
-            page.addSubview(label)
+        let rowH: CGFloat = surfaceH / CGFloat(workflows.count)
+        for (index, workflow) in workflows.enumerated() {
+            addWorkflowRow(
+                number: workflow.0,
+                title: workflow.1,
+                detail: workflow.2,
+                to: surface,
+                frame: NSRect(
+                    x: 0,
+                    y: surfaceH - CGFloat(index + 1) * rowH,
+                    width: contentW,
+                    height: rowH
+                )
+            )
+            if index < workflows.count - 1 {
+                addHairline(
+                    to: surface,
+                    frame: NSRect(x: 22, y: surfaceH - CGFloat(index + 1) * rowH, width: contentW - 44, height: 1)
+                )
+            }
         }
 
         return page
@@ -282,7 +298,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         let w = page.bounds.width
         var y = page.bounds.height - 44
 
-        y = addHero(symbol: "lock.shield", title: "Allow Screen Recording", to: page, topY: y)
+        y = addHero(symbol: "lock.shield", title: pageTitles[1], to: page, topY: y)
 
         let desc = NSTextField(wrappingLabelWithString: "KRIT needs the macOS Screen Recording permission to capture screenshots, record your screen, read text with OCR, and scan QR codes. Captures stay on your Mac unless you choose to share them.")
         desc.font = .systemFont(ofSize: 12.5)
@@ -333,7 +349,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         let w = page.bounds.width
         var y = page.bounds.height - 44
 
-        y = addHero(symbol: "keyboard", title: "Capture from anywhere", to: page, topY: y)
+        y = addHero(symbol: "keyboard", title: pageTitles[2], to: page, topY: y)
         y -= 6
 
         let shortcuts: [(String, String)] = [
@@ -385,11 +401,16 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     private func makeAgentPage() -> NSView {
         let page = NSView(frame: pageBounds)
         let w = page.bounds.width
-        var y = page.bounds.height - 44
+        var y = page.bounds.height - 58
 
-        y = addHero(symbol: "sparkles", title: "Works with your AI agent", to: page, topY: y)
+        let title = NSTextField(wrappingLabelWithString: pageTitles[3])
+        title.font = KritType.largeTitle.nsFont
+        title.alignment = .center
+        title.frame = NSRect(x: 72, y: y - 30, width: w - 144, height: 30)
+        page.addSubview(title)
+        y -= 42
 
-        let desc = NSTextField(wrappingLabelWithString: "KRIT ships a CLI and an MCP server, so Claude Code, Cursor, and any MCP client can take screenshots, read text on screen, and annotate, hands-free.")
+        let desc = NSTextField(wrappingLabelWithString: "Use the same local capture engine from scripts and MCP clients: grab an area, run OCR, and pass the result into the next step without an external service.")
         desc.font = .systemFont(ofSize: 12.5)
         desc.textColor = .secondaryLabelColor
         desc.alignment = .center
@@ -441,6 +462,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .medium)
         icon.contentTintColor = KritColors.accent
+        icon.identifier = NSUserInterfaceItemIdentifier("onboarding-hero-symbol-\(symbol)")
         page.addSubview(icon)
         y -= iconSize + 16
 
@@ -454,11 +476,41 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         return y
     }
 
+    private func addWorkflowRow(number: String, title: String, detail: String, to parent: NSView, frame: NSRect) {
+        let numberField = NSTextField(labelWithString: number)
+        numberField.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
+        numberField.textColor = KritColors.accent
+        numberField.alignment = .left
+        numberField.frame = NSRect(x: 24, y: frame.maxY - 28, width: 34, height: 16)
+        parent.addSubview(numberField)
+
+        let titleField = NSTextField(labelWithString: title)
+        titleField.font = .systemFont(ofSize: 14, weight: .semibold)
+        titleField.textColor = .labelColor
+        titleField.alignment = .left
+        titleField.frame = NSRect(x: 68, y: frame.maxY - 29, width: frame.width - 92, height: 18)
+        parent.addSubview(titleField)
+
+        let detailField = NSTextField(wrappingLabelWithString: detail)
+        detailField.font = .systemFont(ofSize: 12)
+        detailField.textColor = .secondaryLabelColor
+        detailField.alignment = .left
+        detailField.frame = NSRect(x: 68, y: frame.minY + 8, width: frame.width - 92, height: 30)
+        parent.addSubview(detailField)
+    }
+
+    private func addHairline(to parent: NSView, frame: NSRect) {
+        let line = NSView(frame: frame)
+        line.wantsLayer = true
+        line.layer?.backgroundColor = KritColors.insetSurfaceStroke.withAlphaComponent(0.75).cgColor
+        parent.addSubview(line)
+    }
+
     // MARK: - Hero entrance
 
     /// Welcome icon springs in on first show; skipped under Reduce Motion.
     private func animateHeroEntrance() {
-        guard !reduceMotion,
+        guard !Motion.reduced,
               let firstPage = pages.first ?? nil,
               let icon = firstPage.subviews.first(where: {
                   $0.identifier?.rawValue == "onboarding-hero-icon"
@@ -466,17 +518,15 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         icon.wantsLayer = true
         guard let layer = icon.layer else { return }
 
-        let spring = CASpringAnimation(keyPath: "transform.scale")
+        let spring = Motion.gentle()
+        spring.keyPath = "transform.scale"
         spring.fromValue = 0.9
         spring.toValue = 1.0
-        spring.stiffness = 240
-        spring.damping = 30
         spring.initialVelocity = 0
-        spring.duration = spring.settlingDuration
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 0
         fade.toValue = 1
-        fade.duration = 0.3
+        fade.duration = Motion.Duration.quick
 
         // Scale from the icon's center.
         layer.position = CGPoint(x: icon.frame.midX, y: icon.frame.midY)
@@ -567,7 +617,6 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
     @objc private func skipClicked() {
         Settings.hasLaunchedBefore = true
-        Settings.hasSeenFeatureTour = true
         closeWindow()
     }
 
@@ -591,13 +640,38 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         // Closing via the traffic light counts as "seen" too, never re-show.
         Settings.hasLaunchedBefore = true
-        if !completedWelcome { Settings.hasSeenFeatureTour = true }
         stopPermissionPolling()
         window = nil
         let closeHandler = onClose
         onClose = nil
         closeHandler?()
         NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded(excluding: notification.object as? NSWindow)
+    }
+
+    private func configureAccessibility(for page: NSView, index: Int) {
+        page.identifier = NSUserInterfaceItemIdentifier("onboarding-page-\(index + 1)")
+        page.setAccessibilityElement(true)
+        page.setAccessibilityRole(.group)
+        page.setAccessibilityLabel(accessibilityPageSummary(for: index))
+    }
+
+    private func updateAccessibilityForCurrentPage() {
+        let page = page(at: pageIndex)
+        page.setAccessibilityLabel(accessibilityPageSummary(for: pageIndex))
+        DispatchQueue.main.async { [weak self, weak page] in
+            guard let self, let page, self.window != nil else { return }
+            self.window?.makeFirstResponder(self.continueButton)
+            NSAccessibility.post(element: page, notification: .focusedUIElementChanged)
+        }
+    }
+
+    private func accessibilityPageSummary(for index: Int) -> String {
+        let safeIndex = min(max(index, 0), pageTitles.count - 1)
+        return "\(pageTitles[safeIndex]), page \(safeIndex + 1) of \(pages.count)"
+    }
+
+    private static func pageTransitionDuration(reduceMotion: Bool) -> TimeInterval {
+        reduceMotion ? 0 : Motion.Duration.standard
     }
 }
 
@@ -607,12 +681,53 @@ extension WelcomeWindowController {
 
     /// Test-only: forces the window up regardless of the first-launch flag,
     /// without touching Settings.
-    func uiTestForceShow() { showWindow() }
+    func uiTestForceShow() {
+        showWindow()
+        window?.sharingType = .readOnly
+    }
 
     var uiTestPageCount: Int { pages.count }
     var uiTestBuiltPageCount: Int { pages.compactMap(\.self).count }
     var uiTestContinueTitle: String { continueButton?.title ?? "" }
     var uiTestWindow: NSWindow? { window }
+    var uiTestPageIndicatorAccessibilityLabel: String? { pageIndicator?.accessibilityLabel() }
+    var uiTestCurrentPageAccessibilityLabel: String? {
+        page(at: pageIndex).accessibilityLabel()
+    }
+
+    static func uiTestPageTransitionDuration(reduceMotion: Bool) -> TimeInterval {
+        pageTransitionDuration(reduceMotion: reduceMotion)
+    }
+
+    func uiTestContinue() {
+        continueClicked()
+    }
+
+    func uiTestSkip() {
+        skipClicked()
+    }
+
+    func uiTestTextContent(onPage index: Int) -> [String] {
+        collectText(in: page(at: index))
+    }
+
+    func uiTestViewIdentifiers(onPage index: Int) -> [String] {
+        collectIdentifiers(in: page(at: index))
+    }
+
+    var uiTestWorkflowTextDoesNotOverlap: Bool {
+        guard let surface = findView(
+            in: page(at: 0),
+            identifier: "onboarding-workflow-list"
+        ) else { return false }
+        let fields = surface.subviews.compactMap { $0 as? NSTextField }
+        for leftIndex in fields.indices {
+            for rightIndex in fields.indices where rightIndex > leftIndex {
+                if fields[leftIndex].frame.intersects(fields[rightIndex].frame) { return false }
+            }
+        }
+        return true
+    }
 
     /// Walks every page (no animation) and snapshots the REAL window as the
     /// WindowServer composites it (glass, dark mode, vibrancy), cacheDisplay
@@ -622,9 +737,12 @@ extension WelcomeWindowController {
         guard let window, let content = window.contentView else { return [] }
         var paths: [String] = []
         for i in 0..<pages.count {
+            let visiblePage = page(at: i)
             showPage(i, animated: false)
             content.layoutSubtreeIfNeeded()
             content.displayIfNeeded()
+            visiblePage.layoutSubtreeIfNeeded()
+            visiblePage.displayIfNeeded()
             // Give the WindowServer a beat to composite the new page.
             try? await Task.sleep(nanoseconds: 250_000_000)
 
@@ -633,11 +751,11 @@ extension WelcomeWindowController {
             if let cg = CGWindowListCreateImage(
                 .null, .optionIncludingWindow, winID,
                 [.boundsIgnoreFraming, .bestResolution]
-            ) {
+            ), ScreenshotVisualQuality.hasVisibleContent(cg) {
                 data = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
-            } else if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
-                content.cacheDisplay(in: content.bounds, to: rep)
-                data = rep.representation(using: .png, properties: [:])
+            }
+            if data == nil {
+                data = uiTestFallbackSnapshotData(of: visiblePage)
             }
 
             let path = (dir as NSString).appendingPathComponent("onboarding-page\(i + 1).png")
@@ -648,11 +766,71 @@ extension WelcomeWindowController {
         return paths
     }
 
+    private func uiTestFallbackSnapshotData(of view: NSView) -> Data? {
+        guard let sourceRep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+        view.cacheDisplay(in: view.bounds, to: sourceRep)
+        guard let sourceImage = sourceRep.cgImage else { return nil }
+
+        let pixelWidth = max(1, Int(view.bounds.width))
+        let pixelHeight = max(1, Int(view.bounds.height))
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+
+        rep.size = view.bounds.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        NSColor.windowBackgroundColor.setFill()
+        view.bounds.fill()
+        NSImage(cgImage: sourceImage, size: view.bounds.size).draw(
+            in: view.bounds,
+            from: .zero,
+            operation: .sourceOver,
+            fraction: 1
+        )
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let cg = rep.cgImage, ScreenshotVisualQuality.hasVisibleContent(cg) else { return nil }
+        return rep.representation(using: .png, properties: [:])
+    }
+
     /// Test-only teardown that bypasses the "seen" flag side effect by
     /// clearing the close handler first.
     func uiTestClose(restoringHasLaunchedBefore value: Bool) {
         onClose = nil
         window?.close()
         Settings.hasLaunchedBefore = value
+    }
+
+    private func collectText(in view: NSView) -> [String] {
+        let own: [String]
+        if let label = view as? NSTextField, !label.stringValue.isEmpty {
+            own = [label.stringValue]
+        } else {
+            own = []
+        }
+        return own + view.subviews.flatMap { collectText(in: $0) }
+    }
+
+    private func collectIdentifiers(in view: NSView) -> [String] {
+        let own = view.identifier.map { [$0.rawValue] } ?? []
+        return own + view.subviews.flatMap { collectIdentifiers(in: $0) }
+    }
+
+    private func findView(in root: NSView, identifier: String) -> NSView? {
+        if root.identifier?.rawValue == identifier { return root }
+        for child in root.subviews {
+            if let match = findView(in: child, identifier: identifier) { return match }
+        }
+        return nil
     }
 }

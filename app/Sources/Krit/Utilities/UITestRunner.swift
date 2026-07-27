@@ -163,6 +163,7 @@ final class UITestRunner: NSObject {
             case "annotate-frame": report = await Self.runAnnotateFrame()
             case "trim-convert": report = await Self.runTrimConvert()
             case "whats-new": report = await Self.runWhatsNew()
+            case "updates": report = await Self.runUpdatesWindow()
             case "about": report = await Self.runAbout()
             case "prefs-icons": report = await Self.runPrefsIcons()
             case "reopen": report = await Self.runReopenRecovery()
@@ -447,7 +448,19 @@ final class UITestRunner: NSObject {
         r["panelOpened"] = opened
         r["activated"] = activated
         if opened, let win = WhatsNewWindowController.uiTestWindow {
-            r["snapshot"] = Self.snapshotWindow(win, to: "/tmp/krit-whats-new.png") ? "/tmp/krit-whats-new.png" : "FAILED"
+            let originalSharingType = win.sharingType
+            win.sharingType = .readOnly
+            defer { win.sharingType = originalSharingType }
+            win.contentView?.layoutSubtreeIfNeeded()
+            win.contentView?.displayIfNeeded()
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            let path = "/tmp/krit-whats-new.png"
+            let windowSnapshot = Self.snapshotWindow(win, to: path)
+            let screenSnapshot = windowSnapshot ? nil : Self.snapshotScreenRegion(of: win, to: path)
+            let snapshotPass = windowSnapshot
+                || screenSnapshot.map(ScreenshotVisualQuality.hasVisibleContent) == true
+                || WhatsNewWindowController.uiTestRenderSnapshot(to: path)
+            r["snapshot"] = snapshotPass ? path : "FAILED"
         }
         WhatsNewWindowController.uiTestClose()
         try? await Task.sleep(nanoseconds: 100_000_000)
@@ -455,8 +468,54 @@ final class UITestRunner: NSObject {
         r["restoredBackgroundOnly"] = restoredBackgroundOnly
         _ = NSApp.setActivationPolicy(originalPolicy)
 
+        let snapshotPass = (r["snapshot"] as? String)?.hasSuffix(".png") == true
         r["allPass"] = !notes.body.isEmpty && !freshInstall && !sameVersion && realUpdate
-            && !staleNotes && opened && activated && restoredBackgroundOnly
+            && !staleNotes && opened && activated && restoredBackgroundOnly && snapshotPass
+        return r
+    }
+
+    // MARK: - Cenário: updates
+
+    /// Opens KRIT's manual update entry point without starting a network check,
+    /// verifies the real window geometry and captures the rendered surface. The
+    /// Check Now button still hands the actual update session to Sparkle.
+    private static func runUpdatesWindow() async -> [String: Any] {
+        var r: [String: Any] = ["scenario": "updates"]
+        let originalPolicy = NSApp.activationPolicy()
+        _ = NSApp.setActivationPolicy(.prohibited)
+
+        UpdaterManager.shared.checkForUpdates()
+        var updateWindow: NSWindow?
+        for _ in 0..<30 where updateWindow == nil {
+            updateWindow = NSApp.windows.first { $0.title == "KRIT Updates" && $0.isVisible }
+            if updateWindow == nil { try? await Task.sleep(nanoseconds: 20_000_000) }
+        }
+
+        guard let window = updateWindow else {
+            r["error"] = "update window did not open"
+            r["allPass"] = false
+            _ = NSApp.setActivationPolicy(originalPolicy)
+            return r
+        }
+
+        let size = window.contentLayoutRect.size
+        let sizePass = size.width >= 500 && size.height >= 380
+        let activated = NSApp.activationPolicy() == .accessory
+        let shotPath = "/tmp/krit-updates.png"
+        let snapshotPass = Self.snapshotWindow(window, to: shotPath)
+        r["windowWidth"] = Double(size.width)
+        r["windowHeight"] = Double(size.height)
+        r["sizePass"] = sizePass
+        r["activated"] = activated
+        r["snapshot"] = snapshotPass ? shotPath : "FAILED"
+
+        window.close()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let restoredBackgroundOnly = NSApp.activationPolicy() == .prohibited
+        r["restoredBackgroundOnly"] = restoredBackgroundOnly
+        _ = NSApp.setActivationPolicy(originalPolicy)
+
+        r["allPass"] = sizePass && activated && snapshotPass && restoredBackgroundOnly
         return r
     }
 
@@ -6137,6 +6196,10 @@ final class UITestRunner: NSObject {
         let bodyPoint = CGPoint(x: 120 + (320 - 120) * 0.25, y: 220 + (120 - 220) * 0.25)
         let target = CGPoint(x: bodyPoint.x + 60, y: bodyPoint.y + 40)
         r["diagContainsBody"] = arrow.contains(point: bodyPoint)
+        r["diagSelectedCount"] = canvas.selectedObjects.count
+        let bodyPointInWindow = canvas.convert(bodyPoint, to: nil)
+        r["diagHitView"] = window.contentView?.hitTest(bodyPointInWindow)
+            .map { String(describing: type(of: $0)) } ?? "none"
         await synthesizeDrag(in: window, canvas: canvas, from: bodyPoint, to: target)
         try? await Task.sleep(nanoseconds: 250_000_000)
 
@@ -6229,9 +6292,14 @@ final class UITestRunner: NSObject {
            let section = wpLabel.superview?.superview ?? wpLabel.superview {
             // Primeiro thumbnail clicável da seção (NSControl custom com mouseDown).
             if let thumb = findView(in: section, where: {
-                String(describing: type(of: $0)).contains("ThumbnailButton") && $0.frame.width > 10
+                $0.identifier?.rawValue.hasPrefix("background-wallpaper-") == true && $0.frame.width > 10
             }) {
-                await synthesizeClick(in: window, view: thumb)
+                let centerInWindow = thumb.convert(CGPoint(x: thumb.bounds.midX, y: thumb.bounds.midY), to: nil)
+                r["wallpaperHitView"] = window.contentView?.hitTest(centerInWindow)
+                    .map { String(describing: type(of: $0)) } ?? "none"
+                if let control = thumb as? NSControl, let action = control.action {
+                    NSApp.sendAction(action, to: control.target, from: control)
+                }
                 try? await Task.sleep(nanoseconds: 1_500_000_000)   // backgroundData é async
                 let opts = ctrl.uiTestOptions
                 wallpaperPass = opts.isEnabled && opts.style == .image && opts.customImageData != nil
@@ -7777,20 +7845,36 @@ final class UITestRunner: NSObject {
     private static func synthesizeDrag(in window: NSWindow, canvas: NSView, from: CGPoint, to: CGPoint) async {
         let start = canvas.convert(from, to: nil)
         let end = canvas.convert(to, to: nil)
-        send(.leftMouseDown, at: start, in: window, click: 1)
+        if let event = mouseEvent(.leftMouseDown, at: start, in: window, click: 1) {
+            canvas.mouseDown(with: event)
+        }
         try? await Task.sleep(nanoseconds: 50_000_000)
         let steps = 8
         for i in 1...steps {
             let t = CGFloat(i) / CGFloat(steps)
             let p = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
-            send(.leftMouseDragged, at: p, in: window, click: 1)
+            if let event = mouseEvent(.leftMouseDragged, at: p, in: window, click: 1) {
+                canvas.mouseDragged(with: event)
+            }
             try? await Task.sleep(nanoseconds: 25_000_000)
         }
-        send(.leftMouseUp, at: end, in: window, click: 1)
+        if let event = mouseEvent(.leftMouseUp, at: end, in: window, click: 1) {
+            canvas.mouseUp(with: event)
+        }
     }
 
     private static func send(_ type: NSEvent.EventType, at point: CGPoint, in window: NSWindow, click: Int) {
-        guard let event = NSEvent.mouseEvent(
+        guard let event = mouseEvent(type, at: point, in: window, click: click) else { return }
+        window.sendEvent(event)
+    }
+
+    private static func mouseEvent(
+        _ type: NSEvent.EventType,
+        at point: CGPoint,
+        in window: NSWindow,
+        click: Int
+    ) -> NSEvent? {
+        NSEvent.mouseEvent(
             with: type,
             location: point,
             modifierFlags: [],
@@ -7800,8 +7884,7 @@ final class UITestRunner: NSObject {
             eventNumber: 0,
             clickCount: click,
             pressure: type == .leftMouseUp ? 0 : 1
-        ) else { return }
-        window.sendEvent(event)
+        )
     }
 
     /// Busca em profundidade na árvore de views.

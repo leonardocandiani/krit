@@ -4,7 +4,7 @@ import Sparkle
 /// Owns the single Sparkle updater for the app. The feed URL and EdDSA public
 /// key live in Info.plist (SUFeedURL / SUPublicEDKey); the appcast is the
 /// repo-root appcast.xml served raw from GitHub, and each release's DMG is
-/// signed by scripts/release/release.sh. Menu item: "Check for Updates…" in
+/// signed by scripts/release/release.sh. Menu item: "Updates…" in
 /// the status bar menu.
 @MainActor
 final class UpdaterManager: NSObject {
@@ -12,6 +12,7 @@ final class UpdaterManager: NSObject {
     static let shared = UpdaterManager()
 
     private var controller: SPUStandardUpdaterController!
+    private var updateWindowController: UpdateWindowController?
 
     private override init() {
         super.init()
@@ -33,9 +34,39 @@ final class UpdaterManager: NSObject {
         set { updater.automaticallyChecksForUpdates = newValue }
     }
 
-    /// User-initiated check (menu item). Shows Sparkle's standard UI.
+    /// User-initiated update entry point (menu item / Settings).
     func checkForUpdates() {
+        presentUpdateWindow()
+    }
+
+    /// Manual CTA from KRIT's update window. Sparkle still owns the check,
+    /// download and installation UI.
+    func performManualUpdateCheck() {
         controller.checkForUpdates(nil)
+    }
+
+    private func presentUpdateWindow() {
+        let content = UpdateWindowContent.current(automaticChecks: automaticChecks)
+        if let existing = updateWindowController {
+            existing.update(content: content)
+            existing.show()
+            return
+        }
+
+        let windowController = UpdateWindowController(
+            content: content,
+            actions: UpdateWindowActions(
+                checkNow: { [weak self] in self?.performManualUpdateCheck() },
+                setAutomaticChecks: { [weak self] enabled in self?.automaticChecks = enabled },
+                showWhatsNew: { WhatsNewWindowController.showNow() }
+            )
+        )
+        windowController.onClose = { [weak self, weak windowController] in
+            guard let windowController, self?.updateWindowController === windowController else { return }
+            self?.updateWindowController = nil
+        }
+        updateWindowController = windowController
+        windowController.show()
     }
 }
 
