@@ -1,19 +1,35 @@
-version: 0.28.2
-KRIT v0.28.2 is a major reliability and visual polish release for capture, recording, editing, and distribution.
+version: 0.29.0
+KRIT v0.29.0 brings a quieter native interface and a more dependable screenshot editor.
 
-### Capture workflows that stay out of your way
-- Quick Access accepts a drag immediately from the full preview surface, including controls and fast first movement, without dead spots.
-- All-in-One reopens with your last valid capture area already selected and ready.
-- Aside window captures now select the real content window instead of its transparent shadow host, removing the dark extra frame without cropping legitimate pixels.
-- Capture delivery shares one rendition across history, clipboard, autosave, and Quick Access, keeping large screenshots responsive.
+### A focused native interface
 
-### A stronger native macOS experience
-- Preferences use a fast native source list, cleaner hierarchy, better keyboard and VoiceOver behavior, and live permission state.
-- The Precision Monolith system ships a new KRIT icon, installer art, and eight original high-resolution wallpaper backgrounds.
-- Recording uses a consistent setup, live HUD, result flow, and corrected pause and resume timeline.
-- OCR, QR, Smart Redact, wallpaper decoding, and history storage move heavy work away from the main interface.
+- Preferences now use neutral navigation, consistent inset surfaces, clearer hierarchy, and restrained transitions that keep KRIT coral reserved for active state.
+- Onboarding uses the real app icon, simpler feature presentation, and a cleaner permission flow without decorative material layers.
+- What's New now presents release notes as readable native cards and correctly handles first launch, missing notes, and modern section headings.
 
-### Safer updates
-- This compatibility release preserves the established ad-hoc distribution model while requiring a universal bundle, SHA-256 checksum, and Sparkle EdDSA signature before the appcast or public branch is updated.
-- The installer verifies the app signature before replacing an existing installation and applies legacy Gatekeeper compatibility only to confirmed ad-hoc bundles.
-- Local automation remains opt-in, test artifacts stay in temporary storage, and history file operations reject unsafe paths.
+### An editor you can trust
+
+- Preview is truly read-only: editing handles, crop overlays, Smart Redact suggestions, guides, and transient objects stay out of the exported view while zoom and pan remain available.
+- Active text is committed before drag, save, copy, share, and export, so the image always matches what is visible in the editor.
+- Applied crops now count as unsaved work, manual zoom is no longer overwritten after opening, and the background sidebar returns when leaving Preview.
+- Smart Redact ignores stale asynchronous results after the source image changes and restores its staged review state when returning to Annotate.
+
+### Release confidence
+
+- New regression tests cover Preview mutations, crop state, drag export, zoom routing, release-note parsing, and update display gates.
+- Continuous integration now runs the Swift test suite before producing the universal macOS bundle.
+
+### Install
+
+```bash
+brew tap leonardocandiani/krit https://github.com/leonardocandiani/krit
+brew install --cask krit
+```
+
+Or:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/v0.29.0/install.sh | bash
+```
+
+On first launch, grant Screen Recording permission in System Settings.
