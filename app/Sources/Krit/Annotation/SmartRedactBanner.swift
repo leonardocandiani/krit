@@ -46,7 +46,7 @@ final class SmartRedactBanner: NSView {
         layer?.masksToBounds = false
         layer?.shadowColor = NSColor.black.cgColor
         layer?.shadowOpacity = 0.30
-        layer?.shadowRadius = 16
+        layer?.shadowRadius = 8
         layer?.shadowOffset = CGSize(width: 0, height: -4)
 
         glass.wantsLayer = true

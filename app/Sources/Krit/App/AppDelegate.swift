@@ -85,7 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             self?.liveAnnotation.exitDrawModeKeepingAnnotations()
             self?.featureTour.showOnFirstRunIfNeeded()
         }
-        if !welcomeController.showIfNeeded(onClose: onWelcomeClose) {
+        let isFirstLaunch = welcomeController.showIfNeeded(onClose: onWelcomeClose)
+        if !isFirstLaunch {
             // Reading the global macOS shortcut domain can touch cfprefsd and the
             // resulting alert enters a modal session. Neither belongs inside
             // applicationDidFinishLaunching, after capture is already ready.
@@ -96,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // After an update, surface the release notes once (gated on a version
         // change; skipped on a fresh install, where the welcome runs instead).
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            WhatsNewWindowController.showIfNeeded()
+            WhatsNewWindowController.showIfNeeded(isFirstLaunchThisSession: isFirstLaunch)
         }
     }
 

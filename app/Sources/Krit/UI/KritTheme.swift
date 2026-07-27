@@ -17,6 +17,10 @@ extension Color {
     static var kritEditorStageBottom: Color { Color(KritColors.editorStageBottom) }
     static var kritEditorChromeBorder: Color { Color(KritColors.editorChromeBorder) }
     static var kritEditorActionBackground: Color { Color(KritColors.editorActionBackground) }
+    static var kritNavigationSelection: Color { Color(KritColors.navigationSelectionFill) }
+    static var kritNavigationHover: Color { Color(KritColors.navigationHoverFill) }
+    static var kritInsetSurface: Color { Color(KritColors.insetSurface) }
+    static var kritInsetSurfaceStroke: Color { Color(KritColors.insetSurfaceStroke) }
 }
 
 /// Applies the KRIT visual language to a hosted SwiftUI tree: coral as the

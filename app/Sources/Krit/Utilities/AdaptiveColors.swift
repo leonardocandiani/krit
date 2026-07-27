@@ -140,6 +140,39 @@ enum KritColors {
         }
     }
 
+    /// Neutral selection for structural navigation. Coral stays on the selected
+    /// glyph and primary actions instead of becoming a large painted rectangle.
+    static let navigationSelectionFill = NSColor(name: "navigationSelectionFill") { appearance in
+        switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
+        case .darkAqua: return NSColor.white.withAlphaComponent(0.12)
+        default:        return NSColor.black.withAlphaComponent(0.08)
+        }
+    }
+
+    static let navigationHoverFill = NSColor(name: "navigationHoverFill") { appearance in
+        switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
+        case .darkAqua: return NSColor.white.withAlphaComponent(0.07)
+        default:        return NSColor.black.withAlphaComponent(0.045)
+        }
+    }
+
+    /// Subtle inset surface shared by Settings-style cards and compact status
+    /// rows. It remains neutral so content hierarchy does not compete with coral.
+    static let insetSurface = NSColor(name: "insetSurface") { appearance in
+        let opaque = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
+        case .darkAqua: return NSColor.white.withAlphaComponent(opaque ? 0.10 : 0.065)
+        default:        return NSColor.black.withAlphaComponent(opaque ? 0.07 : 0.035)
+        }
+    }
+
+    static let insetSurfaceStroke = NSColor(name: "insetSurfaceStroke") { appearance in
+        switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
+        case .darkAqua: return NSColor.white.withAlphaComponent(0.11)
+        default:        return NSColor.black.withAlphaComponent(0.08)
+        }
+    }
+
     /// Pointer feedback for compact editor tools. These remain neutral so coral
     /// keeps its meaning as a primary action or a committed toggle state.
     static let editorToolHoverFill = NSColor(name: "editorToolHoverFill") { appearance in

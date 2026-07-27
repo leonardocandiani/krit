@@ -77,10 +77,8 @@ final class HistoryRepresentationTests: XCTestCase {
         XCTAssertEqual(manager.items.first?.presentedPath, presentedPath)
 
         let indexURL = storage.appendingPathComponent("index.json")
-        let indexPersisted = await waitUntilFileExists(indexURL.path)
-        XCTAssertTrue(indexPersisted)
-        let persisted = try JSONDecoder().decode([HistoryItem].self, from: Data(contentsOf: indexURL))
-        XCTAssertEqual(persisted.first?.presentedPath, presentedPath)
+        let persistedPresentedPath = await waitUntilIndexContainsPresentedPath(indexURL, presentedPath: presentedPath)
+        XCTAssertEqual(persistedPresentedPath, presentedPath)
     }
 
     func testDeletedItemRejectsLatePresentationUpdate() async throws {
@@ -147,5 +145,17 @@ final class HistoryRepresentationTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return false
+    }
+
+    private func waitUntilIndexContainsPresentedPath(_ url: URL, presentedPath: String) async -> String? {
+        for _ in 0..<100 {
+            if let data = try? Data(contentsOf: url),
+               let persisted = try? JSONDecoder().decode([HistoryItem].self, from: data),
+               persisted.first?.presentedPath == presentedPath {
+                return persisted.first?.presentedPath
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return nil
     }
 }

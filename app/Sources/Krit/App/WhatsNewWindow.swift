@@ -57,13 +57,17 @@ final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
         return notesVersion == current
     }
 
-    static func showIfNeeded() {
+    static func showIfNeeded(isFirstLaunchThisSession: Bool = false) {
         let current = WhatsNewStore.appVersion
-        defer { Settings.lastWhatsNewVersion = current }   // mark current as seen in every path
+        if isFirstLaunchThisSession || !Settings.hasLaunchedBefore {
+            Settings.lastWhatsNewVersion = current
+            return
+        }
         guard let notes = WhatsNewStore.load() else { return }
         guard shouldShow(current: current, lastSeen: Settings.lastWhatsNewVersion,
                          hasLaunched: Settings.hasLaunchedBefore, notesVersion: notes.version) else { return }
         present(notes: notes)
+        Settings.lastWhatsNewVersion = current
     }
 
     /// Manual entry (menu): always shows whatever ships in this build.
@@ -92,7 +96,7 @@ final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
-        window.setContentSize(NSSize(width: 460, height: 560))
+        window.setContentSize(NSSize(width: 520, height: 600))
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
@@ -113,80 +117,146 @@ final class WhatsNewWindowController: NSWindowController, NSWindowDelegate {
 
 // MARK: - View
 
+struct WhatsNewDocument: Equatable {
+    struct Section: Equatable, Identifiable {
+        let title: String
+        let items: [String]
+
+        var id: String { title }
+    }
+
+    let introduction: [String]
+    let sections: [Section]
+
+    static func parse(_ markdown: String) -> WhatsNewDocument {
+        var introduction: [String] = []
+        var sections: [Section] = []
+        var title: String?
+        var items: [String] = []
+
+        func flushSection() {
+            guard let title else { return }
+            sections.append(Section(title: title, items: items))
+            items.removeAll(keepingCapacity: true)
+        }
+
+        for rawLine in markdown.components(separatedBy: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+
+            if line.hasPrefix("### ") || line.hasPrefix("## ") {
+                flushSection()
+                title = String(line.drop(while: { $0 == "#" || $0 == " " }))
+            } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
+                let item = String(line.dropFirst(2))
+                if title == nil { introduction.append(item) } else { items.append(item) }
+            } else if title == nil {
+                introduction.append(line)
+            } else {
+                items.append(line)
+            }
+        }
+        flushSection()
+        return WhatsNewDocument(introduction: introduction, sections: sections)
+    }
+}
+
 private struct WhatsNewView: View {
     let version: String
     let markdown: String
     let onClose: () -> Void
 
+    private var document: WhatsNewDocument { .parse(markdown) }
+
     var body: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 6) {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 30, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-                Text("What's New")
-                    .font(.system(size: 22, weight: .bold))
-                Text("KRIT \(version)")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.secondary)
-            }
-            .padding(.top, 28)
-            .padding(.bottom, 18)
+            HStack(spacing: KritSpacing.l) {
+                Image(nsImage: NSApp.applicationIconImage ?? NSImage())
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 54, height: 54)
+                    .accessibilityHidden(true)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                        block.view
-                    }
+                VStack(alignment: .leading, spacing: KritSpacing.xxs) {
+                    Text("What's New")
+                        .kritType(.largeTitle)
+                    Text("KRIT \(version)")
+                        .kritType(.callout)
+                        .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 28)
-                .padding(.bottom, 16)
+
+                Spacer()
+            }
+            .padding(.horizontal, KritSpacing.xxxl)
+            .padding(.top, KritSpacing.xxxl)
+            .padding(.bottom, KritSpacing.xxl)
+
+            ZStack(alignment: .top) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: KritSpacing.l) {
+                        ForEach(Array(document.introduction.enumerated()), id: \.offset) { _, paragraph in
+                            inlineText(paragraph)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        ForEach(document.sections) { section in
+                            releaseSection(section)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, KritSpacing.xxxl)
+                    .padding(.top, KritSpacing.m)
+                    .padding(.bottom, KritSpacing.xxl)
+                }
+
+                KritEdgeDissolve()
             }
 
-            Divider()
-            Button(action: onClose) {
-                Text("Continue").frame(maxWidth: .infinity)
+            ZStack(alignment: .top) {
+                KritEdgeDissolve(.up)
+                    .offset(y: -10)
+
+                HStack {
+                    Text("Release notes for this update")
+                        .kritType(.caption)
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                    Button("Continue", action: onClose)
+                        .controlSize(.large)
+                        .keyboardShortcut(.defaultAction)
+                }
+                .padding(.horizontal, KritSpacing.xxxl)
+                .padding(.vertical, KritSpacing.l)
             }
-            .controlSize(.large)
-            .keyboardShortcut(.defaultAction)
-            .padding(16)
         }
-        .frame(width: 460, height: 560)
+        .frame(width: 520, height: 600)
+        .kritTheme()
     }
 
-    // Minimal markdown: ## headings, - bullets, blank-line spacing, **bold** inline.
-    private struct Block { let view: AnyView }
+    private func releaseSection(_ section: WhatsNewDocument.Section) -> some View {
+        KritInsetCard {
+            VStack(alignment: .leading, spacing: KritSpacing.m) {
+                Text(section.title)
+                    .kritType(.heading)
 
-    private var blocks: [Block] {
-        var result: [Block] = []
-        for rawLine in markdown.components(separatedBy: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty { continue }
-            if line.hasPrefix("## ") {
-                let text = String(line.dropFirst(3))
-                result.append(Block(view: AnyView(
-                    Text(text).font(.system(size: 14, weight: .semibold)).padding(.top, 6)
-                )))
-            } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
-                let text = String(line.dropFirst(2))
-                result.append(Block(view: AnyView(
-                    HStack(alignment: .top, spacing: 8) {
-                        Circle().fill(Color.accentColor).frame(width: 5, height: 5).padding(.top, 6)
-                        inlineText(text)
+                ForEach(Array(section.items.enumerated()), id: \.offset) { _, item in
+                    HStack(alignment: .top, spacing: KritSpacing.m) {
+                        Circle()
+                            .fill(Color.kritAccent)
+                            .frame(width: 5, height: 5)
+                            .padding(.top, 6)
+                        inlineText(item)
+                            .foregroundStyle(.primary.opacity(0.9))
                     }
-                )))
-            } else {
-                result.append(Block(view: AnyView(inlineText(line))))
+                }
             }
         }
-        return result
     }
 
     private func inlineText(_ s: String) -> Text {
         if let attr = try? AttributedString(markdown: s) {
-            return Text(attr).font(.system(size: 13)).foregroundColor(.primary.opacity(0.9))
+            return Text(attr).kritType(.body)
         }
-        return Text(s).font(.system(size: 13))
+        return Text(s).kritType(.body)
     }
 }

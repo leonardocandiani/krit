@@ -43,6 +43,10 @@ jobs:
           xcodebuild -version
           swift --version
 
+      - name: Run unit tests
+        working-directory: app
+        run: swift test --disable-index-store --force-resolved-versions
+
       - name: Build app (universal, ad-hoc signed)
         working-directory: app
         run: bash build-app.sh

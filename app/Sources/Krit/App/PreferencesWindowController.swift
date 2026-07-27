@@ -161,7 +161,7 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: - Section switching
 
-    private func select(tab: PreferencesTab, animated _: Bool, forceReload: Bool = false) {
+    private func select(tab: PreferencesTab, animated: Bool, forceReload: Bool = false) {
         guard selectedTab != tab || forceReload else {
             sidebar.setSelected(tab)
             return
@@ -169,6 +169,13 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         selectedTab = tab
         sidebar.setSelected(tab)
         contentHostingView.rootView = PreferencesContent.makeRootView(for: tab)
+        guard animated, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        contentHostingView.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Motion.Duration.quick
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            contentHostingView.animator().alphaValue = 1
+        }
     }
 
     // MARK: - Public surface
@@ -316,12 +323,17 @@ private final class NativePreferencesSidebarCell: NSTableCellView {
 
     private let glyph = NSImageView()
     private let label = NSTextField(labelWithString: "")
+    private var isSelected = false
+    private var isHovered = false
+    private var tracking: NSTrackingArea?
+
+    override var mouseDownCanMoveWindow: Bool { false }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
         wantsLayer = true
-        layer?.cornerRadius = 8
+        layer?.cornerRadius = ChromeFactory.Radius.control
         layer?.cornerCurve = .continuous
 
         glyph.imageScaling = .scaleProportionallyDown
@@ -349,14 +361,51 @@ private final class NativePreferencesSidebarCell: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self
+        )
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        applyAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        applyAppearance()
+    }
+
     func configure(tab: PreferencesTab, selected: Bool) {
-        layer?.backgroundColor = selected ? KritColors.accent.cgColor : NSColor.clear.cgColor
+        isSelected = selected
         glyph.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: nil)
         glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
-        glyph.contentTintColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
         label.stringValue = tab.title
-        label.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
         setAccessibilityLabel(tab.title)
+        applyAppearance()
+    }
+
+    private func applyAppearance() {
+        if isSelected {
+            layer?.backgroundColor = KritColors.navigationSelectionFill.cgColor
+            glyph.contentTintColor = KritColors.accent
+            label.textColor = .labelColor
+        } else if isHovered {
+            layer?.backgroundColor = KritColors.navigationHoverFill.cgColor
+            glyph.contentTintColor = .labelColor
+            label.textColor = .labelColor
+        } else {
+            layer?.backgroundColor = NSColor.clear.cgColor
+            glyph.contentTintColor = .secondaryLabelColor
+            label.textColor = .labelColor
+        }
     }
 }
 

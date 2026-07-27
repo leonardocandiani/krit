@@ -27,6 +27,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     private var permissionStatusDot: NSView?
     private var permissionStatusLabel: NSTextField?
     private var permissionGrantButton: NSButton?
+    private var completedWelcome = false
 
     private let cardWidth: CGFloat = 640
     private let cardHeight: CGFloat = 470
@@ -99,16 +100,17 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     }
 
     private func buildFooter(in container: NSView) {
-        // Hairline above the footer
-        let sep = NSBox()
-        sep.boxType = .separator
-        sep.frame = NSRect(x: 24, y: footerHeight, width: cardWidth - 48, height: 1)
-        container.addSubview(sep)
+        let dissolve = KritEdgeDissolveView(
+            frame: NSRect(x: 0, y: footerHeight, width: cardWidth, height: 12),
+            direction: .up
+        )
+        dissolve.autoresizingMask = [.width]
+        container.addSubview(dissolve)
 
         skipButton = NSButton(title: "Skip", target: self, action: #selector(skipClicked))
         skipButton.bezelStyle = .inline
         skipButton.isBordered = false
-        skipButton.font = .systemFont(ofSize: 12)
+        skipButton.font = KritType.callout.nsFont
         skipButton.contentTintColor = .secondaryLabelColor
         skipButton.frame = NSRect(x: 24, y: (footerHeight - 28) / 2, width: 60, height: 28)
         container.addSubview(skipButton)
@@ -219,21 +221,21 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
         let iconSize: CGFloat = 76
         let iconView = NSImageView(frame: NSRect(x: (w - iconSize) / 2, y: y - iconSize, width: iconSize, height: iconSize))
-        iconView.image = NSImage(named: "NSApplicationIcon")
+        iconView.image = NSApp.applicationIconImage
         iconView.imageScaling = .scaleProportionallyUpOrDown
         iconView.identifier = NSUserInterfaceItemIdentifier("onboarding-hero-icon")
         page.addSubview(iconView)
         y -= iconSize + 10
 
         let title = NSTextField(labelWithString: "Welcome to KRIT")
-        title.font = .boldSystemFont(ofSize: 26)
+        title.font = .systemFont(ofSize: 26, weight: .semibold)
         title.alignment = .center
         title.frame = NSRect(x: 20, y: y - 30, width: w - 40, height: 30)
         page.addSubview(title)
         y -= 36
 
         let tagline = NSTextField(labelWithString: "Beautiful screenshots, built for you and your AI agent.")
-        tagline.font = .systemFont(ofSize: 13)
+        tagline.font = KritType.body.nsFont
         tagline.textColor = .secondaryLabelColor
         tagline.alignment = .center
         tagline.frame = NSRect(x: 20, y: y - 18, width: w - 40, height: 18)
@@ -256,24 +258,18 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             let x = 48 + CGFloat(col) * colWidth
             let rowY = y - CGFloat(row + 1) * rowHeight
 
-            let chipSize: CGFloat = 24
-            let chip = ChromeFactory.backing(
-                frame: NSRect(x: x, y: rowY + (rowHeight - chipSize) / 2 - 2, width: chipSize, height: chipSize),
-                cornerRadius: ChromeFactory.Radius.pill,
-                tint: KritColors.accent.withAlphaComponent(0.14)
-            )
-            page.addSubview(chip)
-
-            let icon = NSImageView(frame: NSRect(x: x + 4, y: rowY + (rowHeight - 16) / 2 - 2, width: 16, height: 16))
+            let iconSize: CGFloat = 18
+            let icon = NSImageView(frame: NSRect(x: x + 3, y: rowY + (rowHeight - iconSize) / 2 - 2, width: iconSize, height: iconSize))
             icon.image = NSImage(systemSymbolName: feature.0, accessibilityDescription: nil)
-            icon.contentTintColor = KritColors.accent
+            icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+            icon.contentTintColor = .secondaryLabelColor
             page.addSubview(icon)
 
             let label = NSTextField(labelWithString: feature.1)
-            label.font = .systemFont(ofSize: 12)
+            label.font = KritType.callout.nsFont
             label.textColor = .labelColor
             label.lineBreakMode = .byTruncatingTail
-            label.frame = NSRect(x: x + chipSize + 10, y: rowY + (rowHeight - 16) / 2 - 2, width: colWidth - chipSize - 14, height: 16)
+            label.frame = NSRect(x: x + iconSize + 12, y: rowY + (rowHeight - 16) / 2 - 2, width: colWidth - iconSize - 16, height: 16)
             page.addSubview(label)
         }
 
@@ -299,11 +295,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         // Status card: dot + label on the left, grant button on the right.
         let cardW: CGFloat = w - 168
         let cardH: CGFloat = 58
-        let card = ChromeFactory.backing(
-            frame: NSRect(x: 84, y: y - cardH, width: cardW, height: cardH),
-            cornerRadius: ChromeFactory.Radius.card,
-            tint: NSColor.white.withAlphaComponent(0.04)
-        )
+        let card = makeInsetSurface(frame: NSRect(x: 84, y: y - cardH, width: cardW, height: cardH))
         page.addSubview(card)
 
         let dot = NSView(frame: NSRect(x: 18, y: (cardH - 10) / 2, width: 10, height: 10))
@@ -439,28 +431,21 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         return page
     }
 
-    /// Shared hero block: coral chip + symbol + title. Returns the next y.
+    /// Shared hero block: one meaningful symbol and title. Returns the next y.
     private func addHero(symbol: String, title: String, to page: NSView, topY: CGFloat) -> CGFloat {
         let w = page.bounds.width
         var y = topY
 
-        let chipSize: CGFloat = 56
-        let chip = ChromeFactory.backing(
-            frame: NSRect(x: (w - chipSize) / 2, y: y - chipSize, width: chipSize, height: chipSize),
-            cornerRadius: ChromeFactory.Radius.card,
-            tint: KritColors.accent.withAlphaComponent(0.16)
-        )
-        page.addSubview(chip)
-
-        let icon = NSImageView(frame: NSRect(x: (w - 28) / 2, y: y - chipSize + 14, width: 28, height: 28))
+        let iconSize: CGFloat = 34
+        let icon = NSImageView(frame: NSRect(x: (w - iconSize) / 2, y: y - iconSize, width: iconSize, height: iconSize))
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 24, weight: .medium)
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .medium)
         icon.contentTintColor = KritColors.accent
         page.addSubview(icon)
-        y -= chipSize + 14
+        y -= iconSize + 16
 
         let titleField = NSTextField(labelWithString: title)
-        titleField.font = .boldSystemFont(ofSize: 21)
+        titleField.font = KritType.largeTitle.nsFont
         titleField.alignment = .center
         titleField.frame = NSRect(x: 20, y: y - 26, width: w - 40, height: 26)
         page.addSubview(titleField)
@@ -482,11 +467,11 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         guard let layer = icon.layer else { return }
 
         let spring = CASpringAnimation(keyPath: "transform.scale")
-        spring.fromValue = 0.6
+        spring.fromValue = 0.9
         spring.toValue = 1.0
-        spring.stiffness = 300
-        spring.damping = 20
-        spring.initialVelocity = 4
+        spring.stiffness = 240
+        spring.damping = 30
+        spring.initialVelocity = 0
         spring.duration = spring.settlingDuration
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 0
@@ -536,6 +521,17 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         return btn
     }
 
+    private func makeInsetSurface(frame: NSRect) -> NSView {
+        let view = NSView(frame: frame)
+        view.wantsLayer = true
+        view.layer?.backgroundColor = KritColors.insetSurface.cgColor
+        view.layer?.cornerRadius = ChromeFactory.Radius.card
+        view.layer?.cornerCurve = .continuous
+        view.layer?.borderWidth = 1
+        view.layer?.borderColor = KritColors.insetSurfaceStroke.cgColor
+        return view
+    }
+
     private func setCoralTitle(_ btn: NSButton, _ title: String) {
         btn.title = title
     }
@@ -544,6 +540,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
     @objc private func continueClicked() {
         if pageIndex == pages.count - 1 {
+            completedWelcome = true
             Settings.hasLaunchedBefore = true
             closeWindow()
         } else {
@@ -570,6 +567,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
     @objc private func skipClicked() {
         Settings.hasLaunchedBefore = true
+        Settings.hasSeenFeatureTour = true
         closeWindow()
     }
 
@@ -593,6 +591,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         // Closing via the traffic light counts as "seen" too, never re-show.
         Settings.hasLaunchedBefore = true
+        if !completedWelcome { Settings.hasSeenFeatureTour = true }
         stopPermissionPolling()
         window = nil
         let closeHandler = onClose

@@ -32,6 +32,7 @@ enum PreferencesContent {
         return AnyView(
             PreferencesSection(tab: tab) { root }
                 .id(tab.rawValue)
+                .kritTheme()
         )
     }
 
@@ -51,16 +52,15 @@ private struct PreferencesSection<Content: View>: View {
     var body: some View {
         VStack(spacing: 0) {
             PreferencesHeader(tab: tab)
-            Divider()
-            if #available(macOS 14.0, *) {
-                form
-                    // Margem de segurança DENTRO do scroll: o fim do conteúdo respira
-                    // antes da borda da janela (sem isso a última row encosta seca).
-                    // Margem interna não cria faixa morta no meio do scroll, ao
-                    // contrário de um padding externo.
-                    .contentMargins(.bottom, 24, for: .scrollContent)
-            } else {
-                form
+            ZStack(alignment: .top) {
+                if #available(macOS 14.0, *) {
+                    form
+                        .contentMargins(.bottom, KritSpacing.xxxl, for: .scrollContent)
+                } else {
+                    form
+                }
+
+                KritEdgeDissolve()
             }
         }
     }
@@ -78,8 +78,7 @@ private struct PreferencesSection<Content: View>: View {
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
-        .tint(Color(KritColors.accent))
-        .padding(.top, 8)
+        .padding(.top, KritSpacing.m)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
@@ -88,20 +87,20 @@ private struct PreferencesHeader: View {
     let tab: PreferencesTab
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: KritSpacing.l) {
             Image(systemName: tab.symbol)
                 .symbolRenderingMode(.hierarchical)
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(Color(KritColors.accent))
+                .font(KritType.title.font)
+                .foregroundStyle(Color.kritAccent)
                 .frame(width: 30, height: 30)
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(tab.title)
-                    .font(.system(size: 21, weight: .semibold))
+                    .kritType(.largeTitle)
                     .foregroundStyle(.primary)
                 Text(tab.subtitle)
-                    .font(.system(size: 12.5))
+                    .kritType(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -110,9 +109,9 @@ private struct PreferencesHeader: View {
 
             if tab == .capture { CaptureReadinessBadge() }
         }
-        .padding(.horizontal, 22)
-        .padding(.top, 30)
-        .padding(.bottom, 14)
+        .padding(.horizontal, KritSpacing.xxxl)
+        .padding(.top, KritSpacing.xxxl)
+        .padding(.bottom, KritSpacing.l)
     }
 }
 
@@ -125,16 +124,10 @@ private struct CaptureReadinessBadge: View {
     }
 
     var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(isReady ? Color.green : Color.orange)
-                .frame(width: 7, height: 7)
-            Text(isReady ? "Ready" : "Permission needed")
-                .font(.system(size: 12, weight: .medium))
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(.quaternary, in: Capsule())
+        KritStatusLabel(
+            title: isReady ? "Ready" : "Permission needed",
+            color: isReady ? .green : .orange
+        )
         .accessibilityElement(children: .combine)
         .accessibilityLabel(isReady ? "Capture status, ready" : "Capture status, permission needed")
         .onAppear(perform: refresh)
@@ -1027,13 +1020,16 @@ private struct PresetRow: View {
 /// About row a bit of life.
 private struct SettingIcon: View {
     let symbol: String
-    let color: Color
+
+    init(symbol: String, color _: Color) {
+        self.symbol = symbol
+    }
 
     var body: some View {
         Image(systemName: symbol)
             .symbolRenderingMode(.hierarchical)
             .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(color)
+            .foregroundStyle(.secondary)
             .frame(width: 22, height: 22)
             .accessibilityHidden(true)
     }
@@ -1059,7 +1055,7 @@ private struct AboutForm: View {
     var body: some View {
         Section {
             HStack(spacing: 16) {
-                Image(nsImage: NSImage(named: "NSApplicationIcon")
+                Image(nsImage: NSApp.applicationIconImage
                     ?? NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: nil)
                     ?? NSImage())
                     .resizable()
@@ -1225,8 +1221,7 @@ private struct PermissionRow: View {
     }
 }
 
-/// Coloured capsule reflecting a permission's live status: green granted, red
-/// denied, secondary when macOS has not been asked yet.
+/// Compact permission status using one semantic dot instead of a painted badge.
 private struct StatusPill: View {
     let status: PermissionStatus
 
@@ -1247,14 +1242,7 @@ private struct StatusPill: View {
     }
 
     var body: some View {
-        Text(label)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(
-                Capsule().fill(tint.opacity(0.15))
-            )
+        KritStatusLabel(title: label, color: tint)
     }
 }
 

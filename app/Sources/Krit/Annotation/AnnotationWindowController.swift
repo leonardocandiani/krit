@@ -48,6 +48,7 @@ final class AnnotationWindowController: NSWindowController {
     /// backgroundOptions but is NOT a user edit, so the close warning keys off
     /// this flag rather than comparing against editorDefault.
     private var hasUserBackgroundEdit = false
+    private var hasUserCropEdit = false
     // R1: distingue resize programático (auto-fit) de resize manual do usuário.
     private var isProgrammaticResize = false
     private var userManuallyResized = false
@@ -57,6 +58,7 @@ final class AnnotationWindowController: NSWindowController {
     // Sai do modo quando o usuário escolhe um zoom manual no popup; volta ao
     // escolher "Fit". A janela é sempre do usuário (abertura + resize manual).
     private var fitMode = true
+    private var sidebarWasVisibleBeforePreview = false
 
     // Strong references so controllers aren't deallocated while their window is open
     private static var openControllers: [AnnotationWindowController] = []
@@ -258,6 +260,7 @@ final class AnnotationWindowController: NSWindowController {
         scrollView.documentView = canvas
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
+        scrollView.scrollerStyle = .overlay
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.backgroundColor = .clear
@@ -405,8 +408,9 @@ final class AnnotationWindowController: NSWindowController {
 
         // Show Crop check button only when a crop region is drawn
         canvas.onCropChanged = { [weak self] rect in
+            guard let self else { return }
             let hasCrop = rect != nil && !(rect?.isEmpty ?? true)
-            self?.toolbar.setCropApplyVisible(hasCrop)
+            self.toolbar.setCropApplyVisible(!self.canvas.isPreviewMode && hasCrop)
         }
 
         // Return/Enter or double-click inside the region commits the crop,
@@ -482,11 +486,17 @@ final class AnnotationWindowController: NSWindowController {
         }
         bar.onPreviewModeChanged = { [weak self] preview in
             guard let self else { return }
-            self.toolbar.setPreviewMode(preview)
             self.canvas.isPreviewMode = preview
-            // Preview means "what exports": close the background sidebar if open
-            // so nothing editorial frames the result.
-            if preview, self.sidebarVisible { self.toggleBackgroundSidebar() }
+            self.toolbar.setPreviewMode(preview)
+            let hasCrop = self.canvas.cropRect.map { !$0.isEmpty } ?? false
+            self.toolbar.setCropApplyVisible(!preview && hasCrop)
+            if preview {
+                self.sidebarWasVisibleBeforePreview = self.sidebarVisible
+                if self.sidebarVisible { self.toggleBackgroundSidebar() }
+            } else if self.sidebarWasVisibleBeforePreview, !self.sidebarVisible {
+                self.sidebarWasVisibleBeforePreview = false
+                self.toggleBackgroundSidebar()
+            }
         }
         bar.onRequestDragImage = { [weak self] in self?.exportImage() }
         bar.onDragDelivered = { [weak self] in self?.window?.close() }
@@ -721,7 +731,8 @@ final class AnnotationWindowController: NSWindowController {
     }
 
     private func exportImage() -> NSImage {
-        canvas.flatten()
+        canvas.commitTextField()
+        return canvas.flatten()
     }
 
     /// ES5: the stage checkerboard shows only when no background is enabled.
@@ -736,7 +747,7 @@ final class AnnotationWindowController: NSWindowController {
     /// has laid out its real viewport before fitToWindow measures it.
     private func zoomToFitOnAppear() {
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.fitMode else { return }
             let level = self.canvas.fitToWindow()
             self.bottomBar?.setZoomLabel(for: level)
             // The window can still be reshaped after this first pass (sidebar
@@ -744,7 +755,7 @@ final class AnnotationWindowController: NSWindowController {
             // stale and a big window shot opening at the wrong zoom. One more
             // pass against the settled viewport covers that case.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                guard let self else { return }
+                guard let self, self.fitMode else { return }
                 let settled = self.canvas.fitToWindow()
                 self.bottomBar?.setZoomLabel(for: settled)
             }
@@ -1074,6 +1085,7 @@ final class AnnotationWindowController: NSWindowController {
         // background options so the composition re-renders at the new size,
         // and let the window follow the canvas (same R1 path as padding/ratio).
         guard let cropped = canvas.applyCrop() else { return }
+        hasUserCropEdit = true
         image = cropped
         canvas.backgroundImage = cropped
         canvas.frame = NSRect(origin: .zero, size: previewSize(for: backgroundOptions))
@@ -1137,7 +1149,7 @@ extension AnnotationWindowController: NSWindowDelegate {
         // A user background/template change is a real exportable edit even with no
         // annotations, so a styled-then-undrawn editor still warns. The auto-applied
         // default template does NOT count (hasUserBackgroundEdit stays false).
-        guard !canvas.objects.isEmpty || hasUserBackgroundEdit else { return true }
+        guard !canvas.objects.isEmpty || hasUserBackgroundEdit || hasUserCropEdit else { return true }
         let alert = NSAlert()
         alert.messageText = "Unsaved Annotations"
         alert.informativeText = "You have annotations that haven't been saved. Close without saving?"
@@ -1561,18 +1573,16 @@ final class AnnotationToolbar: NSView {
         main.addArrangedSubview(cropBtn)
         cropApplyButton = cropBtn
 
-        // Hairline between the bands, the same separator token as the rest of
-        // the chrome, so the hierarchy reads without a heavy divider.
-        let hairline = NSView()
-        hairline.wantsLayer = true
-        hairline.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        hairline.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(hairline)
+        // A soft edge marks the fixed main band without drawing a hard bar
+        // through the whole editor.
+        let dissolve = KritEdgeDissolveView(frame: .zero, direction: .down)
+        dissolve.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(dissolve)
         NSLayoutConstraint.activate([
-            hairline.leadingAnchor.constraint(equalTo: leadingAnchor),
-            hairline.trailingAnchor.constraint(equalTo: trailingAnchor),
-            hairline.topAnchor.constraint(equalTo: topAnchor, constant: Self.mainBarHeight),
-            hairline.heightAnchor.constraint(equalToConstant: 1),
+            dissolve.leadingAnchor.constraint(equalTo: leadingAnchor),
+            dissolve.trailingAnchor.constraint(equalTo: trailingAnchor),
+            dissolve.topAnchor.constraint(equalTo: topAnchor, constant: Self.mainBarHeight - 2),
+            dissolve.heightAnchor.constraint(equalToConstant: 8),
         ])
 
         // Properties band: tool chip + color + the active tool's controls.
@@ -2574,7 +2584,10 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
     private var dragOrigin: NSPoint?
     private var activeDragFileURL: URL?
     private var hovering = false { didSet { needsDisplay = true } }
+    private var pressed = false { didSet { needsDisplay = true } }
     private var trackingArea: NSTrackingArea?
+
+    override var mouseDownCanMoveWindow: Bool { false }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2606,8 +2619,12 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
     override func draw(_ dirtyRect: NSRect) {
         // 6pt corner matches the native rounded button bezel beside it; the fill
         // is the shared footer-control color so the pill reads as a peer.
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 6, yRadius: 6)
-        (hovering ? KritColors.cornerButtonHover : KritColors.editorActionBackground).setFill()
+        let radius = ChromeFactory.Radius.pill
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
+        let fill = pressed
+            ? KritColors.cornerButtonPressed
+            : (hovering ? KritColors.cornerButtonHover : KritColors.editorActionBackground)
+        fill.setFill()
         path.fill()
         KritColors.editorDockBorder.setStroke()
         path.lineWidth = 1
@@ -2650,6 +2667,7 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
     }
 
     override func mouseDown(with event: NSEvent) {
+        pressed = true
         dragOrigin = event.locationInWindow
     }
 
@@ -2658,6 +2676,7 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
         let current = event.locationInWindow
         guard abs(current.x - origin.x) > 3 || abs(current.y - origin.y) > 3 else { return }
         dragOrigin = nil
+        pressed = false
 
         guard let export = ImageExporter.encodedForExport(dragImg),
               let fileURL = DragFileVault.makeFile(data: export.data, ext: export.ext) else { return }
@@ -2684,6 +2703,11 @@ private final class BottomBarDragPill: NSView, NSDraggingSource {
         promiseItem.setDraggingFrame(bounds, contents: preview)
 
         beginDraggingSession(with: [fileItem, promiseItem], event: event, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        dragOrigin = nil
+        pressed = false
     }
 
     nonisolated func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
@@ -2745,6 +2769,9 @@ private final class BottomBarFilePromiseDelegate: NSObject, NSFilePromiseProvide
 extension AnnotationWindowController {
     static var uiTestLastController: AnnotationWindowController? { openControllers.last }
     var uiTestCanvas: AnnotationCanvas { canvas }
+    var uiTestHasUnsavedChanges: Bool {
+        !canvas.objects.isEmpty || hasUserBackgroundEdit || hasUserCropEdit
+    }
     /// Nova verdade (fit-to-stage): o canvas, NA ESCALA ATUAL, cabe dentro do
     /// palco visível (o viewport do scroll view), tolerância 2pt. A janela não
     /// acompanha mais o canvas; é o canvas que re-escala pra caber. Em modo fit a

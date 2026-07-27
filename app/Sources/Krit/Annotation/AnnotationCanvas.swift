@@ -9,6 +9,14 @@ final class AnnotationCanvas: NSView {
 
     var backgroundImage: NSImage? {
         didSet {
+            if oldValue !== backgroundImage {
+                smartRedactGeneration &+= 1
+                if !smartRedactPreviews.isEmpty {
+                    smartRedactPreviews = []
+                    onSmartRedactStateChanged?(false)
+                    hideSmartRedactBanner()
+                }
+            }
             // The default annotation weight scales with the capture size, so an
             // arrow reads the same relative thickness on a 4K shot as on a small
             // region (the fixed 13pt looked tiny on large captures). Only the
@@ -133,6 +141,7 @@ final class AnnotationCanvas: NSView {
         let label: String
     }
     private(set) var smartRedactPreviews: [SmartRedactPreview] = []
+    private var smartRedactGeneration: UInt64 = 0
     /// Padding added around each detected line before redaction, so the cover
     /// fully eats the glyphs (ascenders/descenders and a little side margin)
     /// instead of leaving a readable sliver at the edges.
@@ -248,6 +257,10 @@ final class AnnotationCanvas: NSView {
 
     override func resetCursorRects() {
         discardCursorRects()
+        if isPreviewMode {
+            addCursorRect(bounds, cursor: .arrow)
+            return
+        }
         let cursor: NSCursor
         switch activeTool {
         case .select:                                      cursor = .arrow
@@ -289,11 +302,11 @@ final class AnnotationCanvas: NSView {
         // 4. In-progress object. Blur/pixelate render no-op through `draw`, so route
         // the one being dragged through the live-effect path, otherwise the region
         // reads as empty while you create or resize it.
-        if let blur = currentObject as? BlurAnnotation {
+        if !isPreviewMode, let blur = currentObject as? BlurAnnotation {
             drawBlur(blur, ctx: ctx)
-        } else if let px = currentObject as? PixelateAnnotation {
+        } else if !isPreviewMode, let px = currentObject as? PixelateAnnotation {
             drawPixelate(px, ctx: ctx)
-        } else if let band = currentObject as? HighlighterAnnotation {
+        } else if !isPreviewMode, let band = currentObject as? HighlighterAnnotation {
             // Highlighter previews the OCR snap live: if the drag is crossing
             // detected text, show the fixed line rects instead of the free band so
             // the user sees exactly what will be highlighted. No text under the
@@ -306,32 +319,34 @@ final class AnnotationCanvas: NSView {
                 preview.color = band.color
                 preview.draw(in: ctx, scale: window?.backingScaleFactor ?? 2)
             }
-        } else {
+        } else if !isPreviewMode {
             currentObject?.draw(in: ctx, scale: window?.backingScaleFactor ?? 2)
         }
 
         // 5. Selection handles
-        for obj in selectedObjects {
-            drawSelectionHandle(for: obj, ctx: ctx)
+        if !isPreviewMode {
+            for obj in selectedObjects {
+                drawSelectionHandle(for: obj, ctx: ctx)
+            }
         }
 
         // 6. Crop overlay
-        if let crop = cropRect {
+        if !isPreviewMode, let crop = cropRect {
             drawCropOverlay(crop, ctx: ctx)
         }
 
         // 6b. Smart Redact preview: translucent red boxes over each pending
         // finding, with a small category chip, so the user sees exactly what
         // Apply will cover before committing.
-        if !smartRedactPreviews.isEmpty {
+        if !isPreviewMode, !smartRedactPreviews.isEmpty {
             drawSmartRedactPreviews(ctx: ctx)
         }
 
         // 7. Precision chrome: marquee rect (B1) and smart-guide lines (B3).
-        if let marquee = marqueeRect {
+        if !isPreviewMode, let marquee = marqueeRect {
             drawMarquee(marquee, ctx: ctx)
         }
-        if !activeGuides.isEmpty {
+        if !isPreviewMode, !activeGuides.isEmpty {
             drawGuides(ctx: ctx)
         }
     }
@@ -700,7 +715,10 @@ final class AnnotationCanvas: NSView {
     /// actor. Nothing is committed here, the user confirms with `applySmartRedact`.
     func runSmartRedact() async -> Int {
         guard let backgroundImage else { return 0 }
+        smartRedactGeneration &+= 1
+        let generation = smartRedactGeneration
         let lines = await textRegionDetector.recognizedLines(for: backgroundImage)
+        guard generation == smartRedactGeneration, self.backgroundImage === backgroundImage else { return 0 }
         guard !lines.isEmpty else {
             smartRedactPreviews = []
             onSmartRedactStateChanged?(false)
@@ -749,6 +767,7 @@ final class AnnotationCanvas: NSView {
     /// Clears the preview afterwards. No-op when nothing is staged.
     func applySmartRedact() {
         guard !smartRedactPreviews.isEmpty else { return }
+        smartRedactGeneration &+= 1
         pushUndo()
         for preview in smartRedactPreviews {
             // Auto-redacted secrets must not be recoverable from the exported file,
@@ -768,6 +787,7 @@ final class AnnotationCanvas: NSView {
     /// Discards the staged preview without redacting anything.
     func cancelSmartRedact() {
         guard !smartRedactPreviews.isEmpty else { return }
+        smartRedactGeneration &+= 1
         smartRedactPreviews = []
         onSmartRedactStateChanged?(false)
         hideSmartRedactBanner()
@@ -791,7 +811,7 @@ final class AnnotationCanvas: NSView {
     /// stays until the user picks "Redact all" or "Cancel" (or presses Enter/Esc,
     /// which run the same paths).
     private func showSmartRedactBanner(mode: SmartRedactBanner.Mode) {
-        guard let scrollView = enclosingScrollView else { return }
+        guard !isPreviewMode, let scrollView = enclosingScrollView else { return }
         smartRedactBannerDismissWork?.cancel()
         smartRedactBannerDismissWork = nil
 
@@ -1318,7 +1338,16 @@ final class AnnotationCanvas: NSView {
     var isPreviewMode = false {
         didSet {
             guard isPreviewMode != oldValue else { return }
-            if isPreviewMode { setSelection([]) }
+            if isPreviewMode {
+                commitTextField()
+                setSelection([])
+                hideSmartRedactBanner()
+                clearSpacePan()
+                NSCursor.arrow.set()
+            } else if !smartRedactPreviews.isEmpty {
+                showSmartRedactBanner(mode: .findings(count: smartRedactPreviews.count))
+            }
+            window?.invalidateCursorRects(for: self)
             setNeedsDisplay(bounds)
         }
     }
@@ -2354,7 +2383,7 @@ final class AnnotationCanvas: NSView {
                              y: point.y - textFieldContentInset.y,
                              width: 220, height: font.ascender - font.descender + 6)
         addSubview(field)
-        field.becomeFirstResponder()
+        window?.makeFirstResponder(field)
         activeTextView = field
         installTextCommitClickMonitor()
         showEmojiButton(for: field)
@@ -2378,7 +2407,7 @@ final class AnnotationCanvas: NSView {
                              y: annotation.origin.y - textFieldContentInset.y,
                              width: max(size.width + 24, 80), height: size.height + 4)
         addSubview(field)
-        field.becomeFirstResponder()
+        window?.makeFirstResponder(field)
         field.selectAll(nil)
         activeTextView = field
         installTextCommitClickMonitor()
@@ -2547,13 +2576,13 @@ final class AnnotationCanvas: NSView {
         // nowhere to insert. The NSTextView is its own editor, so the picked emoji
         // lands at its caret.
         if let field = activeTextView, field.window?.firstResponder !== field {
-            field.becomeFirstResponder()
+            field.window?.makeFirstResponder(field)
         }
         NSApp.orderFrontCharacterPalette(nil)
     }
 
     func duplicateSelected() {
-        guard !selectedObjects.isEmpty else { return }
+        guard !isPreviewMode, !selectedObjects.isEmpty else { return }
         pushUndo()
         var clones: [any AnnotationObject] = []
         for obj in selectedObjects {
@@ -2608,6 +2637,15 @@ final class AnnotationCanvas: NSView {
             crop.origin.y += delta.y
             cropRect = crop
             onCropChanged?(crop)
+        }
+
+        if !smartRedactPreviews.isEmpty {
+            smartRedactPreviews = smartRedactPreviews.map { preview in
+                SmartRedactPreview(
+                    rect: preview.rect.offsetBy(dx: delta.x, dy: delta.y),
+                    label: preview.label
+                )
+            }
         }
 
         if let activeTextView {
@@ -2678,14 +2716,14 @@ final class AnnotationCanvas: NSView {
     }
 
     func performUndo() {
-        guard let prev = undoSnapshots.popLast() else { return }
+        guard !isPreviewMode, let prev = undoSnapshots.popLast() else { return }
         redoSnapshots.append(currentSnapshot())
         applySnapshot(prev)
         onUndoStateChanged?(canUndo, canRedo)
     }
 
     func performRedo() {
-        guard let next = redoSnapshots.popLast() else { return }
+        guard !isPreviewMode, let next = redoSnapshots.popLast() else { return }
         undoSnapshots.append(currentSnapshot())
         applySnapshot(next)
         onUndoStateChanged?(canUndo, canRedo)
@@ -2695,6 +2733,7 @@ final class AnnotationCanvas: NSView {
     /// differs from the live one, swap it back and tell the controller to resync.
     private func applySnapshot(_ snapshot: EditorSnapshot) {
         commitTextField()
+        smartRedactGeneration &+= 1
         // A staged redaction preview is transient; restoring a snapshot drops it
         // so stale red boxes never linger over a different document state.
         if !smartRedactPreviews.isEmpty {
@@ -2743,6 +2782,24 @@ final class AnnotationCanvas: NSView {
             return
         }
 
+        // Zoom remains available in Preview so the exported result can still be
+        // inspected. These callbacks also keep controller fit mode truthful.
+        if event.modifierFlags.contains(.command), activeTextView == nil {
+            switch event.charactersIgnoringModifiers {
+            case "=", "+": zoomIn(); onUserZoom?(); return
+            case "-":      zoomOut(); onUserZoom?(); return
+            case "0":
+                if let onUserFit { onUserFit() } else { _ = fitToWindow() }
+                return
+            default: break
+            }
+        }
+
+        if isPreviewMode {
+            super.keyDown(with: event)
+            return
+        }
+
         // Smart Redact preview owns Enter (apply) and Esc (cancel) while staged,
         // so confirming the suggested boxes is one keystroke and bailing is Esc.
         if !smartRedactPreviews.isEmpty, activeTextView == nil {
@@ -2756,16 +2813,6 @@ final class AnnotationCanvas: NSView {
            let crop = cropRect, crop.width >= 1, crop.height >= 1 {
             onCropCommit?()
             return
-        }
-
-        // Canvas zoom (B5): ⌘+ / ⌘- / ⌘0 (fit). Checked before ⌘Z below.
-        if event.modifierFlags.contains(.command), activeTextView == nil {
-            switch event.charactersIgnoringModifiers {
-            case "=", "+": zoomIn(); return
-            case "-":      zoomOut(); return
-            case "0":      fitToWindow(); return
-            default: break
-            }
         }
 
         // ⌘Z / ⌘⇧Z for undo/redo
@@ -2828,20 +2875,6 @@ final class AnnotationCanvas: NSView {
             duplicateSelected()
             return
         }
-        // Canvas zoom shortcuts: Cmd+plus / Cmd+minus step, Cmd+0 fits. The "="
-        // key doubles as "+" so the unshifted keystroke works like every editor.
-        if event.modifierFlags.contains(.command), activeTextView == nil {
-            switch event.charactersIgnoringModifiers {
-            case "+", "=":
-                zoomIn(); onUserZoom?(); return
-            case "-":
-                zoomOut(); onUserZoom?(); return
-            case "0":
-                onUserFit?(); return
-            default: break
-            }
-        }
-
         // Single-key tool shortcuts (only when no text field is active and no command key)
         if activeTextView == nil && !event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers?.lowercased() {
@@ -3004,7 +3037,7 @@ final class AnnotationCanvas: NSView {
     }
 
     func deleteSelected() {
-        guard !selectedObjects.isEmpty else { return }
+        guard !isPreviewMode, !selectedObjects.isEmpty else { return }
         pushUndo()
         let ids = Set(selectedObjects.map(\.id))
         let removedSteps = objects.contains { ids.contains($0.id) && $0 is NumberedStepAnnotation }
