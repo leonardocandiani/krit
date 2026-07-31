@@ -17,6 +17,13 @@ enum PreferencesTab: Int, CaseIterable {
     case permissions = 8
     case about = 6
 
+    /// Looks a tab up by its lower-cased title, for `krit://preferences/<name>`.
+    init?(name: String) {
+        guard let match = Self.allCases.first(where: { $0.title.lowercased() == name.lowercased() })
+        else { return nil }
+        self = match
+    }
+
     var title: String {
         switch self {
         case .general:     return "General"
@@ -58,6 +65,38 @@ enum PreferencesTab: Int, CaseIterable {
         case .about:       return "Version, updates, license, and project links."
         }
     }
+
+    /// The colour of this section's glyph tile. Categorical, the way System
+    /// Settings uses it: after the first read, the row is found by colour and
+    /// position rather than by re-reading nine labels. Recording is the one
+    /// that has to be red, because that is what a record control means
+    /// everywhere else on the system.
+    var tileColor: NSColor {
+        switch self {
+        case .general:     return .systemGray
+        case .capture:     return KritColors.accent
+        case .recording:   return .systemRed
+        case .preview:     return .systemTeal
+        case .editor:      return .systemPurple
+        case .shortcuts:   return .systemIndigo
+        case .presets:     return .systemPink
+        case .permissions: return .systemGreen
+        case .about:       return .systemBlue
+        }
+    }
+
+    /// Section this tab belongs to in the sidebar, or nil when it needs no
+    /// header above it. Grouping nine flat rows into three named blocks is what
+    /// turns a list into a map.
+    var group: String? {
+        switch self {
+        case .general:     return nil
+        case .capture:     return "Capture"
+        case .editor:      return "Editing"
+        case .shortcuts:   return "KRIT"
+        default:           return nil
+        }
+    }
 }
 
 /// Native macOS Settings shell: AppKit owns the window and source-list sidebar,
@@ -86,7 +125,11 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         window.title = "KRIT Settings"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
-        window.isMovableByWindowBackground = true
+        // Deliberately NOT movable by background. Settings is a form: dragging a
+        // slider, a segmented control or a text field would otherwise hand the
+        // drag to the window and move the whole thing instead of the control.
+        // The transparent titlebar is still there to drag by.
+        window.isMovableByWindowBackground = false
         window.center()
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 760, height: 540)
@@ -202,10 +245,31 @@ final class NativePreferencesSidebar: NSObject, NSTableViewDataSource, NSTableVi
 
     let view: NSView
 
+    /// A sidebar line is either a section header or a tab. Nine flat rows read
+    /// as a list; the same nine under three headers read as a map, which is the
+    /// whole reason the headers exist.
+    private enum Row {
+        case header(String)
+        case tab(PreferencesTab)
+
+        var tab: PreferencesTab? {
+            if case .tab(let t) = self { return t }
+            return nil
+        }
+    }
+
     private let tableView = NSTableView()
-    private let tabs = PreferencesTab.allCases
+    private let rows: [Row] = PreferencesTab.allCases.flatMap { tab -> [Row] in
+        guard let group = tab.group else { return [.tab(tab)] }
+        return [.header(group), .tab(tab)]
+    }
     private let onSelect: (PreferencesTab) -> Void
     private var suppressSelectionCallback = false
+
+    /// Row index of a tab, for selection round-trips.
+    private func index(of tab: PreferencesTab) -> Int? {
+        rows.firstIndex { $0.tab == tab }
+    }
 
     init(width: CGFloat, height: CGFloat, onSelect: @escaping (PreferencesTab) -> Void) {
         self.onSelect = onSelect
@@ -238,43 +302,72 @@ final class NativePreferencesSidebar: NSObject, NSTableViewDataSource, NSTableVi
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scrollView)
 
+        // Update check lives at the foot of the sidebar, out of the section
+        // list: it is an action, not a destination, and putting it among the
+        // tabs would make it read as a tenth place to go.
+        let update = SidebarFooterButton(title: "Check for updates", symbol: "arrow.trianglehead.2.clockwise") {
+            UpdaterManager.shared.checkForUpdates()
+        }
+        update.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(update)
+
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
             scrollView.topAnchor.constraint(equalTo: view.topAnchor, constant: 58),
-            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10),
+            scrollView.bottomAnchor.constraint(equalTo: update.topAnchor, constant: -10),
+
+            update.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+            update.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            update.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
+            update.heightAnchor.constraint(equalToConstant: 32),
         ])
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { tabs.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let identifier = NSUserInterfaceItemIdentifier("preferences.sidebar.cell")
-        let cell: NativePreferencesSidebarCell
-        if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NativePreferencesSidebarCell {
-            cell = reused
-        } else {
-            cell = NativePreferencesSidebarCell()
+        switch rows[row] {
+        case .header(let title):
+            let identifier = NSUserInterfaceItemIdentifier("preferences.sidebar.header")
+            let view = tableView.makeView(withIdentifier: identifier, owner: self) as? PreferencesSidebarHeader
+                ?? PreferencesSidebarHeader()
+            view.identifier = identifier
+            view.configure(title: title)
+            return view
+        case .tab(let tab):
+            let identifier = NSUserInterfaceItemIdentifier("preferences.sidebar.cell")
+            let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NativePreferencesSidebarCell
+                ?? NativePreferencesSidebarCell()
             cell.identifier = identifier
+            cell.configure(tab: tab, selected: tableView.selectedRowIndexes.contains(row))
+            return cell
         }
-        cell.configure(tab: tabs[row], selected: tableView.selectedRowIndexes.contains(row))
-        return cell
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         NativePreferencesSidebarRowView()
     }
 
+    /// A header is a label, not a destination: arrow keys and clicks skip it.
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        rows[row].tab != nil
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        rows[row].tab == nil ? 30 : 36
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
         refreshVisibleCells()
         guard !suppressSelectionCallback,
               tableView.selectedRow >= 0,
-              tableView.selectedRow < tabs.count else { return }
-        onSelect(tabs[tableView.selectedRow])
+              let tab = rows[tableView.selectedRow].tab else { return }
+        onSelect(tab)
     }
 
     func setSelected(_ tab: PreferencesTab) {
-        guard let row = tabs.firstIndex(of: tab) else { return }
+        guard let row = index(of: tab) else { return }
         if tableView.selectedRow != row {
             suppressSelectionCallback = true
             tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
@@ -285,18 +378,19 @@ final class NativePreferencesSidebar: NSObject, NSTableViewDataSource, NSTableVi
     }
 
     private func refreshVisibleCells() {
-        for row in 0..<tabs.count {
-            guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false)
+        for row in rows.indices {
+            guard let tab = rows[row].tab,
+                  let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false)
                     as? NativePreferencesSidebarCell else { continue }
-            cell.configure(tab: tabs[row], selected: tableView.selectedRowIndexes.contains(row))
+            cell.configure(tab: tab, selected: tableView.selectedRowIndexes.contains(row))
         }
     }
 
     var uiTestTableView: NSTableView { tableView }
 
     var uiTestSelectedTab: PreferencesTab? {
-        guard tableView.selectedRow >= 0, tableView.selectedRow < tabs.count else { return nil }
-        return tabs[tableView.selectedRow]
+        guard tableView.selectedRow >= 0 else { return nil }
+        return rows[tableView.selectedRow].tab
     }
 }
 
@@ -305,7 +399,105 @@ private final class PreferencesSeparatorView: NSView {
     override var wantsUpdateLayer: Bool { true }
 
     override func updateLayer() {
-        layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.14).cgColor
+        layer?.backgroundColor = KritColors.hairline.cgColor
+    }
+}
+
+/// A soft-tinted action button: accent at low alpha for the fill, accent for
+/// the label. Reads as actionable without competing with the primary button in
+/// the content pane, which is the only place a solid accent fill belongs.
+@MainActor
+private final class SidebarFooterButton: NSView {
+    private let action: () -> Void
+    private let label = NSTextField(labelWithString: "")
+    private let glyph = NSImageView()
+    private var hovered = false
+    private var tracking: NSTrackingArea?
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    init(title: String, symbol: String, action: @escaping () -> Void) {
+        self.action = action
+        super.init(frame: .zero)
+
+        wantsLayer = true
+        layer?.cornerRadius = ChromeFactory.Radius.control
+        layer?.cornerCurve = .continuous
+
+        glyph.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        glyph.contentTintColor = KritColors.accent
+        glyph.translatesAutoresizingMaskIntoConstraints = false
+        glyph.setAccessibilityElement(false)
+        addSubview(glyph)
+
+        label.attributedStringValue = KritType.bodyEmphasis.string(title, color: KritColors.accent)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+
+        let content = NSLayoutGuide()
+        addLayoutGuide(content)
+        NSLayoutConstraint.activate([
+            content.centerXAnchor.constraint(equalTo: centerXAnchor),
+            glyph.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: glyph.trailingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
+        applyAppearance()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+                                  owner: self)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true; applyAppearance() }
+    override func mouseExited(with event: NSEvent) { hovered = false; applyAppearance() }
+    override func mouseDown(with event: NSEvent) { action() }
+
+    private func applyAppearance() {
+        let alpha: CGFloat = hovered ? 0.20 : 0.12
+        crossfadeBackground(to: KritColors.accent.withAlphaComponent(alpha))
+    }
+}
+
+/// An all-caps group label above a run of sidebar rows. Tracked wide and set in
+/// the tertiary tone so the block recedes while every letter stays legible.
+@MainActor
+private final class PreferencesSidebarHeader: NSView {
+    private let label = NSTextField(labelWithString: "")
+
+    init() {
+        super.init(frame: .zero)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            // Sits low in its row so the label hugs the group it introduces
+            // rather than floating between two groups.
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
+
+    func configure(title: String) {
+        label.attributedStringValue = KritType.sectionLabel.string(title, color: KritColors.textTertiary)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel(title)
     }
 }
 
@@ -321,11 +513,17 @@ private final class NativePreferencesSidebarRowView: NSTableRowView {
 @MainActor
 private final class NativePreferencesSidebarCell: NSTableCellView {
 
+    /// The filled rounded square the glyph sits on, matching the Settings
+    /// pattern. It owns its own layer so source-list vibrancy cannot
+    /// reinterpret the fill, which is the same reason the row's selection is
+    /// drawn here instead of in `drawSelection`.
+    private let tile = NSView()
     private let glyph = NSImageView()
     private let label = NSTextField(labelWithString: "")
     private var isSelected = false
     private var isHovered = false
     private var tracking: NSTrackingArea?
+    private var tab: PreferencesTab = .general
 
     override var mouseDownCanMoveWindow: Bool { false }
 
@@ -336,12 +534,24 @@ private final class NativePreferencesSidebarCell: NSTableCellView {
         layer?.cornerRadius = ChromeFactory.Radius.control
         layer?.cornerCurve = .continuous
 
+        tile.wantsLayer = true
+        // Concentric with the row's own radius: the tile is inset inside it, so
+        // its corner has to be the smaller one or the two shapes stop being
+        // parallel.
+        tile.layer?.cornerRadius = 6
+        tile.layer?.cornerCurve = .continuous
+        tile.layer?.borderWidth = KritColors.hairlineWidth
+        tile.layer?.borderColor = NSColor.black.withAlphaComponent(0.10).cgColor
+        tile.translatesAutoresizingMaskIntoConstraints = false
+        tile.setAccessibilityElement(false)
+        addSubview(tile)
+
         glyph.imageScaling = .scaleProportionallyDown
         glyph.translatesAutoresizingMaskIntoConstraints = false
         glyph.setAccessibilityElement(false)
-        addSubview(glyph)
+        glyph.contentTintColor = .white
+        tile.addSubview(glyph)
 
-        label.font = .systemFont(ofSize: 13, weight: .medium)
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
@@ -349,11 +559,15 @@ private final class NativePreferencesSidebarCell: NSTableCellView {
         imageView = glyph
 
         NSLayoutConstraint.activate([
-            glyph.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
-            glyph.widthAnchor.constraint(equalToConstant: 17),
-            glyph.heightAnchor.constraint(equalToConstant: 17),
-            label.leadingAnchor.constraint(equalTo: glyph.trailingAnchor, constant: 10),
+            tile.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            tile.centerYAnchor.constraint(equalTo: centerYAnchor),
+            tile.widthAnchor.constraint(equalToConstant: 22),
+            tile.heightAnchor.constraint(equalToConstant: 22),
+            glyph.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
+            glyph.centerYAnchor.constraint(equalTo: tile.centerYAnchor),
+            glyph.widthAnchor.constraint(equalToConstant: 13),
+            glyph.heightAnchor.constraint(equalToConstant: 13),
+            label.leadingAnchor.constraint(equalTo: tile.trailingAnchor, constant: 10),
             label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
@@ -384,27 +598,32 @@ private final class NativePreferencesSidebarCell: NSTableCellView {
     }
 
     func configure(tab: PreferencesTab, selected: Bool) {
+        self.tab = tab
         isSelected = selected
         glyph.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: nil)
-        glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        tile.layer?.backgroundColor = tab.tileColor.cgColor
         label.stringValue = tab.title
         setAccessibilityLabel(tab.title)
         applyAppearance()
     }
 
     private func applyAppearance() {
+        // The tile keeps its colour in every state: it identifies the row, so
+        // dimming it on hover would cost the one thing it is there for. Only
+        // the row fill and the label weight answer to selection.
+        let role: KritType = isSelected ? .bodyEmphasis : .body
+        label.attributedStringValue = role.string(
+            tab.title,
+            color: isSelected ? KritColors.textStrong : KritColors.textPrimary
+        )
+
         if isSelected {
             layer?.backgroundColor = KritColors.navigationSelectionFill.cgColor
-            glyph.contentTintColor = KritColors.accent
-            label.textColor = .labelColor
         } else if isHovered {
             layer?.backgroundColor = KritColors.navigationHoverFill.cgColor
-            glyph.contentTintColor = .labelColor
-            label.textColor = .labelColor
         } else {
             layer?.backgroundColor = NSColor.clear.cgColor
-            glyph.contentTintColor = .secondaryLabelColor
-            label.textColor = .labelColor
         }
     }
 }

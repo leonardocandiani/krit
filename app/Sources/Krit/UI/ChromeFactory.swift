@@ -28,11 +28,21 @@ enum ChromeFactory {
 
     /// Corner-radius scale shared by every glass surface, so radii stay
     /// consistent and concentric across the app.
+    /// One ruler, not two. These used to be their own scale (panel 16, card 12,
+    /// control 11), which is why a window built here and a window built from
+    /// KritMetrics read as two different apps sitting next to each other: the
+    /// eye catches a 4pt difference in corner radius long before it can name it.
+    /// Every surface now derives from the same numbers, so restyling one screen
+    /// no longer means the rest drift out of step.
     enum Radius {
-        static let dock: CGFloat = 18
-        static let panel: CGFloat = 16
-        static let card: CGFloat = 12
-        static let control: CGFloat = 11
+        /// The recording bars are floating chrome, the same class of surface as
+        /// a floating panel, so they take the same corner.
+        static let dock: CGFloat = KritMetrics.Radius.panel
+        static let panel: CGFloat = KritMetrics.Radius.panel
+        static let card: CGFloat = KritMetrics.Radius.card
+        static let control: CGFloat = KritMetrics.Radius.cell
+        /// Kept tight: pills are short, and a pill rounder than its own height
+        /// stops being a pill.
         static let pill: CGFloat = 6
     }
 
@@ -43,25 +53,53 @@ enum ChromeFactory {
 
     /// Wraps `content` in a glass (or blur) capsule with the given radius.
     /// The returned view owns `content`; size the returned view, not content.
+    ///
+    /// `alwaysDark` pins the capsule to the dark appearance in both themes. Use
+    /// it for chrome that floats over *user content* rather than over the app:
+    /// a screenshot can be any colour, so a capsule that follows the system
+    /// theme would be white-on-white half the time. Pinning it dark also fixes
+    /// the controls inside, which then know their glyphs must be light.
     @MainActor
-    static func make(content: NSView, cornerRadius: CGFloat, variant: Variant = .regular, tint: NSColor? = nil) -> NSView {
+    static func make(content: NSView, cornerRadius: CGFloat, variant: Variant = .regular, tint: NSColor? = nil, alwaysDark: Bool = false) -> NSView {
         content.translatesAutoresizingMaskIntoConstraints = false
+        let capsule: NSView
+        // Real glass samples what is behind it, so it cannot be held dark: over a
+        // light screenshot it turns white and takes the light glyphs inside it
+        // with it. Chrome that must stay dark uses the HUD material instead,
+        // which is the same translucent dark the reference app draws.
+        if alwaysDark {
+            let blur = makeBlur(cornerRadius: cornerRadius, variant: variant, tint: tint)
+            blur.appearance = NSAppearance(named: .darkAqua)
+            blur.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+                content.topAnchor.constraint(equalTo: blur.topAnchor),
+                content.bottomAnchor.constraint(equalTo: blur.bottomAnchor),
+            ])
+            return blur
+        }
         if #available(macOS 26.0, *), !forceFallback {
             let glass = NSGlassEffectView()
             glass.contentView = content
             glass.cornerRadius = cornerRadius
             if let tint { glass.tintColor = tint }
-            return glass
+            capsule = glass
+        } else {
+            let blur = makeBlur(cornerRadius: cornerRadius, variant: variant, tint: tint)
+            blur.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+                content.topAnchor.constraint(equalTo: blur.topAnchor),
+                content.bottomAnchor.constraint(equalTo: blur.bottomAnchor),
+            ])
+            capsule = blur
         }
-        let blur = makeBlur(cornerRadius: cornerRadius, variant: variant, tint: tint)
-        blur.addSubview(content)
-        NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
-            content.topAnchor.constraint(equalTo: blur.topAnchor),
-            content.bottomAnchor.constraint(equalTo: blur.bottomAnchor),
-        ])
-        return blur
+        // Set on the capsule, which the content inherits: setting it on the
+        // content alone leaves the material itself following the system theme.
+        if alwaysDark { capsule.appearance = NSAppearance(named: .darkAqua) }
+        return capsule
     }
 
     /// A standalone glass (or blur) backing view meant to sit *behind* controls,
@@ -137,7 +175,11 @@ enum ChromeFactory {
             let highContrast = ws.accessibilityDisplayShouldIncreaseContrast
             let lessTransparent = ws.accessibilityDisplayShouldReduceTransparency
             let borderAlpha: CGFloat = highContrast ? 0.55 : (lessTransparent ? 0.30 : 0.18)
-            blur.layer?.borderWidth = highContrast ? 1.5 : 1
+            // Half a point is one physical line on Retina. A full point draws
+            // the rim at double the intended weight, which is what makes the
+            // fallback look heavier than real glass. Increase Contrast is the
+            // one case that deliberately asks for a visible edge.
+            blur.layer?.borderWidth = highContrast ? 1.5 : KritColors.hairlineWidth
             blur.layer?.borderColor = NSColor.white.withAlphaComponent(borderAlpha).cgColor
         }
 

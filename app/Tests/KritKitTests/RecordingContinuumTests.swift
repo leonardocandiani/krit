@@ -181,8 +181,13 @@ final class RecordingContinuumTests: XCTestCase {
         XCTAssertEqual(RecordingChrome.hudShellRadius, RecordingChrome.preflightShellRadius)
         XCTAssertEqual(RecordingChrome.resultShellRadius, ChromeFactory.Radius.panel)
         XCTAssertEqual(RecordingChrome.controlRadius, ChromeFactory.Radius.control)
-        XCTAssertEqual(RecordingChrome.overlayShadow.opacity, 0.56)
-        XCTAssertEqual(RecordingChrome.overlayShadow.radius, 24)
+        // Wide and soft, the shadow a menu casts. The point of pinning it is
+        // that both recording surfaces share one shadow, and that it stays in
+        // the range that reads as "floating" rather than as a dark rectangle
+        // painted underneath, which is what 0.56 looked like over pale content.
+        XCTAssertEqual(RecordingChrome.overlayShadow.opacity, 0.22)
+        XCTAssertLessThanOrEqual(RecordingChrome.overlayShadow.opacity, 0.30)
+        XCTAssertEqual(RecordingChrome.overlayShadow.radius, 28)
         XCTAssertLessThan(RecordingChrome.contrastFloorAlpha, 0.68)
     }
 

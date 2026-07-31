@@ -78,6 +78,8 @@ final class UITestRunner: NSObject {
             case "sound":        report = Self.runSoundProbe()
             case "onboarding":   report = await Self.runOnboardingSuite()
             case "preferences":  report = await Self.runPreferencesSuite()
+            case "prefs-visual": report = await Self.runPrefsVisual()
+            case "editor-visual": report = await Self.runEditorVisual()
             case "launch-readiness": report = await Self.runLaunchReadiness()
             case "permissions-tab": report = await Self.runPermissionsTab()
             case "overlay-show": report = await Self.runOverlayShowSuite()
@@ -6323,12 +6325,10 @@ final class UITestRunner: NSObject {
             tb.selectToolExternally(.text)
             try? await Task.sleep(nanoseconds: 400_000_000)
             tb.layoutSubtreeIfNeeded()
-            // What matters is that no button is CLIPPED by the edge, not that the
-            // full design trailing inset survives. fittingWidth bakes in that inset
-            // (desired breathing room); the content actually ends trailingInset
-            // earlier. So the row clips only if (fittingWidth - trailingInset)
-            // overflows the window. The snapshot confirms the visual.
-            let contentRightEdge = tb.fittingWidth - AnnotationToolbar.trailingInset
+            // What matters is that no button is CLIPPED by the edge. The toolbar
+            // is a floating pill now, so fittingWidth IS its content width: it
+            // clips when that width cannot fit between the stage's two margins.
+            let contentRightEdge = tb.fittingWidth
             textToolHeaderPass = contentRightEdge <= window.frame.width + 0.5
             r["textToolFittingWidth"] = Double(tb.fittingWidth)
             r["textToolContentRightEdge"] = Double(contentRightEdge)
@@ -7894,6 +7894,154 @@ final class UITestRunner: NSObject {
             if let hit = findView(in: sub, where: predicate) { return hit }
         }
         return nil
+    }
+
+    /// Snapshots the editor: the surface the app is actually used through.
+    ///
+    /// Four states, in both appearances: bare canvas, canvas with the background
+    /// panel open, and the same two with an annotation on top. Enough to judge
+    /// the toolbar, the stage and the sidebar together, which is where a
+    /// redesign either holds or falls apart.
+    private static func runEditorVisual() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let dir = "/tmp/krit-editor-visual"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        var written: [String] = []
+
+        let saved = Settings.appearanceMode
+        defer { Settings.appearanceMode = saved; AppearanceMode.applyCurrent() }
+
+        for mode in [AppearanceMode.light, .dark] {
+            Settings.appearanceMode = mode
+            AppearanceMode.applyCurrent()
+            try? await Task.sleep(nanoseconds: 300_000_000)
+
+            let name = mode == .dark ? "dark" : "light"
+            AnnotationWindowController.open(image: Self.sampleShot())
+            try? await Task.sleep(nanoseconds: 1_100_000_000)
+            guard let ctrl = AnnotationWindowController.uiTestLastController,
+                  let window = ctrl.window else { continue }
+
+            if Self.snapshotWindow(window, to: "\(dir)/\(name)-1-bare.png") {
+                written.append("\(name)-1-bare.png")
+            }
+
+            ctrl.uiTestToggleSidebar()
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            if Self.snapshotWindow(window, to: "\(dir)/\(name)-2-sidebar.png") {
+                written.append("\(name)-2-sidebar.png")
+            }
+
+            // Spacing is checked by number, not by eye. A render tells you the
+            // panel "looks about right"; these say whether it sits on the ruler.
+            if mode == .light, let metrics = ctrl.uiTestChromeMetrics {
+                for (key, value) in metrics { r["metric.\(key)"] = value }
+            }
+
+            var options = ctrl.uiTestOptions
+            options.isEnabled = true
+            ctrl.uiTestApplyBackground(options)
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            if Self.snapshotWindow(window, to: "\(dir)/\(name)-3-background.png") {
+                written.append("\(name)-3-background.png")
+            }
+
+            window.close()
+            try? await Task.sleep(nanoseconds: 400_000_000)
+        }
+
+        r["dir"] = dir
+        r["written"] = written
+        r["allPass"] = written.count == 6
+        return r
+    }
+
+    /// A stand-in capture that looks like a real screenshot rather than a flat
+    /// fill: a window mock on a gradient. A chapado rectangle hides exactly the
+    /// contrast problems a stage is supposed to reveal.
+    private static func sampleShot() -> NSImage {
+        let size = NSSize(width: 900, height: 580)
+        let img = NSImage(size: size)
+        img.lockFocus()
+
+        NSGradient(colors: [
+            NSColor(srgbRed: 0.42, green: 0.60, blue: 1.0, alpha: 1),
+            NSColor(srgbRed: 0.72, green: 0.51, blue: 0.94, alpha: 1),
+            NSColor(srgbRed: 0.95, green: 0.41, blue: 0.56, alpha: 1),
+        ])?.draw(in: NSRect(origin: .zero, size: size), angle: 300)
+
+        let card = NSRect(x: 90, y: 80, width: 720, height: 420)
+        let path = NSBezierPath(roundedRect: card, xRadius: 12, yRadius: 12)
+        NSColor(srgbRed: 0.99, green: 0.99, blue: 1.0, alpha: 0.97).setFill()
+        path.fill()
+
+        NSColor(srgbRed: 0.93, green: 0.93, blue: 0.95, alpha: 1).setFill()
+        NSRect(x: 90, y: 452, width: 720, height: 48).fill()
+        for (i, dot) in [NSColor.systemRed, .systemYellow, .systemGreen].enumerated() {
+            dot.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 108 + i * 20, y: 470, width: 12, height: 12)).fill()
+        }
+
+        NSColor(white: 0.82, alpha: 1).setFill()
+        for row in 0..<7 {
+            let w = [520.0, 470.0, 560.0, 380.0, 500.0, 430.0, 300.0][row]
+            NSRect(x: 130, y: 390 - Double(row) * 44, width: w, height: 14).fill()
+        }
+        img.unlockFocus()
+        return img
+    }
+
+    /// Renders every Preferences tab, in both appearances, straight into PNGs.
+    ///
+    /// `cacheDisplay` draws the view hierarchy into a bitmap itself, so this is
+    /// the one way to see the UI when ScreenCaptureKit cannot help: with the
+    /// session locked every screen capture returns nil, and that is exactly when
+    /// a remote check is most useful. The hosting view is parented to a window
+    /// that is never ordered front, purely so layout gets a real pass.
+    private static func runPrefsVisual() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        let dir = URL(fileURLWithPath: "/tmp/krit-prefs-visual")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var written: [String] = []
+        let size = NSSize(width: 664, height: 940)
+
+        for name in [NSAppearance.Name.aqua, .darkAqua] {
+            guard let appearance = NSAppearance(named: name) else { continue }
+            let mode = name == .darkAqua ? "dark" : "light"
+
+            for tab in PreferencesTab.allCases {
+                let host = PreferencesContent.makeView(for: tab)
+                host.frame = NSRect(origin: .zero, size: size)
+                host.appearance = appearance
+
+                let window = NSWindow(contentRect: host.frame,
+                                      styleMask: [.borderless],
+                                      backing: .buffered,
+                                      defer: false)
+                window.appearance = appearance
+                window.contentView = host
+                host.layoutSubtreeIfNeeded()
+
+                // SwiftUI needs a turn of the run loop before its first real
+                // layout; without it every tab renders as an empty rectangle.
+                try? await Task.sleep(nanoseconds: 220_000_000)
+                host.layoutSubtreeIfNeeded()
+
+                guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { continue }
+                host.cacheDisplay(in: host.bounds, to: rep)
+                guard let png = rep.representation(using: .png, properties: [:]) else { continue }
+
+                let file = "\(mode)-\(tab.title.lowercased()).png"
+                try? png.write(to: dir.appendingPathComponent(file))
+                written.append(file)
+                window.contentView = nil
+            }
+        }
+
+        r["dir"] = dir.path
+        r["written"] = written
+        r["allPass"] = written.count == PreferencesTab.allCases.count * 2
+        return r
     }
 }
 

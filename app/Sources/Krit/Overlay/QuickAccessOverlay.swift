@@ -213,6 +213,24 @@ private final class OverlayInteractionCoordinator {
 }
 
 @MainActor
+/// Hovering a card ACTIVATES the app so Space and ⌘-keys work without a click
+/// (see grabKey). The cost is that a keystroke the user aimed at whatever app
+/// was frontmost can land on the card instead: the cursor drifts over a fresh
+/// card, KRIT steals the keyboard, and the ⌘E already in flight opens the
+/// editor "out of nowhere". Keys only count once the focus has settled.
+enum KeyFocusSettling {
+    /// A hand that moved the mouse needs longer than this to then press a key,
+    /// so nothing a user actually meant falls inside the window.
+    nonisolated static let delay: CFAbsoluteTime = 0.25
+
+    /// Pure arithmetic, deliberately off the main actor so it stays testable
+    /// without standing up a window.
+    nonisolated static func hasSettled(takenAt: CFAbsoluteTime,
+                                       now: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) -> Bool {
+        now - takenAt >= delay
+    }
+}
+
 private final class QuickAccessWindow: NSWindow {
 
     /// Keep strong refs so ARC doesn't deallocate while visible.
@@ -432,6 +450,11 @@ private final class QuickAccessWindow: NSWindow {
     /// and how many the hover/ownership gate dropped.
     nonisolated(unsafe) static var uiTestKeySeen = 0
     nonisolated(unsafe) static var uiTestKeyGateDrop = 0
+    /// Keys dropped by the settling window right after the card took focus.
+    nonisolated(unsafe) static var uiTestKeySettleDrop = 0
+
+    /// When this window last became key, the clock KeyFocusSettling reads.
+    private var keyFocusTakenAt: CFAbsoluteTime = 0
     nonisolated(unsafe) static var uiTestGestureEntryCount = 0
     /// Conveyor trace: proves the REAL (synchronous) drag actually translated the
     /// siblings DURING the gesture, which an end-state "all parked" check can't tell
@@ -611,6 +634,13 @@ private final class QuickAccessWindow: NSWindow {
             QuickAccessWindow.uiTestKeyGateDrop += 1
             return false
         }
+        // Focus we took by hover, not by a click, is not yet consent to act on
+        // keys: drop whatever arrives while it settles. Returning false leaves
+        // the event to the system instead of consuming it silently.
+        if !KeyFocusSettling.hasSettled(takenAt: keyFocusTakenAt) {
+            QuickAccessWindow.uiTestKeySettleDrop += 1
+            return false
+        }
         return handleKey(event)
     }
 
@@ -678,6 +708,14 @@ private final class QuickAccessWindow: NSWindow {
             QuickLookController.shared.close(owner: self)
             if isKeyWindow { releaseKey() }
         }
+    }
+
+    /// Stamped on every path that hands us the keyboard, the retries inside
+    /// grabKey included, so the settling window is measured from the moment
+    /// focus actually landed rather than from when we asked for it.
+    override func becomeKey() {
+        super.becomeKey()
+        keyFocusTakenAt = CFAbsoluteTimeGetCurrent()
     }
 
     /// Borrow keyboard focus for this card. Escalates the LSUIElement app to
@@ -1365,11 +1403,31 @@ private final class QuickAccessWindow: NSWindow {
         container.layer?.cornerRadius = metrics.cornerRadius
         container.layer?.cornerCurve = .continuous
         container.layer?.masksToBounds = false
+        // Lift shadow. The card used to carry a single 0.55 shadow, which reads
+        // as a drop-shadow filter rather than an object above the desktop: too
+        // dark to sit over light wallpaper, too diffuse to say how high it
+        // floats. Same two-part recipe as the editor chrome, one layer for the
+        // contact edge and one for the lift, because CALayer draws only one.
         container.layer?.shadowColor = NSColor.black.cgColor
-        container.layer?.shadowOpacity = 0.55
+        container.layer?.shadowOpacity = 0.22
         container.layer?.shadowRadius = metrics.shadowRadius
         container.layer?.shadowOffset = CGSize(width: 0, height: -10)
         contentView = container
+
+        // Views rather than raw sublayers: the card animates its frame during
+        // the zoom, and CALayer autoresizing does not survive that on a
+        // layer-backed NSView.
+        let contactShadow = NSView(frame: container.bounds)
+        contactShadow.wantsLayer = true
+        contactShadow.layer?.cornerRadius = metrics.cornerRadius
+        contactShadow.layer?.cornerCurve = .continuous
+        contactShadow.layer?.backgroundColor = NSColor.black.cgColor
+        contactShadow.layer?.shadowColor = NSColor.black.cgColor
+        contactShadow.layer?.shadowOpacity = 0.10
+        contactShadow.layer?.shadowRadius = 6
+        contactShadow.layer?.shadowOffset = CGSize(width: 0, height: -2)
+        contactShadow.autoresizingMask = [.width, .height]
+        container.addSubview(contactShadow)
 
         // Autoresizing so the visual layers grow with the window during the O5
         // zoom (the window frame animates; subviews follow without a rebuild).
@@ -1384,7 +1442,28 @@ private final class QuickAccessWindow: NSWindow {
         clipView.autoresizingMask = [.width, .height]
         // Subtle dark tint, frames content, visible at rounded corners and behind image
         clipView.layer?.backgroundColor = KritColors.overlayTint.cgColor
+        // Inner rim, the hairline that separates the card from whatever it sits
+        // on. Without it a dark screenshot on a dark wallpaper has no edge.
+        clipView.layer?.borderWidth = KritColors.hairlineWidth
+        clipView.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
         container.addSubview(clipView)
+
+        // Top specular line: the top edge catching light, which is what reads as
+        // glass rather than as a rounded rectangle. Same gradient as the editor
+        // chrome, laid over the clip so it follows the corner radius.
+        let gradient = CAGradientLayer()
+        gradient.colors = [
+            NSColor.white.withAlphaComponent(0.30).cgColor,
+            NSColor.white.withAlphaComponent(0).cgColor,
+        ]
+        gradient.startPoint = CGPoint(x: 0.5, y: 1)
+        gradient.endPoint = CGPoint(x: 0.5, y: 0)
+        let highlight = NSView(frame: NSRect(x: 0, y: totalH - 3, width: thumbW, height: 3))
+        highlight.layer = gradient
+        highlight.wantsLayer = true
+        highlight.autoresizingMask = [.width, .minYMargin]
+        // Added last (bottom of this method) so it sits over the thumbnail: a
+        // specular line under the image is a line nobody sees.
 
         // White border, primary edge definition on light wallpapers (shadow handles dark)
         let borderView = PassthroughView(frame: container.bounds)
@@ -1641,6 +1720,8 @@ private final class QuickAccessWindow: NSWindow {
             progressBg.addSubview(progressFill)
             timeoutProgressLayer = progressFill.layer
         }
+
+        clipView.addSubview(highlight, positioned: .above, relativeTo: nil)
     }
 
     /// Video affordance: a centered play disc + a mm:ss duration pill pinned to the
@@ -4007,6 +4088,7 @@ private extension QuickAccessWindow {
             "cardFrames": QuickAccessWindow.openWindows.map { "\(Int($0.frame.origin.x)),\(Int($0.frame.origin.y)) \(Int($0.frame.width))x\(Int($0.frame.height))" },
             "keySeen": QuickAccessWindow.uiTestKeySeen,
             "keyGateDrop": QuickAccessWindow.uiTestKeyGateDrop,
+            "keySettleDrop": QuickAccessWindow.uiTestKeySettleDrop,
         ]
     }
     func uiTestEntranceSnapshot() -> [String: Any] {

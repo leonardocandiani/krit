@@ -136,6 +136,25 @@ enum Settings {
         set { defaults.set(newValue.rawValue, forKey: "appearanceMode") }
     }
 
+    /// How opaque the editor's chrome is, from 0 (fully see-through, the desktop
+    /// reads straight through the panel) to 1 (solid).
+    ///
+    /// A preference rather than a constant because the right amount depends on
+    /// the wallpaper underneath: over a busy photo, glass that looks elegant on
+    /// a plain desktop turns the controls into noise. Default sits high enough
+    /// that text stays comfortable without the panel reading as a solid slab.
+    static var editorChromeOpacity: Double {
+        get {
+            guard defaults.object(forKey: "editorChromeOpacity") != nil else { return 0.82 }
+            return min(max(defaults.double(forKey: "editorChromeOpacity"), 0.35), 1)
+        }
+        set { defaults.set(min(max(newValue, 0.35), 1), forKey: "editorChromeOpacity") }
+    }
+
+    /// Posted when the chrome opacity changes, so open editors restyle live
+    /// instead of only picking it up the next time one is opened.
+    static let editorChromeOpacityChanged = Notification.Name("krit.editorChromeOpacityChanged")
+
     static var showMenuBarIcon: Bool {
         get {
             if defaults.object(forKey: "showMenuBarIcon") == nil { return true }

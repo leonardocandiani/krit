@@ -79,6 +79,12 @@ enum URLCommandRouter {
             appDelegate.captureText()
         case "history":
             appDelegate.openHistory()
+        case "preferences":
+            // The window is otherwise reachable only through the menu bar, which
+            // needs Accessibility permission to drive. Being able to open a
+            // named tab is what makes the Preferences UI verifiable at runtime
+            // instead of by reading its code.
+            PreferencesWindowController.shared.show(tab: PreferencesTab(name: action) ?? .general)
         default:
             log.error("krit url: unknown verb \(verb, privacy: .public); ignoring")
         }

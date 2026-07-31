@@ -14,14 +14,25 @@ final class AnnotationWindowController: NSWindowController {
     private static let initialScreenHeightFraction: CGFloat = 0.84
     private static let initialScreenEdgeInset: CGFloat = 24
 
-    // Shared stage metrics: used both at init and on every relayout so the header,
-    // canvas, sidebar and bottom bar stay registered with one another. The toolbar
-    // owns the canonical height of the single command band.
-    private static let toolbarHeight: CGFloat = AnnotationToolbar.totalHeight
+    // Shared stage metrics. The editor is a single uninterrupted stage with
+    // chrome floating *over* it, not a canvas boxed in by bands: the only
+    // reserved strip is the titlebar the traffic lights live in. Everything
+    // else (tools, actions) is a glass pill the stage shows through.
+    //
+    // Band at the top of the window where the system draws the traffic lights.
+    // The STAGE runs under it, so there is no dead strip; the PANELS stop below
+    // it, because the window buttons are system-placed and cannot be moved out
+    // of a panel's way. Whoever wants that corner loses it, and it should be the
+    // panel, not the buttons the whole OS relies on.
+    private static let trafficLightBand: CGFloat = 28
+    private static let titlebarHeight: CGFloat = 38
+    /// Breathing room between a floating pill and the edge of the stage.
+    private static let stagePadding: CGFloat = 22
     private static let stageInset: CGFloat = 18
-    /// ES4: height of the editor's bottom bar (zoom · Drag me · Share/Pin/Copy/Save).
-    /// The window minimum and the stage band both account for it.
-    private static let bottomBarHeight: CGFloat = 48
+    /// Height of the floating tool pill: 5pt of padding around a 32pt control.
+    private static let toolbarHeight: CGFloat = AnnotationToolbar.totalHeight
+    /// Height of the floating action pill (zoom · mode · drag · share/pin/copy).
+    private static let bottomBarHeight: CGFloat = EditorBottomBar.pillHeight
     /// Canvas height the sidebar needs to show its scrolling control column
     /// comfortably; the window minimum is derived from this so opening the
     /// sidebar never crams the editor.
@@ -31,7 +42,6 @@ final class AnnotationWindowController: NSWindowController {
     private let toolbar: AnnotationToolbar
     private var backgroundSidebar: BackgroundSidebar?
     private var bottomBar: EditorBottomBar?
-    private var chromeBackdrop: EditorChromeBackdrop?
     private var editorScrollView: NSScrollView?
     private var sidebarVisible = false
     // ES1: the sidebar is an integrated window column flush to the left edge
@@ -193,7 +203,6 @@ final class AnnotationWindowController: NSWindowController {
             openingPresetName = nil
         }
         let canvasSize = ScreenshotBackgroundComposer.outputPointSize(for: image.size, options: initialBackground)
-        let toolbarHeight = Self.toolbarHeight
 
         // Open the window sized to the image (scaled to fit), not to a fraction of
         // the screen. Limiting width and height independently broke the aspect for
@@ -214,14 +223,17 @@ final class AnnotationWindowController: NSWindowController {
         )
         win.titleVisibility = .hidden
         win.titlebarAppearsTransparent = true
-        // Unified toolbar style with an empty NSToolbar: the SYSTEM centers the
-        // traffic lights in a 52pt band, putting them on the main band's ruler
-        // with zero frame hacks on the standard window buttons.
-        win.toolbarStyle = .unified
-        let emptyToolbar = NSToolbar()
-        emptyToolbar.showsBaselineSeparator = false
-        win.toolbar = emptyToolbar
+        // No empty unified toolbar any more: it existed to centre the traffic
+        // lights inside the old 52pt command band, and that band is gone. Left
+        // in, it pushes the lights down to the middle of a band nothing draws,
+        // which is deeper into the panel's content.
         win.isReleasedWhenClosed = false
+        // A behind-window material samples the DESKTOP, and it can only do that
+        // through a window that is not opaque. Without these two lines the stage
+        // vibrancy renders as flat grey and the opacity preference does nothing
+        // visible.
+        win.isOpaque = false
+        win.backgroundColor = .clear
         // Janela normal de documento: .floating prendia o editor acima de TODOS
         // os apps (clicar num app abaixo não o trazia pra frente).
         win.level = .normal
@@ -245,17 +257,16 @@ final class AnnotationWindowController: NSWindowController {
         canvas.backgroundImage = image
         canvas.frame = NSRect(origin: .zero, size: canvasSize)
 
-        // Scroll view for canvas. It fills the chrome notch EXACTLY (header to
-        // footer, sidebar to trailing edge), no inset band, no own border or
-        // shadow: a second frame floating inside the notch read as a detached
-        // panel, with the stage color leaking around it. Breathing room around
-        // the document comes from the window sizing formulas (stageInset) via
-        // the centering clip view, not from chrome geometry.
+        // Scroll view for canvas. It owns the whole stage under the titlebar, no
+        // inset band and no border of its own: a second frame floating inside
+        // would read as a detached panel with the stage colour leaking around
+        // it. Breathing room around the document comes from the window sizing
+        // formulas (stageInset) via the centering clip view, not from chrome.
         let scrollView = NSScrollView(frame: NSRect(
             x: 0,
-            y: Self.bottomBarHeight,
+            y: 0,
             width: winW,
-            height: winH - toolbarHeight - Self.bottomBarHeight
+            height: winH
         ))
         // Center canvas when viewport is larger than the image (eliminates blank side areas)
         let clipView = CenteringClipView()
@@ -277,15 +288,12 @@ final class AnnotationWindowController: NSWindowController {
         scrollView.wantsLayer = true
         // No scroll edge effect here: `scrollEdgeEffectStyle` is a SwiftUI-only
         // modifier in the macOS 26 SDK; AppKit's NSScrollView exposes no equivalent
-        // property, so there is nothing to guard with #available. The stage already
-        // separates from the chrome via the notch hairline drawn by the backdrop.
+        // property, so there is nothing to guard with #available.
 
-        // Header band: a single full-width row pinned to the top of the window,
-        // the same disciplined layout as the footer. The toolbar's own internal
-        // stack (leading-anchored, centerY) drives every control; the controller
-        // only frames this band, no dock-centering or left-group math.
-        toolbar.frame = Self.headerFrame(winW: winW, winH: winH)
-        // Manual layout on resize (layoutStage) so the band tracks the window.
+        // Tool pill: intrinsically sized glass, centred over the stage. The
+        // toolbar sizes itself; the controller only places it.
+        toolbar.frame = Self.toolbarPillFrame(stageX: 0, stageWidth: winW, winH: winH, toolbar: toolbar)
+        // Manual layout on resize (layoutStage) so the pill tracks the stage.
         toolbar.autoresizingMask = []
 
         toolbar.onToolChanged     = { [weak self] tool in
@@ -437,15 +445,9 @@ final class AnnotationWindowController: NSWindowController {
         // Build hierarchy FIRST, then configure layers (layers don't exist until views are in a window)
         let container = PremiumEditorStageView(frame: NSRect(origin: .zero, size: windowSize))
 
-        // ES1/ES4: one continuous L-shaped chrome surface (left column + footer as a
-        // single material piece) sits behind everything. The sidebar and bottom bar
-        // are just transparent control hosts on top of it; the canvas/stage occupies
-        // the notch of the L. Added first so it stays at the back.
-        let backdrop = EditorChromeBackdrop(frame: container.bounds)
-        backdrop.autoresizingMask = [.width, .height]
-        container.addSubview(backdrop)
-        chromeBackdrop = backdrop
-
+        // Stage first, chrome over it. There is no backdrop behind the canvas any
+        // more: the editor is one uninterrupted stage, and every piece of chrome
+        // is a glass pill floating on it. Order here is z-order.
         container.addSubview(scrollView)
         container.addSubview(toolbar)
 
@@ -457,9 +459,7 @@ final class AnnotationWindowController: NSWindowController {
         // (ES1): x:0, full height between the bottom bar and the floating dock.
         // Hidden until toggled.
         let sidebar = BackgroundSidebar(options: backgroundOptions)
-        sidebar.frame = NSRect(x: 0, y: Self.bottomBarHeight,
-                               width: Self.sidebarWidth,
-                               height: winH - toolbarHeight - Self.bottomBarHeight)
+        sidebar.frame = Self.sidebarRect(winW: winW, winH: winH, visible: false)
         // Owned by layoutStage; height tracks the content band, width is fixed.
         sidebar.autoresizingMask = []
         sidebar.isHidden = true
@@ -472,12 +472,13 @@ final class AnnotationWindowController: NSWindowController {
         }
         container.addSubview(sidebar)
         backgroundSidebar = sidebar
+
         editorScrollView = scrollView
 
         // ES4: editor bottom bar, zoom popup (left), Drag me pill (center, file
         // promise out), Share/Pin/Copy/Save cluster (right, Save tinted coral).
         let bar = EditorBottomBar()
-        bar.frame = NSRect(x: 0, y: 0, width: winW, height: Self.bottomBarHeight)
+        bar.frame = Self.actionPillFrame(stageX: 0, stageWidth: winW, winH: winH, bar: nil)
         bar.autoresizingMask = []
         bar.onZoomChanged = { [weak self] mag in
             // Zoom manual: o usuário assume o controle, o auto-fit para de mexer
@@ -514,9 +515,6 @@ final class AnnotationWindowController: NSWindowController {
         bar.onCopy = { [weak self] in self?.copyToClipboard() }
         container.addSubview(bar)
         bottomBar = bar
-
-        // Seed the L backdrop's arms for the initial (sidebar-closed) layout.
-        backdrop.update(leftArmWidth: 0, bottomArmHeight: Self.bottomBarHeight, topArmHeight: toolbarHeight)
 
         // ES7: keep the bottom-bar zoom label in sync when the user pinches/⌘± on
         // the canvas, so the popup always reflects the live magnification.
@@ -830,7 +828,7 @@ final class AnnotationWindowController: NSWindowController {
         // pousa a parede no fim, debaixo da coluna assentada.
         sidebar.isHidden = false
         if showing {
-            sidebar.frame = Self.sidebarRect(winH: window.frame.height, visible: false)
+            sidebar.frame = Self.sidebarRect(winW: window.frame.width, winH: window.frame.height, visible: false)
             // Commita o estado seed (recém des-hidden, fora da tela) no render
             // server ANTES do grupo animado: sem isso o animator não tem estado
             // de partida apresentado e a coluna teleporta pra x:0 (o slide nunca
@@ -838,8 +836,6 @@ final class AnnotationWindowController: NSWindowController {
             window.contentView?.layoutSubtreeIfNeeded()
             window.displayIfNeeded()
             CATransaction.flush()
-        } else {
-            chromeBackdrop?.update(leftArmWidth: 0, bottomArmHeight: Self.bottomBarHeight, topArmHeight: Self.toolbarHeight)
         }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = Motion.reduced ? 0 : Motion.Duration.standard
@@ -850,11 +846,6 @@ final class AnnotationWindowController: NSWindowController {
             Task { @MainActor [weak self] in
                 guard let self, self.sidebarAnimationGeneration == animationGeneration else { return }
                 if !showing { self.backgroundSidebar?.isHidden = true }
-                if showing {
-                    self.chromeBackdrop?.update(leftArmWidth: Self.sidebarWidth,
-                                                bottomArmHeight: Self.bottomBarHeight,
-                                                topArmHeight: Self.toolbarHeight)
-                }
                 self.canvas.setNeedsDisplay(self.canvas.bounds)
             }
         })
@@ -874,65 +865,82 @@ final class AnnotationWindowController: NSWindowController {
         let winW = targetSize?.width ?? container.bounds.width
         let winH = targetSize?.height ?? container.bounds.height
 
-        // The canvas fills the chrome notch exactly: flush against the sidebar's
-        // trailing edge (or the window edge when closed), the header band and the
-        // footer. Any gap here exposes the stage color as a stray frame.
-        let leftEdge = sidebarVisible ? Self.sidebarWidth : 0
-        let canvasRect = NSRect(
-            x: leftEdge,
-            y: Self.bottomBarHeight,
-            width: max(1, winW - leftEdge),
-            height: max(1, winH - Self.toolbarHeight - Self.bottomBarHeight)
-        )
-        let sidebarRect = Self.sidebarRect(winH: winH, visible: sidebarVisible)
-        let headerRect = Self.headerFrame(winW: winW, winH: winH)
-        let barRect = NSRect(x: 0, y: 0, width: winW, height: Self.bottomBarHeight)
-
-        // The L-shaped chrome backdrop spans from y:0 up to the dock band; its left
-        // arm is the open sidebar width (0 when closed), its bottom arm is the bar.
-        // The canvas hairline is drawn by the backdrop along the notch edges.
-        let leftArm = sidebarVisible ? Self.sidebarWidth : 0
+        // The stage runs the full height under the titlebar and stops only where
+        // the inspector begins. Nothing is subtracted for the tool or action
+        // pills: they float on top, and the artwork is free to pass beneath them.
+        // The stage stops where the floating panel's margin begins, not where the
+        // panel does: otherwise the artwork slides under the panel's shadow.
+        let panelSpan = Self.sidebarWidth + KritMetrics.Panel.margin * 2
+        let stageWidth = max(1, winW - (sidebarVisible ? panelSpan : 0))
+        // Full height, titlebar included. Reserving a strip for the titlebar left
+        // a dead band across the top of the window that the reference does not
+        // have: there the surfaces run to the top edge and the traffic lights
+        // simply float over the stage.
+        //
+        // The panel is on the LEADING edge, so the stage starts after it.
+        let stageX = sidebarVisible ? panelSpan : 0
+        let canvasRect = NSRect(x: stageX, y: 0, width: stageWidth, height: max(1, winH))
+        let sidebarRect = Self.sidebarRect(winW: winW, winH: winH, visible: sidebarVisible)
+        let headerRect = Self.toolbarPillFrame(stageX: stageX, stageWidth: stageWidth, winH: winH, toolbar: toolbar)
+        let barRect = Self.actionPillFrame(stageX: stageX, stageWidth: stageWidth, winH: winH, bar: bottomBar)
 
         if animated {
             scrollView.animator().frame = canvasRect
             backgroundSidebar?.animator().frame = sidebarRect
             toolbar.animator().frame = headerRect
             bottomBar?.animator().frame = barRect
-            // Braços do chrome NÃO mudam aqui: a máscara do backdrop não anima
-            // (troca de path é seca), então quem anima coordena o timing — o
-            // toggle da sidebar atualiza o braço esquerdo no fim da moção ao
-            // abrir (a coluna carrega o próprio material durante o slide) e
-            // imediatamente ao fechar.
         } else {
             scrollView.frame = canvasRect
             backgroundSidebar?.frame = sidebarRect
             toolbar.frame = headerRect
             bottomBar?.frame = barRect
-            // The backdrop redraws its continuous frame from these arm metrics
-            // every layout pass (header + sidebar + footer around the notch).
-            chromeBackdrop?.update(leftArmWidth: leftArm, bottomArmHeight: Self.bottomBarHeight, topArmHeight: Self.toolbarHeight)
         }
     }
 
-    /// Integrated sidebar column frame: flush left (x:0) and full-height between
-    /// the bottom bar and the floating dock when visible; parked just off the left
-    /// edge (x:-width) when hidden, so opening/closing reads as a slide.
-    private static func sidebarRect(winH: CGFloat, visible: Bool) -> NSRect {
-        NSRect(
-            x: visible ? 0 : -sidebarWidth,
-            y: bottomBarHeight,
+    /// Inspector column frame: docked to the *trailing* edge and full height
+    /// under the titlebar when visible; parked just past the right edge when
+    /// hidden, so opening and closing reads as a slide in from the side the
+    /// controls actually live on.
+    private static func sidebarRect(winW: CGFloat, winH: CGFloat, visible: Bool) -> NSRect {
+        // The panel floats rather than docking: it keeps `Panel.margin` from the
+        // window on all sides, which is what lets its 20.5pt corners read as
+        // corners instead of being clipped by the window edge.
+        let margin = KritMetrics.Panel.margin
+        return NSRect(
+            x: visible ? margin : -sidebarWidth,
+            y: margin,
             width: sidebarWidth,
-            height: max(1, winH - toolbarHeight - bottomBarHeight)
+            height: max(1, winH - margin * 2 - trafficLightBand)
         )
     }
 
-    /// Header band frame: a single full-width row across the top of the window,
-    /// spanning the whole `toolbarHeight`. The toolbar's own internal stack
-    /// (leading-anchored past the traffic lights, centerY) positions every
-    /// control, so the controller only needs this one trivial frame, no
-    /// dock-centering or left-group math.
-    private static func headerFrame(winW: CGFloat, winH: CGFloat) -> NSRect {
-        NSRect(x: 0, y: winH - toolbarHeight, width: winW, height: toolbarHeight)
+    /// The tool pill: intrinsically sized, centred over the stage, at the TOP.
+    /// Centring is on the *stage*, not the window, so opening the inspector
+    /// shifts the pill along with the artwork it belongs to.
+    private static func toolbarPillFrame(stageX: CGFloat, stageWidth: CGFloat, winH: CGFloat, toolbar: AnnotationToolbar) -> NSRect {
+        let width = min(toolbar.fittingWidth, stageWidth - stagePadding * 2)
+        return NSRect(
+            x: (stageX + (stageWidth - width) / 2).rounded(),
+            y: max(1, winH - stagePadding - toolbarHeight),
+            width: max(1, width),
+            height: toolbarHeight
+        )
+    }
+
+    /// The view pill: bottom-trailing corner of the stage. It holds how you LOOK
+    /// at the shot (zoom, annotate/preview, drag it out) as opposed to what you
+    /// do to it, which is the tool pill's job at the top.
+    private static func actionPillFrame(stageX: CGFloat, stageWidth: CGFloat, winH: CGFloat, bar: EditorBottomBar?) -> NSRect {
+        let width = min(bar?.fittingWidth ?? 320, stageWidth - stagePadding * 2)
+        return NSRect(
+            // Centred on the stage, like the tool pill above it. Pinned to the
+            // trailing edge it read as an afterthought hugging the corner while
+            // its twin sat centred at the top.
+            x: (stageX + (stageWidth - width) / 2).rounded(),
+            y: stagePadding,
+            width: max(1, width),
+            height: bottomBarHeight
+        )
     }
 
     /// Window width that keeps the full header row visible (its fitting width,
@@ -940,16 +948,17 @@ final class AnnotationWindowController: NSWindowController {
     /// trailing breathing room) and a usable canvas beside the sidebar when open.
     /// Uses the toolbar's measured content width, never a stale constant.
     private static func minimumWindowWidth(toolbarWidth: CGFloat, sidebarVisible: Bool) -> CGFloat {
-        // The header row must fit in full; `toolbarWidth` (fittingWidth) already
-        // accounts for the leading inset and trailing room. The +8 is breathing
-        // room so the toolbar never sits flush against the edge: native popups
-        // (the font family menu) settle a couple of points wider after the system
-        // measures their text, and without slack that growth clips the edge button.
-        let headerNeed = toolbarWidth + 8
-        guard sidebarVisible else { return headerNeed }
-        // ...and the canvas must stay usable beside the open sidebar.
-        let canvasNeed = sidebarWidth + minimumCanvasWidth + stageInset
-        return max(headerNeed, canvasNeed)
+        // The tool pill must fit on the STAGE, which is the window minus the
+        // inspector, minus a margin on each side. Sizing to the toolbar alone
+        // (as the old full-width band did) leaves the pill short by exactly the
+        // inspector's width once it opens, and the first thing that gives is the
+        // size slider, which collapses to its thumb.
+        let panelSpan = sidebarWidth + KritMetrics.Panel.margin * 2
+        let stageNeed = toolbarWidth + stagePadding * 2 + (sidebarVisible ? panelSpan : 0)
+        guard sidebarVisible else { return stageNeed }
+        // ...and the canvas must stay usable beside the open inspector.
+        let canvasNeed = panelSpan + minimumCanvasWidth + stageInset
+        return max(stageNeed, canvasNeed)
     }
 
     private static let minimumCanvasWidth: CGFloat = 360
@@ -1195,106 +1204,6 @@ extension AnnotationWindowController: NSWindowDelegate {
     }
 }
 
-// MARK: - Editor chrome backdrop (continuous frame, ES1/ES3/ES4)
-
-/// One continuous material surface that frames the canvas on all chrome sides as a
-/// single piece: top arm (header/toolbar band), left arm (sidebar, when open) and
-/// bottom arm (the footer), folding around the corners with no seam. The canvas
-/// occupies the notch. The material runs full-bleed to the window edges (under the
-/// transparent titlebar + traffic lights), so the header reads as the SAME frame as
-/// the sidebar and footer, not a separate panel. A 1px hairline traces only the
-/// notch boundary (the edges where the frame meets the canvas).
-@MainActor
-final class EditorChromeBackdrop: NSView {
-    private let material: NSVisualEffectView
-    private let hairline = CAShapeLayer()
-    private var leftArmWidth: CGFloat = 0
-    private var bottomArmHeight: CGFloat = 0
-    private var topArmHeight: CGFloat = 0
-
-    override init(frame frameRect: NSRect) {
-        material = NSVisualEffectView(frame: frameRect)
-        super.init(frame: frameRect)
-        wantsLayer = true
-        // HIG: the L-frame is STRUCTURAL window chrome (it bounds the content notch
-        // and runs flush to the window edges), not a floating element, so it stays
-        // a window material and does NOT become NSGlassEffectView. Glass is reserved
-        // for elements that float over content; the stage in the notch is the
-        // content layer and never gets glass. Window-background material so the whole
-        // frame (header + sidebar + footer) reads as one continuous window chrome.
-        // Sits behind the controls; the mask carves out the canvas notch so the dark
-        // stage shows through.
-        material.material = .windowBackground
-        material.blendingMode = .behindWindow
-        material.state = .followsWindowActiveState
-        material.autoresizingMask = [.width, .height]
-        addSubview(material)
-
-        hairline.fillColor = NSColor.clear.cgColor
-        // Subtle: at separatorColor 0.8 this read as bright "white wires" around
-        // the canvas. The notch boundary only needs a whisper of definition.
-        hairline.strokeColor = KritColors.editorChromeBorder.cgColor
-        hairline.lineWidth = 1
-        layer?.addSublayer(hairline)
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    override var isFlipped: Bool { false }
-
-    /// Re-carve the frame from the current arm metrics. The notch (canvas) is the
-    /// rectangle inset by the three arms; the right edge runs flush to the window.
-    func update(leftArmWidth: CGFloat, bottomArmHeight: CGFloat, topArmHeight: CGFloat) {
-        self.leftArmWidth = leftArmWidth
-        self.bottomArmHeight = bottomArmHeight
-        self.topArmHeight = topArmHeight
-        relayoutMask()
-    }
-
-    override func layout() {
-        super.layout()
-        relayoutMask()
-    }
-
-    private func relayoutMask() {
-        let b = bounds
-        guard b.width > 0, b.height > 0 else { return }
-        // The notch (canvas) is bounded by the top arm above, left arm at leading,
-        // bottom arm below, and runs flush to the trailing window edge.
-        let notch = CGRect(
-            x: leftArmWidth,
-            y: bottomArmHeight,
-            width: max(0, b.width - leftArmWidth),
-            height: max(0, b.height - topArmHeight - bottomArmHeight)
-        )
-
-        // Mask the material: fill the whole bounds, punch out the notch (even-odd).
-        let path = CGMutablePath()
-        path.addRect(b)
-        path.addRect(notch)
-        let mask = CAShapeLayer()
-        mask.path = path
-        mask.fillRule = .evenOdd
-        material.layer?.mask = mask
-
-        // Hairline along the three inner edges of the notch (top, left, bottom),
-        // only where the frame actually borders the canvas. The trailing edge is the
-        // window edge, so no hairline there.
-        let border = CGMutablePath()
-        // Left edge (only when the sidebar arm is present).
-        if leftArmWidth > 0 {
-            border.move(to: CGPoint(x: notch.minX + 0.5, y: notch.minY))
-            border.addLine(to: CGPoint(x: notch.minX + 0.5, y: notch.maxY))
-        }
-        // Top edge (header band).
-        border.move(to: CGPoint(x: notch.minX, y: notch.maxY - 0.5))
-        border.addLine(to: CGPoint(x: b.width, y: notch.maxY - 0.5))
-        // Bottom edge (footer band).
-        border.move(to: CGPoint(x: notch.minX, y: notch.minY + 0.5))
-        border.addLine(to: CGPoint(x: b.width, y: notch.minY + 0.5))
-        hairline.path = border
-    }
-}
 
 // MARK: - Centering Clip View
 
@@ -1355,18 +1264,41 @@ final class CenteringClipView: NSClipView {
 
 @MainActor
 private final class PremiumEditorStageView: NSView {
+
+    /// Blurred desktop behind the stage. What makes the editor sit *on* the
+    /// desktop rather than hide it, and what the opacity preference dials.
+    private let vibrancy = NSVisualEffectView()
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+
+        vibrancy.material = .underWindowBackground
+        vibrancy.blendingMode = .behindWindow
+        vibrancy.state = .followsWindowActiveState
+        vibrancy.frame = bounds
+        vibrancy.autoresizingMask = [.width, .height]
+        addSubview(vibrancy, positioned: .below, relativeTo: nil)
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(opacityChanged),
+            name: Settings.editorChromeOpacityChanged, object: nil
+        )
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    @objc private func opacityChanged() { needsDisplay = true }
+
     override func draw(_ dirtyRect: NSRect) {
-        // Flat neutral void. The old purple/coral radial glows belonged to the
-        // floating-dock design; inside the chrome notch they read as a "purple
-        // smear" leaking around the canvas, so the stage is now a single color.
-        KritColors.editorStageTop.setFill()
+        // The stage tint is laid OVER the vibrancy at the user's opacity, so at
+        // 1 it reads as the flat neutral void it always was, and as it drops the
+        // wallpaper comes through instead of a grey slab.
+        KritColors.editorStageTop
+            .withAlphaComponent(CGFloat(Settings.editorChromeOpacity))
+            .setFill()
         bounds.fill()
     }
 }
@@ -1411,22 +1343,20 @@ final class EditorKeyWindow: NSWindow {
 @MainActor
 final class AnnotationToolbar: NSView {
 
-    // Conservative floor before the live fitting width exists. The editor uses
-    // one command band, with related tools grouped behind native menus and the
-    // active tool's properties inline.
-    static let requiredWidth: CGFloat = 960
-    /// Main band: tools and window actions. 52pt so the system-centered traffic
-    /// lights (unified toolbar style) sit on the same vertical ruler as the
-    /// controls, no frame hacks on the standard window buttons.
-    static let mainBarHeight: CGFloat = 52
-    /// Total chrome height the controller reserves for the single command band.
-    static let totalHeight: CGFloat = mainBarHeight
-
-    /// Leading inset of the main band, large enough to clear the traffic lights
-    /// so the first action group never slides under the close button (R6).
-    static let leadingInset: CGFloat = 92
-    /// Trailing breathing room so the bands never butt against the window edge.
-    static let trailingInset: CGFloat = 16
+    // The toolbar is a floating glass pill over the stage, not a band across the
+    // window. Its geometry is the reference app's: 5pt of padding around a row
+    // of 32pt controls, capsule corners, 3pt between neighbours.
+    //
+    /// Padding between the pill's edge and the controls inside it.
+    static let pillPadding: CGFloat = 5
+    /// Edge length of a control inside the pill. Circular, so this is both.
+    static let controlSize: CGFloat = 32
+    /// Gap between adjacent controls.
+    static let controlGap: CGFloat = 3
+    /// Total pill height: padding, control, padding.
+    static let totalHeight: CGFloat = controlSize + pillPadding * 2
+    /// Conservative floor before the live fitting width exists.
+    static let requiredWidth: CGFloat = 560
 
     var onToolChanged: ((AnnotationTool) -> Void)?
     var onColorChanged: ((NSColor) -> Void)?
@@ -1492,6 +1422,10 @@ final class AnnotationToolbar: NSView {
     /// Horizontal flow for canvas commands, tools, contextual properties and
     /// delivery actions.
     private var rootStack: NSStackView?
+    /// The glass capsule the row sits in. Held so the tint can follow the shot.
+    private var pillGlass: NSView?
+    /// Rule between the tool properties and the delivery actions.
+    private var actionsDivider: NSView?
     private var propertiesStack: NSStackView?
     private var propertiesDivider: NSView?
     private var contextWidthRow: NSView?
@@ -1517,27 +1451,38 @@ final class AnnotationToolbar: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     private func buildUI() {
-        // The header is the top arm of the continuous editor chrome. One 52pt
-        // command band keeps the stage dominant: canvas commands, grouped tools,
-        // the active tool's compact properties, then delivery actions.
+        // A capsule of glass floating over the stage, holding one row: canvas
+        // commands, the tools, then the active tool's properties. Delivery
+        // actions are NOT here; they live in their own pill so that reaching for
+        // "copy and close" can never be a slip of the hand away from picking a
+        // brush.
         wantsLayer = true
 
         let main = NSStackView()
         main.orientation = .horizontal
         main.alignment = .centerY
         main.distribution = .fill
-        main.spacing = 8
+        main.spacing = Self.controlGap
         main.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(main)
+
+        // The glass owns the row; the pill sizes itself to whatever the row
+        // needs, which is what lets the controller centre it on the stage.
+        let glass = KritGlassBacking(style: .bar, cornerRadius: Self.totalHeight / 2)
+        glass.setContent(main)
+        glass.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(glass)
         NSLayoutConstraint.activate([
-            main.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.leadingInset),
-            main.topAnchor.constraint(equalTo: topAnchor),
-            main.heightAnchor.constraint(equalToConstant: Self.mainBarHeight),
-            // Pinned trailing edge: the flexible gap inside the band stretches and
-            // shrinks with the window, so the actions hug the right edge at every
-            // width instead of the window being forced to fit a rigid row.
-            main.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.trailingInset),
+            glass.leadingAnchor.constraint(equalTo: leadingAnchor),
+            glass.trailingAnchor.constraint(equalTo: trailingAnchor),
+            glass.topAnchor.constraint(equalTo: topAnchor),
+            glass.bottomAnchor.constraint(equalTo: bottomAnchor),
+            main.heightAnchor.constraint(equalToConstant: Self.controlSize),
         ])
+        // ChromeFactory pins content to its own edges, so the padding has to come
+        // from the row's own insets rather than from the constraints above.
+        main.edgeInsets = NSEdgeInsets(top: Self.pillPadding, left: Self.pillPadding,
+                                       bottom: Self.pillPadding, right: Self.pillPadding)
+        pillGlass = glass
         rootStack = main
 
         // Canvas group right after the traffic lights: crop, backgrounds toggle,
@@ -1560,20 +1505,15 @@ final class AnnotationToolbar: NSView {
         main.addArrangedSubview(properties)
         propertiesStack = properties
 
-        // Flexible gap: this is the band's shock absorber. It has no minimum
-        // beyond a hair of breathing room and zero hugging, so the band tracks
-        // the window from requiredWidth on up.
-        let gap = NSView()
-        gap.translatesAutoresizingMaskIntoConstraints = false
-        gap.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-        gap.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-        gap.widthAnchor.constraint(greaterThanOrEqualToConstant: 8).isActive = true
-        main.addArrangedSubview(gap)
+        // No flexible gap: a pill is sized by its contents, not stretched to the
+        // window. What used to be a shock absorber is now the stage showing
+        // through on both sides.
+        let actionDivider = makeHeaderDivider()
+        main.addArrangedSubview(actionDivider)
+        actionsDivider = actionDivider
 
-        // Window actions on the right: Save as… + Copy & Close (native
-        // bezels, coral on the emphasized action). Copy/Pin/Share live ONCE in
-        // the bottom bar. While a crop region is staged the pair swaps for
-        // Cancel/Apply (the Snapzy/CleanShot contextual action slot).
+        // Delivery actions close the row: Save as… then the emphasized Copy &
+        // Close. While a crop region is staged the pair swaps for Cancel/Apply.
         let saveBtn = makeActionButton(title: "Save as\u{2026}", action: #selector(saveAsTapped))
         main.addArrangedSubview(saveBtn)
         saveAsButton = saveBtn
@@ -1590,37 +1530,31 @@ final class AnnotationToolbar: NSView {
         main.addArrangedSubview(cropBtn)
         cropApplyButton = cropBtn
 
-        // A soft edge marks the fixed main band without drawing a hard bar
-        // through the whole editor.
-        let dissolve = KritEdgeDissolveView(frame: .zero, direction: .down)
-        dissolve.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(dissolve)
-        NSLayoutConstraint.activate([
-            dissolve.leadingAnchor.constraint(equalTo: leadingAnchor),
-            dissolve.trailingAnchor.constraint(equalTo: trailingAnchor),
-            dissolve.topAnchor.constraint(equalTo: topAnchor, constant: Self.mainBarHeight - 2),
-            dissolve.heightAnchor.constraint(equalToConstant: 8),
-        ])
-
+        // The pill's own rim is the edge now, so there is no dissolve to fade
+        // one band into another.
         selectTool(.arrow)
     }
 
-    /// Width the command band needs to fit its visible controls. The flexible
-    /// gap contributes only its minimum and absorbs wider windows.
+    /// Width the pill needs to fit its visible controls. Unlike the old band,
+    /// this is the *actual* width the toolbar is given: a pill that is wider
+    /// than its contents is just a gap with a border around it.
     var fittingWidth: CGFloat {
         rootStack?.layoutSubtreeIfNeeded()
-        let mainContent = rootStack?.fittingSize.width ?? Self.requiredWidth
-        return max(Self.requiredWidth, Self.leadingInset + mainContent + Self.trailingInset)
+        return max(Self.requiredWidth, rootStack?.fittingSize.width ?? Self.requiredWidth)
     }
 
-    /// A 1x20 vertical separator for the main band's group splits.
+    /// The vertical rule that splits the command band into groups. Half a point
+    /// and short: it exists to say "these belong together, those don't", and a
+    /// full-point rule at full height turns a toolbar into a table.
     private func makeHeaderDivider() -> NSView {
         let divider = NSView()
         divider.wantsLayer = true
-        divider.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        // On dark glass the group rule is a light hairline, not the app's dark
+        // one: KritColors.divider is meant for light surfaces and vanishes here.
+        divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.22).cgColor
         divider.translatesAutoresizingMaskIntoConstraints = false
-        divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        divider.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        divider.widthAnchor.constraint(equalToConstant: KritColors.hairlineWidth).isActive = true
+        divider.heightAnchor.constraint(equalToConstant: 18).isActive = true
         return divider
     }
 
@@ -1782,9 +1716,21 @@ final class AnnotationToolbar: NSView {
         label.font = .systemFont(ofSize: 11)
         label.textColor = .secondaryLabelColor
         widthLabel = label
-        let slider = NSSlider(value: Settings.annotationLineWidth, minValue: 1, maxValue: 20, target: self, action: #selector(lineWidthChanged))
-        // Brand coral on the filled track; the system blue clashed with the dock.
-        slider.trackFillColor = KritColors.accent
+        let slider = KritSlider()
+        slider.minValue = 1
+        slider.maxValue = 20
+        slider.doubleValue = Settings.annotationLineWidth
+        slider.target = self
+        slider.action = #selector(lineWidthChanged)
+        // A slider is the one control that becomes useless rather than merely
+        // cramped when squeezed: below this width the thumb has nowhere to
+        // travel, so the pill gives up other slack first. Strong but breakable:
+        // on a display too small to grow the window, a squeezed slider beats a
+        // constraint conflict, which AppKit resolves by breaking something at
+        // random.
+        let minTrack = slider.widthAnchor.constraint(greaterThanOrEqualToConstant: 90)
+        minTrack.priority = .defaultHigh
+        minTrack.isActive = true
         widthSlider = slider
         // Secure blur toggle: only revealed for the blur tool (selectTool hides it
         // for every other drawing tool). On = new blurs are an irreversible mosaic.
@@ -1795,7 +1741,7 @@ final class AnnotationToolbar: NSView {
         secureBtn.imagePosition = .imageOnly
         secureBtn.toolTip = "Secure blur (irreversible)"
         secureBtn.translatesAutoresizingMaskIntoConstraints = false
-        secureBtn.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        secureBtn.widthAnchor.constraint(equalToConstant: Self.controlSize).isActive = true
         secureBtn.isHidden = true
         secureBlurButton = secureBtn
 
@@ -1807,8 +1753,12 @@ final class AnnotationToolbar: NSView {
         strengthCaption.textColor = .secondaryLabelColor
         strengthCaption.isHidden = true
         strengthLabel = strengthCaption
-        let strength = NSSlider(value: blurRadius, minValue: 4, maxValue: 40, target: self, action: #selector(redactStrengthChanged))
-        strength.trackFillColor = KritColors.accent
+        let strength = KritSlider()
+        strength.minValue = 4
+        strength.maxValue = 40
+        strength.doubleValue = blurRadius
+        strength.target = self
+        strength.action = #selector(redactStrengthChanged)
         strength.isHidden = true
         strength.widthAnchor.constraint(equalToConstant: 104).isActive = true
         strengthSlider = strength
@@ -1852,7 +1802,7 @@ final class AnnotationToolbar: NSView {
         plateButton.imagePosition = .imageOnly
         plateButton.toolTip = "Text backplate"
         plateButton.translatesAutoresizingMaskIntoConstraints = false
-        plateButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        plateButton.widthAnchor.constraint(equalToConstant: Self.controlSize).isActive = true
         backplateButton = plateButton
 
         // Style presets: opens the rich popover of WYSIWYG style swatches (regular,
@@ -1863,7 +1813,7 @@ final class AnnotationToolbar: NSView {
         styleBtn.imagePosition = .imageOnly
         styleBtn.toolTip = "Text styles"
         styleBtn.translatesAutoresizingMaskIntoConstraints = false
-        styleBtn.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        styleBtn.widthAnchor.constraint(equalToConstant: Self.controlSize).isActive = true
         styleButton = styleBtn
 
         let fontRow = NSStackView(views: [familyPopup, sizeField, sizeStepper, plateButton, styleBtn])
@@ -1885,14 +1835,32 @@ final class AnnotationToolbar: NSView {
     /// default button (Return) and tints the bezel coral (QRCodeResultWindow
     /// pattern), keeping the brand accent on the one emphasized action.
     private func makeActionButton(title: String, action: Selector, isPrimary: Bool = false) -> NSButton {
-        let btn = NSButton(title: title, target: self, action: action)
-        btn.bezelStyle = .rounded
-        btn.controlSize = .regular
+        let btn = GlassPillButton(title: title, target: self, action: action)
+        btn.isBordered = false
+        btn.emphasis = isPrimary ? .brand : .plain
+        // White on glass for the secondary action, white on coral for the
+        // primary: both read against the pill, neither needs a bezel.
+        let label = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.white,
+            .kern: -0.1,
+        ])
+        btn.attributedTitle = label
         btn.translatesAutoresizingMaskIntoConstraints = false
-        if isPrimary {
-            btn.keyEquivalent = "\r"
-            btn.bezelColor = KritColors.accent
-        }
+        // Width measured from the text rather than left to the intrinsic size of
+        // a borderless button, which under-reports and lets the stack ellipsise
+        // "Save as…" to "Sav…" while the pill still has room to spare.
+        let padding: CGFloat = 15
+        let width = btn.widthAnchor.constraint(equalToConstant: (label.size().width + padding * 2).rounded(.up))
+        // Breakable: on a display too small to grow the editor window, a button
+        // that gives up a few points beats a constraint conflict, which AppKit
+        // resolves by dropping a constraint of its own choosing.
+        width.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            btn.heightAnchor.constraint(equalToConstant: Self.controlSize),
+            width,
+        ])
+        if isPrimary { btn.keyEquivalent = "\r" }
         return btn
     }
 
@@ -1920,8 +1888,8 @@ final class AnnotationToolbar: NSView {
     private func makeChromeToggleButton(symbol: String, action: Selector) -> ChromeToggleButton {
         let btn = ChromeToggleButton(symbol: symbol, target: self, action: action)
         btn.translatesAutoresizingMaskIntoConstraints = false
-        btn.widthAnchor.constraint(equalToConstant: 30).isActive = true
-        btn.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        btn.widthAnchor.constraint(equalToConstant: Self.controlSize).isActive = true
+        btn.heightAnchor.constraint(equalToConstant: Self.controlSize).isActive = true
         return btn
     }
 
@@ -2236,9 +2204,9 @@ final class FlatToolButton: EditorChromeButton {
         setAccessibilityLabel(tool.tooltip)
         setAccessibilityValue("Not selected")
         translatesAutoresizingMaskIntoConstraints = false
-        // 28x28 flat hit target, the CleanShot strip footprint.
-        widthAnchor.constraint(equalToConstant: 28).isActive = true
-        heightAnchor.constraint(equalToConstant: 28).isActive = true
+        // Circular hit target on the pill's ruler.
+        widthAnchor.constraint(equalToConstant: AnnotationToolbar.controlSize).isActive = true
+        heightAnchor.constraint(equalToConstant: AnnotationToolbar.controlSize).isActive = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -2247,31 +2215,26 @@ final class FlatToolButton: EditorChromeButton {
     override var allowsVibrancy: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
-        // Pad: drawn when selected (mono contrast pad) or when this is a bordered
-        // canvas-group tool (faint chrome pad even at rest).
-        let pad = bounds.insetBy(dx: 1, dy: 1)
-        let radius: CGFloat = 6
+        // On dark glass a tool is a circle that appears when you reach for it.
+        // Selected is a solid white disc with the glyph knocked out, which is
+        // the only state that has to survive on top of any screenshot.
+        let disc = NSBezierPath(ovalIn: bounds)
         if isSelectedTool {
-            let path = NSBezierPath(roundedRect: pad, xRadius: radius, yRadius: radius)
-            KritColors.toolSelectedFill.setFill()
-            path.fill()
-        } else if isPointerPressed || isPointerInside {
-            let path = NSBezierPath(roundedRect: pad, xRadius: radius, yRadius: radius)
-            (isPointerPressed ? KritColors.editorToolPressedFill : KritColors.editorToolHoverFill).setFill()
-            path.fill()
+            NSColor.white.setFill()
+            disc.fill()
+        } else if isPointerPressed {
+            NSColor.white.withAlphaComponent(0.26).setFill()
+            disc.fill()
+        } else if isPointerInside {
+            NSColor.white.withAlphaComponent(0.16).setFill()
+            disc.fill()
         } else if isBorderedTool {
-            let path = NSBezierPath(roundedRect: pad, xRadius: radius, yRadius: radius)
-            KritColors.editorActionBackground.setFill()
-            path.fill()
-            KritColors.editorDockBorder.setStroke()
-            path.lineWidth = 1
-            path.stroke()
+            NSColor.white.withAlphaComponent(0.10).setFill()
+            disc.fill()
         }
 
         guard let glyph else { return }
-        let tint = isSelectedTool
-            ? KritColors.toolSelectedGlyph
-            : KritColors.toolInactiveGlyph
+        let tint = isSelectedTool ? KritColors.onLightChrome : NSColor.white.withAlphaComponent(0.92)
         let tinted = glyph.tinted(with: tint)
         let size = tinted.size
         let origin = NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2)
@@ -2306,7 +2269,7 @@ final class ToolFamilyButton: EditorChromeButton {
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
         widthAnchor.constraint(equalToConstant: 34).isActive = true
-        heightAnchor.constraint(equalToConstant: 28).isActive = true
+        heightAnchor.constraint(equalToConstant: AnnotationToolbar.controlSize).isActive = true
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
         setAccessibilityLabel("\(label) tools")
@@ -2324,13 +2287,18 @@ final class ToolFamilyButton: EditorChromeButton {
 
     override func draw(_ dirtyRect: NSRect) {
         let selected = isActiveFamily
-        let pad = bounds.insetBy(dx: 1, dy: 1)
-        let path = NSBezierPath(roundedRect: pad, xRadius: 6, yRadius: 6)
+        // A family button is wider than it is tall (glyph plus chevron), so its
+        // shape is a capsule rather than the plain tools' circle. Same states.
+        let radius = bounds.height / 2
+        let path = NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius)
         if selected {
-            KritColors.toolSelectedFill.setFill()
+            NSColor.white.setFill()
             path.fill()
-        } else if isPointerPressed || isPointerInside {
-            (isPointerPressed ? KritColors.editorToolPressedFill : KritColors.editorToolHoverFill).setFill()
+        } else if isPointerPressed {
+            NSColor.white.withAlphaComponent(0.26).setFill()
+            path.fill()
+        } else if isPointerInside {
+            NSColor.white.withAlphaComponent(0.16).setFill()
             path.fill()
         }
 
@@ -2338,16 +2306,16 @@ final class ToolFamilyButton: EditorChromeButton {
         let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
         if let glyph = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(config) {
-            let tint = selected ? KritColors.toolSelectedGlyph : KritColors.toolInactiveGlyph
+            let tint = selected ? KritColors.onLightChrome : NSColor.white.withAlphaComponent(0.92)
             let tinted = glyph.tinted(with: tint)
-            let origin = NSPoint(x: 5, y: bounds.midY - tinted.size.height / 2)
+            let origin = NSPoint(x: 8, y: bounds.midY - tinted.size.height / 2)
             tinted.draw(at: origin, from: .zero, operation: .sourceOver, fraction: 1)
         }
 
         let chevronConfig = NSImage.SymbolConfiguration(pointSize: 7, weight: .semibold)
         if let chevron = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
             .withSymbolConfiguration(chevronConfig) {
-            let tint = selected ? KritColors.toolSelectedGlyph : KritColors.toolInactiveGlyph
+            let tint = selected ? KritColors.onLightChrome : NSColor.white.withAlphaComponent(0.92)
             let tinted = chevron.tinted(with: tint.withAlphaComponent(0.72))
             tinted.draw(
                 at: NSPoint(x: bounds.maxX - tinted.size.width - 3, y: bounds.midY - tinted.size.height / 2),
@@ -2428,9 +2396,10 @@ final class ChromeToggleButton: EditorChromeButton {
     override var allowsVibrancy: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
-        let pad = bounds.insetBy(dx: 1, dy: 1)
-        let path = NSBezierPath(roundedRect: pad, xRadius: 6, yRadius: 6)
+        let path = NSBezierPath(ovalIn: bounds)
         if isActive {
+            // Active fills with the accent: this is the one place on the pill
+            // where colour means "this mode is running", not "this is primary".
             let activeFill: NSColor
             if isPointerPressed {
                 activeFill = KritColors.accent.blended(withFraction: 0.16, of: .black) ?? KritColors.accent
@@ -2443,17 +2412,14 @@ final class ChromeToggleButton: EditorChromeButton {
             path.fill()
         } else {
             let inactiveFill = isPointerPressed
-                ? KritColors.editorToolPressedFill
-                : (isPointerInside ? KritColors.editorToolHoverFill : KritColors.editorActionBackground)
+                ? NSColor.white.withAlphaComponent(0.26)
+                : (isPointerInside ? NSColor.white.withAlphaComponent(0.16) : NSColor.white.withAlphaComponent(0.10))
             inactiveFill.setFill()
             path.fill()
-            KritColors.editorDockBorder.setStroke()
-            path.lineWidth = 1
-            path.stroke()
         }
 
         guard let glyph, !hidesGlyph else { return }
-        let tint = isActive ? NSColor.white : KritColors.toolInactiveGlyph
+        let tint = NSColor.white
         let tinted = glyph.tinted(with: tint)
         let size = tinted.size
         let origin = NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2)
@@ -2503,12 +2469,21 @@ final class EditorBottomBar: NSView {
     /// editor-mode toggle). true = preview (editing chrome hidden).
     var onPreviewModeChanged: ((Bool) -> Void)?
 
+    /// The action pill shares the tool pill's ruler: same padding, same control
+    /// size, same gap. Two floating capsules that disagreed on their metrics
+    /// would read as two apps.
+    static let pillPadding: CGFloat = AnnotationToolbar.pillPadding
+    static let controlSize: CGFloat = AnnotationToolbar.controlSize
+    static let controlGap: CGFloat = AnnotationToolbar.controlGap
+    static let pillHeight: CGFloat = AnnotationToolbar.totalHeight
+
     private let zoomPopup = NSPopUpButton()
     private let modeControl = NSSegmentedControl(labels: ["Annotate", "Preview"], trackingMode: .selectOne, target: nil, action: nil)
     private var shareButton: NSButton?
     private var sharePicker: NSSharingServicePicker?
     private var dragPill: BottomBarDragPill?
     private var actionCluster: NSStackView?
+    private var contentRow: NSStackView?
 
     // Zoom presets: explicit % plus a "Fit" entry that re-fits the composition.
     private static let zoomPercents: [Int] = [35, 50, 75, 100]
@@ -2522,98 +2497,104 @@ final class EditorBottomBar: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     private func buildUI() {
-        // The bottom bar is the BOTTOM ARM of the continuous L-shaped chrome
-        // (EditorChromeBackdrop provides the material). It owns no material/hairline
-        // of its own, so the footer and the sidebar flow as one piece. The hairline
-        // that borders the canvas is drawn by the stage, not here.
+        // The action pill: a second capsule of glass, in the top-trailing corner
+        // of the stage. It holds what you do WITH the shot (zoom, mode, drag it
+        // out, share, pin, copy) as opposed to what you do TO it, which is the
+        // tool pill's job. Two pills, two verbs.
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.edgeInsets = NSEdgeInsets(top: Self.pillPadding, left: Self.pillPadding,
+                                      bottom: Self.pillPadding, right: Self.pillPadding)
 
-        // Left: zoom popup. Native rounded pop-up at the same regular control size
-        // as the cluster buttons, so every footer control shares one Apple ruler.
+        let glass = KritGlassBacking(style: .bar, cornerRadius: Self.pillHeight / 2)
+        glass.setContent(row)
+        glass.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(glass)
+        NSLayoutConstraint.activate([
+            glass.leadingAnchor.constraint(equalTo: leadingAnchor),
+            glass.trailingAnchor.constraint(equalTo: trailingAnchor),
+            glass.topAnchor.constraint(equalTo: topAnchor),
+            glass.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        contentRow = row
+
+        // Zoom. Borderless inside glass: a native bezel here would draw a second
+        // shape inside the capsule and the pill would read as a container of
+        // buttons instead of one control surface.
         zoomPopup.translatesAutoresizingMaskIntoConstraints = false
-        zoomPopup.controlSize = .regular
-        zoomPopup.bezelStyle = .rounded
+        zoomPopup.controlSize = .small
+        zoomPopup.isBordered = false
         zoomPopup.target = self
         zoomPopup.action = #selector(zoomChanged(_:))
         zoomPopup.removeAllItems()
         for pct in Self.zoomPercents { zoomPopup.addItem(withTitle: "\(pct)%") }
         zoomPopup.addItem(withTitle: "Fit")
         zoomPopup.selectItem(withTitle: "Fit")
-        addSubview(zoomPopup)
-        NSLayoutConstraint.activate([
-            zoomPopup.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            zoomPopup.centerYAnchor.constraint(equalTo: centerYAnchor),
-            zoomPopup.widthAnchor.constraint(equalToConstant: 88),
-        ])
+        zoomPopup.contentTintColor = .white
+        // Centred, not leading: a borderless pop-up draws its title flush to the
+        // cell edge, so the only gap left was the pill's own 5pt padding and the
+        // number sat on the capsule's rim.
+        zoomPopup.alignment = .center
+        row.addArrangedSubview(zoomPopup)
+        zoomPopup.widthAnchor.constraint(equalToConstant: 82).isActive = true
 
-        // Annotate/Preview mode toggle beside the zoom popup (Snapzy's editor
-        // mode switch). Preview hides every piece of editing chrome so the user
-        // sees exactly what exports.
+        // Annotate/Preview toggle. Preview hides every piece of editing chrome so
+        // the user sees exactly what exports.
         modeControl.target = self
         modeControl.action = #selector(modeChanged(_:))
         modeControl.selectedSegment = 0
         modeControl.selectedSegmentBezelColor = KritColors.accent
-        modeControl.controlSize = .regular
+        modeControl.controlSize = .small
         modeControl.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(modeControl)
-        NSLayoutConstraint.activate([
-            modeControl.leadingAnchor.constraint(equalTo: zoomPopup.trailingAnchor, constant: 10),
-            modeControl.centerYAnchor.constraint(equalTo: centerYAnchor),
-        ])
+        row.addArrangedSubview(modeControl)
 
-        // Center: Drag me pill. Degrades gracefully when the window narrows
-        // (full -> grip-only -> hidden) so it never overlaps the side zones;
-        // layout() below measures the real central slack each pass.
         let pill = BottomBarDragPill()
         pill.imageProvider = { [weak self] in self?.onRequestDragImage?() }
         pill.onDragDelivered = { [weak self] in self?.onDragDelivered?() }
         pill.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(pill)
-        NSLayoutConstraint.activate([
-            pill.centerXAnchor.constraint(equalTo: centerXAnchor),
-            pill.centerYAnchor.constraint(equalTo: centerYAnchor),
-        ])
+        row.addArrangedSubview(pill)
         dragPill = pill
 
-        // Right: action cluster.
         let cluster = NSStackView()
         cluster.orientation = .horizontal
         cluster.alignment = .centerY
-        cluster.spacing = 8
+        cluster.spacing = Self.controlGap
         cluster.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(cluster)
-        NSLayoutConstraint.activate([
-            cluster.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            cluster.centerYAnchor.constraint(equalTo: centerYAnchor),
-        ])
+        row.addArrangedSubview(cluster)
 
-        // Footer cluster: Share, Pin, Copy only, like CleanShot's footer (share /
-        // pin / copy / cloud). Saving lives entirely in the header ("Save as…" and
-        // "Done"); a second "Save" down here was a duplicate the owner flagged.
+        // Share and Pin only. A plain "Copy" here duplicated the tool pill's
+        // "Copy & Close": two buttons, same verb, one screen apart. Copying now
+        // lives once, on the primary action.
         let share = iconButton(symbol: "square.and.arrow.up", tooltip: "Share", action: #selector(shareTapped))
         shareButton = share
         cluster.addArrangedSubview(share)
         cluster.addArrangedSubview(iconButton(symbol: "pin", tooltip: "Pin to desktop", action: #selector(pinTapped)))
-        cluster.addArrangedSubview(iconButton(symbol: "doc.on.doc", tooltip: "Copy", action: #selector(copyTapped)))
         actionCluster = cluster
     }
 
-    /// Measures the real central slack between the zoom popup (left zone) and
-    /// the action cluster (right zone) and degrades the centered drag pill:
-    /// full label, grip only, or gone. The Snapzy footer pattern, in AppKit.
     @objc private func modeChanged(_ sender: NSSegmentedControl) {
         onPreviewModeChanged?(sender.selectedSegment == 1)
     }
 
+    /// Width the pill needs for everything it is currently showing.
+    var fittingWidth: CGFloat {
+        contentRow?.layoutSubtreeIfNeeded()
+        return max(240, contentRow?.fittingSize.width ?? 240)
+    }
+
     override func layout() {
         super.layout()
+        // The row is intrinsically sized now, so the drag pill no longer has to
+        // measure slack against neighbours: it degrades only when the stage
+        // itself is too narrow to give the pill its full label.
         guard let pill = dragPill else { return }
-        let leftEdge = max(zoomPopup.frame.maxX, modeControl.frame.maxX)
-        let rightEdge = actionCluster?.frame.minX ?? bounds.maxX
-        let margin: CGFloat = 12   // breathing room on each side of the pill
-        // The pill is pinned to centerX, so its usable half-slack is limited by
-        // the NEAREST zone edge; the symmetric slack is twice that.
-        let halfSlack = min(bounds.midX - leftEdge, rightEdge - bounds.midX) - margin
-        let available = max(0, halfSlack * 2)
+        let others = (contentRow?.arrangedSubviews ?? [])
+            .filter { $0 !== pill }
+            .reduce(CGFloat(0)) { $0 + $1.fittingSize.width + Self.controlGap }
+        let available = bounds.width - others - Self.pillPadding * 2
         let newMode: BottomBarDragPill.PillMode
         if available >= BottomBarDragPill.fullWidth { newMode = .full }
         else if available >= BottomBarDragPill.compactWidth { newMode = .compact }
@@ -2621,22 +2602,23 @@ final class EditorBottomBar: NSView {
         pill.setMode(newMode)
     }
 
-    /// A native rounded icon button (Share / Pin / Copy). Native bezel sizes its
-    /// own height, so the whole cluster shares the system ruler with the Save
-    /// button and the zoom pop-up; the symbol is centered by AppKit. A fixed width
-    /// keeps the three icon buttons identical instead of each hugging its glyph.
+    /// A borderless glyph button sized to the pill's control ruler. On glass the
+    /// shape comes from the hover wash, not from a bezel.
     private func iconButton(symbol: String, tooltip: String, action: Selector) -> NSButton {
-        let btn = NSButton(title: "", target: self, action: action)
-        btn.bezelStyle = .rounded
-        btn.controlSize = .regular
-        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        let btn = GlassPillButton(title: "", target: self, action: action)
+        btn.isBordered = false
+        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
         btn.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)?
             .withSymbolConfiguration(config)
         btn.imagePosition = .imageOnly
         btn.imageScaling = .scaleProportionallyDown
+        btn.contentTintColor = .white
         btn.toolTip = tooltip
         btn.translatesAutoresizingMaskIntoConstraints = false
-        btn.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        NSLayoutConstraint.activate([
+            btn.widthAnchor.constraint(equalToConstant: Self.controlSize),
+            btn.heightAnchor.constraint(equalToConstant: Self.controlSize),
+        ])
         return btn
     }
 
@@ -3017,6 +2999,38 @@ extension AnnotationWindowController {
         backgroundSidebar?.options = options
     }
     var uiTestSidebar: BackgroundSidebar? { backgroundSidebar }
+
+    /// Exposed so the spacing test asserts the real band instead of repeating
+    /// the number, which would make the two drift apart independently.
+    static var uiTestTrafficLightBand: CGFloat { trafficLightBand }
+
+    /// Measured chrome geometry, so spacing can be asserted instead of eyeballed
+    /// in a screenshot. Every value is a distance the design ruler has an
+    /// opinion about; a render can only tell you it "looks about right".
+    var uiTestChromeMetrics: [String: Double]? {
+        guard let container = window?.contentView, let panel = backgroundSidebar else { return nil }
+        let bounds = container.bounds
+        let panelFrame = panel.frame
+        let toolFrame = toolbar.frame
+        let actionFrame = bottomBar?.frame ?? .zero
+        return [
+            "panelWidth": panelFrame.width,
+            "panelMarginLeading": panelFrame.minX,
+            "panelMarginBottom": panelFrame.minY,
+            "panelMarginTop": bounds.maxY - panelFrame.maxY,
+            "toolPillHeight": toolFrame.height,
+            "toolPillMarginTop": bounds.maxY - toolFrame.maxY,
+            "actionPillHeight": actionFrame.height,
+            "actionPillCenterOffset": actionFrame.midX - toolFrame.midX,
+            // The pill must be centred on the stage, which is the window minus
+            // the panel: a pill centred on the window drifts when the panel opens.
+            // Centre of the STAGE, which with one leading panel is not the
+            // centre of the window.
+            "toolPillCenterOffset": toolFrame.midX
+                - (panelFrame.width + KritMetrics.Panel.margin * 2
+                   + (bounds.width - panelFrame.width - KritMetrics.Panel.margin * 2) / 2),
+        ]
+    }
     func uiTestToggleSidebar() { toggleBackgroundSidebar() }
 
     /// Smart Redact harness hook: runs the pure detection pass (OCR + classifier)

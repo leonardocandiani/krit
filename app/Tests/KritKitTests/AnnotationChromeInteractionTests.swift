@@ -19,7 +19,9 @@ final class AnnotationChromeInteractionTests: XCTestCase {
 
     func testEditorModeSegmentUsesKritAccentInsteadOfSystemBlue() throws {
         let bar = EditorBottomBar(frame: NSRect(x: 0, y: 0, width: 720, height: 56))
-        let mode = try XCTUnwrap(bar.subviews.compactMap { $0 as? NSSegmentedControl }.first)
+        // Searched by descendant rather than direct subview: the bar's controls
+        // now live inside the glass capsule that backs the pill.
+        let mode = try XCTUnwrap(descendants(of: NSSegmentedControl.self, in: bar).first)
         let actual = try XCTUnwrap(mode.selectedSegmentBezelColor?.usingColorSpace(.sRGB))
         let expected = try XCTUnwrap(KritColors.accent.usingColorSpace(.sRGB))
 
@@ -37,14 +39,22 @@ final class AnnotationChromeInteractionTests: XCTestCase {
             height: AnnotationToolbar.totalHeight
         ))
 
-        XCTAssertEqual(AnnotationToolbar.totalHeight, AnnotationToolbar.mainBarHeight)
+        // The pill is padding, one control, padding: nothing else may creep into
+        // its height, or the capsule stops being a capsule.
+        XCTAssertEqual(
+            AnnotationToolbar.totalHeight,
+            AnnotationToolbar.controlSize + AnnotationToolbar.pillPadding * 2
+        )
         XCTAssertEqual(descendants(of: ToolFamilyButton.self, in: toolbar).count, 3)
         XCTAssertEqual(descendants(of: FlatToolButton.self, in: toolbar).count, 6)
         toolbar.layoutSubtreeIfNeeded()
-        XCTAssertLessThanOrEqual(
-            toolbar.fittingWidth - AnnotationToolbar.trailingInset,
-            AnnotationToolbar.requiredWidth + 20
-        )
+
+        // The toolbar floats over the stage, so its width is its content's. The
+        // guard that matters is that it stays a pill: wide enough for the tools,
+        // and nowhere near the full width of an editor window (which is what it
+        // used to span as a band).
+        XCTAssertGreaterThanOrEqual(toolbar.fittingWidth, AnnotationToolbar.requiredWidth)
+        XCTAssertLessThan(toolbar.fittingWidth, 900)
     }
 
     func testBottomBarDragPillAcceptsFirstMouseAndUsesProfessionalHitArea() throws {

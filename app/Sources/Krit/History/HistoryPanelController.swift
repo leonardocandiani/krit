@@ -565,7 +565,7 @@ private final class HistoryCardItem: NSCollectionViewItem {
         // Thumbnail well: rounded corners + light shadow (Apple-native layer).
         let well = NSView(frame: NSRect(x: 0, y: 28, width: 200, height: 130))
         well.wantsLayer = true
-        well.layer?.cornerRadius = 12
+        well.layer?.cornerRadius = ChromeFactory.Radius.card
         well.layer?.cornerCurve = .continuous
         well.layer?.shadowColor = NSColor.black.cgColor
         well.layer?.shadowOpacity = 0.18
@@ -580,7 +580,7 @@ private final class HistoryCardItem: NSCollectionViewItem {
         thumbView.frame = well.bounds
         thumbView.imageScaling = .scaleProportionallyUpOrDown
         thumbView.wantsLayer = true
-        thumbView.layer?.cornerRadius = 12
+        thumbView.layer?.cornerRadius = ChromeFactory.Radius.card
         thumbView.layer?.cornerCurve = .continuous
         thumbView.layer?.masksToBounds = true
         thumbView.layer?.backgroundColor = KritColors.canvasBackground.cgColor
@@ -867,14 +867,14 @@ private final class SourceAppBadge: NSView {
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: Self.side, height: Self.side))
         wantsLayer = true
-        layer?.cornerRadius = 7
+        layer?.cornerRadius = ChromeFactory.Radius.control
         layer?.cornerCurve = .continuous
         layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
         layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
         layer?.borderWidth = 1
         // Soft drop so the badge lifts off busy thumbnails.
         layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowOpacity = 0.35
+        layer?.shadowOpacity = 0.18
         layer?.shadowRadius = 3
         layer?.shadowOffset = CGSize(width: 0, height: -1)
 
@@ -963,12 +963,15 @@ private final class HistoryPreviewWindow: NSWindow {
 
         cardView.imageScaling = .scaleProportionallyUpOrDown
         cardView.wantsLayer = true
-        cardView.layer?.cornerRadius = 14
+        cardView.layer?.cornerRadius = ChromeFactory.Radius.panel
         cardView.layer?.cornerCurve = .continuous
         cardView.layer?.shadowColor = NSColor.black.cgColor
-        cardView.layer?.shadowOpacity = 0.5
-        cardView.layer?.shadowRadius = 44
-        cardView.layer?.shadowOffset = CGSize(width: 0, height: -18)
+        // The preview already sits on a dark scrim, so the shadow only has to
+        // separate the card from it. At 0.5/44 it was painting a dark halo the
+        // scrim then doubled.
+        cardView.layer?.shadowOpacity = 0.28
+        cardView.layer?.shadowRadius = 32
+        cardView.layer?.shadowOffset = CGSize(width: 0, height: -10)
         cardView.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(cardView)
 

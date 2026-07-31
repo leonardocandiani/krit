@@ -18,6 +18,27 @@ enum Motion {
         static let slow: TimeInterval = 0.42
     }
 
+    /// The house curve for anything that moves as a surface: a panel sliding,
+    /// a sheet arriving, a page changing. It leaves fast and brakes for a long
+    /// time, which is what reads as weight without needing a spring. Same shape
+    /// the iOS drawer uses.
+    static let panelCurve = CAMediaTimingFunction(controlPoints: 0.32, 0.72, 0, 1)
+
+    /// Sharper exit for overlays that should feel like they were already there.
+    static let expoOut = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
+
+    /// Run a block with the panel curve, honouring Reduce Motion.
+    @MainActor
+    static func animatePanel(_ duration: TimeInterval = Duration.standard,
+                             curve: CAMediaTimingFunction = panelCurve,
+                             _ body: (NSAnimationContext) -> Void) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = reduced ? 0 : duration
+            ctx.timingFunction = curve
+            body(ctx)
+        }
+    }
+
     /// Snappy spring (fast settle, slight overshoot) for cards, HUD and hovers.
     static func snappy() -> CASpringAnimation { spring(stiffness: 320, damping: 26) }
     /// Gentle spring (soft settle, no overshoot) for panels and sheets.

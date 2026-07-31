@@ -21,6 +21,54 @@ extension Color {
     static var kritNavigationHover: Color { Color(KritColors.navigationHoverFill) }
     static var kritInsetSurface: Color { Color(KritColors.insetSurface) }
     static var kritInsetSurfaceStroke: Color { Color(KritColors.insetSurfaceStroke) }
+
+    // MARK: - Surfaces by role
+    //
+    // The SwiftUI face of the tinted neutrals. Every one of these carries 3% of
+    // coral, which is what stops a hosted island from drifting to a system grey
+    // that belongs to no one.
+
+    static var kritWindow: Color { Color(KritColors.windowBackground) }
+    static var kritSidebar: Color { Color(KritColors.sidebarBackground) }
+    static var kritContent: Color { Color(KritColors.contentBackground) }
+    static var kritPanel: Color { Color(KritColors.panelBackground) }
+
+    static var kritCard: Color { Color(KritColors.surfaceCard) }
+    static var kritCardHover: Color { Color(KritColors.surfaceCardHover) }
+    static var kritInput: Color { Color(KritColors.surfaceInput) }
+    static var kritWell: Color { Color(KritColors.surfaceWell) }
+    static var kritHover: Color { Color(KritColors.surfaceHover) }
+    static var kritPressed: Color { Color(KritColors.surfacePressed) }
+
+    // MARK: - Text, five steps
+
+    static var kritTextPrimary: Color { Color(KritColors.textPrimary) }
+    static var kritTextStrong: Color { Color(KritColors.textStrong) }
+    static var kritTextSecondary: Color { Color(KritColors.textSecondary) }
+    static var kritTextTertiary: Color { Color(KritColors.textTertiary) }
+    static var kritTextMuted: Color { Color(KritColors.textMuted) }
+
+    // MARK: - Lines
+
+    static var kritHairline: Color { Color(KritColors.hairline) }
+    static var kritHairlineStrong: Color { Color(KritColors.hairlineStrong) }
+    static var kritDivider: Color { Color(KritColors.divider) }
+}
+
+extension View {
+    /// A card surface: tinted fill, hairline rim, continuous corner. The one
+    /// place that decides what "a card" looks like, so two panels doing the
+    /// same job stop being drawn two different ways.
+    func kritCardSurface(radius: CGFloat = ChromeFactory.Radius.card,
+                         fill: Color = .kritCard) -> some View {
+        background(
+            RoundedRectangle(cornerRadius: radius, style: .continuous).fill(fill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .strokeBorder(Color.kritHairline, lineWidth: KritColors.hairlineWidth)
+        )
+    }
 }
 
 /// Applies the KRIT visual language to a hosted SwiftUI tree: coral as the

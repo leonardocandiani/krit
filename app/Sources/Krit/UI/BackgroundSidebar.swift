@@ -45,7 +45,7 @@ final class BackgroundSidebar: NSView {
 
     var onChange: ((ScreenshotBackgroundOptions) -> Void)?
 
-    static let preferredWidth: CGFloat = 264
+    static let preferredWidth: CGFloat = KritMetrics.Panel.width
 
     /// Only the never-touched editor state gets a branded seed in the blur grid.
     /// Any user choice, including a same-palette enabled gradient, owns its source.
@@ -80,17 +80,34 @@ final class BackgroundSidebar: NSView {
     // no per-section drift. Sections share `sectionGap`; the column clears the
     // titlebar by `topInset`.
     private enum Style {
-        static let thumbColumns = 5
-        static let thumbSpacing: CGFloat = 6
-        static let sidePadding: CGFloat = 16
-        static let sectionGap: CGFloat = 18
-        static let topInset: CGFloat = 14
-        static let bottomInset: CGFloat = 18
-        static let pairedControlSpacing: CGFloat = 12
+        /// Four across, 4pt apart: the reference's icon grid, not a 5-column
+        /// guess. Every number below now comes from `KritMetrics` for the same
+        /// reason, so no section can quietly drift onto its own ruler.
+        static let thumbColumns = KritMetrics.Grid.cellColumns
+        static let thumbSpacing = KritMetrics.Grid.cellGap
+        static let sidePadding = KritMetrics.Panel.bodyInsets.left
+        /// Card to card.
+        static let sectionGap = KritMetrics.cardGap
+        /// Caption to the grid it names.
+        static let headerGap = KritMetrics.headerGap
+        static let topInset = KritMetrics.Panel.bodyInsets.top
+        /// The header row that holds the traffic lights and the panel's own
+        /// actions. Tall enough that a 12pt light centred in it clears both
+        /// edges, and that the row still reads as a row rather than a strip.
+        static let headerHeight: CGFloat = 40
+        /// Where the panel's own controls start, measured from its leading edge:
+        /// past the three window buttons.
+        static let trafficLightWidth: CGFloat = 72
+        static let bottomInset = KritMetrics.Panel.bodyInsets.bottom
+        static let pairedControlSpacing = KritMetrics.controlGap
         static var innerWidth: CGFloat { BackgroundSidebar.preferredWidth - sidePadding * 2 }
+        /// Usable width INSIDE a section card, which is the column minus the
+        /// body inset minus the card's own horizontal padding. Grids measured
+        /// against `innerWidth` overflow their card by exactly `cardPadX * 2`.
+        static var contentWidth: CGFloat { innerWidth - KritMetrics.cardPadX * 2 }
         static var pairedControlWidth: CGFloat { BackgroundSidebar.pairedControlWidth(innerWidth: innerWidth, spacing: pairedControlSpacing) }
         static var thumbSize: CGFloat {
-            (innerWidth - thumbSpacing * CGFloat(thumbColumns - 1)) / CGFloat(thumbColumns)
+            (contentWidth - thumbSpacing * CGFloat(thumbColumns - 1)) / CGFloat(thumbColumns)
         }
 
     }
@@ -140,15 +157,17 @@ final class BackgroundSidebar: NSView {
     private var lastBlurIdentity: String?
 
     // Controls
-    private let paddingSlider = NSSlider()
-    private let insetSlider = NSSlider()
-    private let shadowSlider = NSSlider()
-    private let cornerSlider = NSSlider()
+    private let paddingSlider = KritSlider()
+    private let insetSlider = KritSlider()
+    private let shadowSlider = KritSlider()
+    private let cornerSlider = KritSlider()
     private let paddingValue = makeValueLabel()
     private let insetValue = makeValueLabel()
     private let shadowValue = makeValueLabel()
     private let cornerValue = makeValueLabel()
     private let autoBalanceSwitch = NSSwitch()
+    /// The floating glass the column's controls sit on.
+    private var glassBacking: KritGlassBacking?
     private let blurCheckbox = NSButton()
     private let ratioPopup = NSPopUpButton()
     private var alignmentButtons: [NSButton] = []
@@ -244,18 +263,20 @@ final class BackgroundSidebar: NSView {
         self.options = options
         super.init(frame: NSRect(x: 0, y: 0, width: Self.preferredWidth, height: 600))
         wantsLayer = true
-        // ES1: a coluna é o braço esquerdo do chrome em L (EditorChromeBackdrop),
-        // mas carrega o PRÓPRIO material de fundo: durante o slide de abertura a
-        // parede do backdrop ainda não pousou (chega no completion), e sem fundo
-        // próprio os controles deslizavam pelados sobre o palco — o movimento
-        // "descolado do fundo" do relato. Assentada, o material dela se funde ao
-        // do backdrop (mesmo windowBackground), lendo como uma peça só.
-        let material = NSVisualEffectView(frame: bounds)
-        material.material = .windowBackground
-        material.blendingMode = .behindWindow
-        material.state = .followsWindowActiveState
-        material.autoresizingMask = [.width, .height]
-        addSubview(material, positioned: .below, relativeTo: nil)
+        // The inspector is an opaque column, not a vibrant one. It sits beside
+        // the artwork rather than over it, and a material here would let the
+        // screenshot's colours bleed under the controls that are supposed to be
+        // judging that screenshot. One hairline on the leading edge separates
+        // the column from the stage.
+        // The panel floats: it keeps a margin from the window on every side and
+        // carries the reference's 20.5pt panel radius, rather than running edge
+        // to edge as a docked column. The controller insets its frame; the glass
+        // fills whatever it is given.
+        let backing = KritGlassBacking(style: .panel, cornerRadius: KritMetrics.Radius.panel)
+        backing.frame = bounds
+        backing.autoresizingMask = [.width, .height]
+        addSubview(backing, positioned: .below, relativeTo: nil)
+        glassBacking = backing
         buildLayout()
         rebuildThumbnails()
         syncControls()
@@ -266,6 +287,22 @@ final class BackgroundSidebar: NSView {
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: Self.preferredWidth, height: NSView.noIntrinsicMetric)
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    /// Resolves the column's colours against the *current* appearance. Assigning
+    /// `cgColor` once at init bakes in whichever theme happened to be active
+    /// then, which is why the column came out dark under the light theme.
+    override func updateLayer() {
+        // The glass backing paints the surface; the column itself stays clear so
+        // the panel's rounded corners are not squared off by an opaque layer.
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
     }
 
     // MARK: Layout
@@ -296,8 +333,20 @@ final class BackgroundSidebar: NSView {
         documentView.addSubview(contentStack)
         scrollView.documentView = documentView
 
+        // A header row of its own, the way the reference does it: the panel runs
+        // to the top of the window and the traffic lights sit INSIDE it, sharing
+        // one line with the panel's own actions. Without this line the lights
+        // land on top of whatever control happened to be first.
+        let header = makeHeaderRow()
+        addSubview(header)
+
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: topAnchor),
+            header.topAnchor.constraint(equalTo: topAnchor),
+            header.leadingAnchor.constraint(equalTo: leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor),
+            header.heightAnchor.constraint(equalToConstant: Style.headerHeight),
+
+            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -309,9 +358,8 @@ final class BackgroundSidebar: NSView {
             contentStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor)
         ])
 
-        // Ordem da referência CleanShot: a barra de presets no TOPO, depois None,
-        // galerias, cores e os controles compactos em pares.
-        contentStack.addArrangedSubview(makePresetBar())
+        // A barra de presets subiu pro header (linha dos traffic lights), então o
+        // scroll começa direto no None.
         contentStack.addArrangedSubview(makeNoneButton())
         gradientSection = makeSection(title: "Gradients", grid: gradientGrid(), accessory: makeGradientsToggle())
         contentStack.addArrangedSubview(gradientSection!)
@@ -343,6 +391,28 @@ final class BackgroundSidebar: NSView {
     /// showing the active preset (swatch + name) and a "+" that saves the current
     /// canvas config under a name.
     /// The popup's menu is rebuilt on every change by `reloadPresetBar`.
+    /// The panel's top line: window buttons on the left (drawn by the system,
+    /// we only leave room), the panel's own controls on the right.
+    ///
+    /// This is what the reference does, and it is the only arrangement that
+    /// works once the panel runs to the top of the window: the lights have to
+    /// live *in* a row of the panel, not on top of one.
+    private func makeHeaderRow() -> NSView {
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        let bar = makePresetBar()
+        header.addSubview(bar)
+        NSLayoutConstraint.activate([
+            bar.leadingAnchor.constraint(equalTo: header.leadingAnchor,
+                                         constant: Style.trafficLightWidth),
+            bar.trailingAnchor.constraint(equalTo: header.trailingAnchor,
+                                          constant: -Style.sidePadding),
+            bar.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+        ])
+        return header
+    }
+
     private func makePresetBar() -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -367,7 +437,7 @@ final class BackgroundSidebar: NSView {
 
         row.addArrangedSubview(presetPopup)
         row.addArrangedSubview(addButton)
-        row.widthAnchor.constraint(equalToConstant: Style.innerWidth).isActive = true
+
         return row
     }
 
@@ -674,13 +744,11 @@ final class BackgroundSidebar: NSView {
     /// (background disabled), with a coral tint, matching the editor toolbar's
     /// native toggles. Clicking it routes through the same commit path as before.
     private func makeNoneButton() -> NSView {
-        let button = NSButton(title: "None", target: self, action: #selector(selectNone))
-        button.setButtonType(.pushOnPushOff)
-        if #available(macOS 26.0, *) {
-            button.bezelStyle = .glass
-        } else {
-            button.bezelStyle = .rounded
-        }
+        // Push-on/off with a system bezel paints the ON state in the SYSTEM
+        // accent (blue on a default Mac), which is the one colour this app never
+        // uses. Selection here speaks the same coral as every other selected
+        // state in the editor.
+        let button = SelectableRowButton(title: "None", target: self, action: #selector(selectNone))
         button.translatesAutoresizingMaskIntoConstraints = false
         button.widthAnchor.constraint(equalToConstant: Style.innerWidth).isActive = true
         noneButton = button
@@ -691,7 +759,7 @@ final class BackgroundSidebar: NSView {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
+        stack.spacing = Style.headerGap
         stack.translatesAutoresizingMaskIntoConstraints = false
         if let accessory {
             let header = NSStackView()
@@ -704,12 +772,39 @@ final class BackgroundSidebar: NSView {
             header.addArrangedSubview(label)
             header.addArrangedSubview(accessory)
             stack.addArrangedSubview(header)
-            header.widthAnchor.constraint(equalToConstant: Style.innerWidth).isActive = true
+            header.widthAnchor.constraint(equalToConstant: Style.contentWidth).isActive = true
         } else {
             stack.addArrangedSubview(makeSectionLabel(title))
         }
         stack.addArrangedSubview(grid)
-        return stack
+        return Self.card(wrapping: stack)
+    }
+
+    /// The reference's section card, at its literal values:
+    ///
+    ///     borderRadius: 10
+    ///     padding: "12px 14px"          (cardPadY / cardPadX)
+    ///     border: "0.5px solid var(--border)"
+    ///
+    /// Sections drawn as bare stacks read as one long strip; the card is what
+    /// makes "Gradients" and "Wallpapers" look like two things rather than two
+    /// headings over the same wall of thumbnails.
+    private static func card(wrapping content: NSView) -> NSView {
+        let card = CardView()
+        card.translatesAutoresizingMaskIntoConstraints = false
+        content.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(content)
+        NSLayoutConstraint.activate([
+            // Every card spans the column. Left to hug its contents, a section
+            // with three thumbnails draws a visibly narrower card than one with
+            // ten, and the stack of cards reads as ragged rather than as a list.
+            card.widthAnchor.constraint(equalToConstant: Style.innerWidth),
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: KritMetrics.cardPadX),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -KritMetrics.cardPadX),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: KritMetrics.cardPadY),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -KritMetrics.cardPadY),
+        ])
+        return card
     }
 
     /// "+" no header da seção Wallpapers: importa qualquer imagem (os wallpapers
@@ -724,20 +819,23 @@ final class BackgroundSidebar: NSView {
         return button
     }
 
+    /// Group header in the app's section voice: 11pt semibold, upper-cased,
+    /// tracked +0.6. Sentence-case at 10pt read as a stray line of body text and
+    /// left the four groups looking like one long list.
     private func makeSectionLabel(_ text: String) -> NSTextField {
-        let label = NSTextField(labelWithString: text)
-        label.font = .systemFont(ofSize: 10, weight: .semibold)
-        label.textColor = .tertiaryLabelColor
-        label.translatesAutoresizingMaskIntoConstraints = false
-        return label
+        let field = NSTextField(labelWithAttributedString: KritMetrics.sectionCaption(text))
+        field.translatesAutoresizingMaskIntoConstraints = false
+        return field
     }
 
     private func makeDivider() -> NSView {
         let line = NSView()
         line.translatesAutoresizingMaskIntoConstraints = false
         line.wantsLayer = true
-        line.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        line.layer?.backgroundColor = KritColors.divider.cgColor
+        // Half a point: one physical line on Retina. A full point reads as a
+        // drawn rule instead of a seam between groups.
+        line.heightAnchor.constraint(equalToConstant: KritColors.hairlineWidth).isActive = true
         line.widthAnchor.constraint(equalToConstant: Style.innerWidth).isActive = true
         return line
     }
@@ -802,13 +900,34 @@ final class BackgroundSidebar: NSView {
     }
 
     private func makeMatrix(from views: [NSView]) -> NSGridView {
-        let rows = chunk(views, into: Style.thumbColumns)
+        // Pad the last row so every grid has the SAME number of columns. Without
+        // this, a section with three thumbnails builds a three-column grid whose
+        // columns are wider than the four-column grid above it, and the two
+        // sections visibly fail to line up.
+        var padded = views
+        let remainder = padded.count % Style.thumbColumns
+        if remainder != 0 {
+            for _ in 0..<(Style.thumbColumns - remainder) {
+                let spacer = NSView()
+                spacer.translatesAutoresizingMaskIntoConstraints = false
+                spacer.widthAnchor.constraint(equalToConstant: Style.thumbSize).isActive = true
+                padded.append(spacer)
+            }
+        }
+
+        let rows = chunk(padded, into: Style.thumbColumns)
         let grid = NSGridView(views: rows)
         grid.translatesAutoresizingMaskIntoConstraints = false
         grid.rowSpacing = Style.thumbSpacing
         grid.columnSpacing = Style.thumbSpacing
         grid.xPlacement = .leading
         grid.yPlacement = .top
+        // Fixed column width: left to size themselves, columns take the width of
+        // their widest cell, so one section's tiles drift out of step with the
+        // next one's.
+        for index in 0..<grid.numberOfColumns {
+            grid.column(at: index).width = Style.thumbSize
+        }
         return grid
     }
 
@@ -886,8 +1005,9 @@ final class BackgroundSidebar: NSView {
         autoBalanceSwitch.action = #selector(autoBalanceToggled(_:))
         autoBalanceSwitch.translatesAutoresizingMaskIntoConstraints = false
 
-        // Layout em pares, como a referência: Padding cheio; Inset+Auto-balance;
-        // Shadow+Corners; Alignment+Ratio. Compacto sem perder o valor mono.
+        // Pairs, as before: Padding full width; Inset + Auto-balance; Shadow +
+        // Corners; Alignment + Ratio. This is the arrangement that fits the
+        // column, and splitting it into one control per line was a regression.
         stack.addArrangedSubview(labeledControl("Padding", paddingSlider, value: paddingValue))
         stack.addArrangedSubview(pairRow(
             labeledControl("Inset", insetSlider, value: insetValue),
@@ -1003,6 +1123,8 @@ final class BackgroundSidebar: NSView {
         row.translatesAutoresizingMaskIntoConstraints = false
         row.addArrangedSubview(header)
         row.addArrangedSubview(control)
+        // No fixed width: these rows sit two per line, so each takes whatever
+        // half of the column its pair gives it.
         header.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
         control.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
         return row
@@ -1346,8 +1468,9 @@ final class BackgroundSidebar: NSView {
         // Background disabled == None selected: light the native toggle's pressed
         // bezel and coral tint, the same accent cue the editor toolbar toggles use.
         let noneSelected = !options.isEnabled
+        // The row restyles itself from `state`; a contentTintColor here would
+        // only fight it.
         noneButton?.state = noneSelected ? .on : .off
-        noneButton?.contentTintColor = noneSelected ? KritColors.accent : nil
 
         for button in thumbnailButtons {
             button.isSelectedThumbnail = isThumbnailSelected(button)
@@ -1543,6 +1666,8 @@ final class BackgroundSidebar: NSView {
 
 private final class BackgroundThumbnailButton: NSControl {
 
+    override var mouseDownCanMoveWindow: Bool { false }
+
     var previewImage: NSImage? { didSet { needsDisplay = true } }
     var isSelectedThumbnail = false { didSet { needsDisplay = true } }
     private var hovering = false { didSet { needsDisplay = true } }
@@ -1600,9 +1725,38 @@ private final class BackgroundThumbnailButton: NSControl {
     }
 }
 
+/// A section card. Its border resolves per appearance, so it cannot be a plain
+/// `NSView` with a `cgColor` assigned once at build time.
+private final class CardView: NSView {
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = KritMetrics.Radius.card
+        layer?.cornerCurve = .continuous
+        layer?.borderWidth = KritColors.hairlineWidth
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func updateLayer() {
+        layer?.borderColor = KritColors.hairline.cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 // MARK: - Color swatch
 
 private final class BackgroundColorSwatch: NSControl {
+
+    override var mouseDownCanMoveWindow: Bool { false }
 
     var fillColor: NSColor = .white { didSet { needsDisplay = true } }
     var isSelectedSwatch = false { didSet { needsDisplay = true } }
@@ -1633,19 +1787,43 @@ private final class BackgroundColorSwatch: NSControl {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 2, dy: 2))
+        // Reference geometry:
+        //   idle      inset 0 0 0 .5px rgba(0,0,0,.10), 0 1px 2px rgba(0,0,0,.08)
+        //   selected  inset 0 0 0 1.5px <surface>, inset 0 0 0 3px <accent>
+        //   hover     scale(1.12)
+        // The selected ring is drawn as surface-then-accent so the accent reads
+        // as a ring *around* the swatch. A single accent stroke disappears the
+        // moment the swatch itself is a warm colour.
+        let inset: CGFloat = hovering ? 1 : 2
+        let rect = bounds.insetBy(dx: inset, dy: inset)
+        let circle = NSBezierPath(ovalIn: rect)
+
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.08)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        shadow.set()
         fillColor.setFill()
         circle.fill()
-        NSColor(calibratedWhite: 1, alpha: hovering ? 0.35 : 0.15).setStroke()
-        circle.lineWidth = 1
-        circle.stroke()
+        NSGraphicsContext.restoreGraphicsState()
 
-        if isSelectedSwatch {
-            let ring = NSBezierPath(ovalIn: bounds.insetBy(dx: 0.5, dy: 0.5))
-            KritColors.accent.setStroke()
-            ring.lineWidth = 2
-            ring.stroke()
+        guard isSelectedSwatch else {
+            NSColor.black.withAlphaComponent(0.10).setStroke()
+            circle.lineWidth = KritColors.hairlineWidth
+            circle.stroke()
+            return
         }
+
+        let gap = NSBezierPath(ovalIn: rect.insetBy(dx: 0.75, dy: 0.75))
+        KritColors.sidebarBackground.setStroke()
+        gap.lineWidth = 1.5
+        gap.stroke()
+
+        let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 2.25, dy: 2.25))
+        KritColors.accent.setStroke()
+        ring.lineWidth = 1.5
+        ring.stroke()
     }
 }
 

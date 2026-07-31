@@ -17,10 +17,14 @@ enum RecordingChrome {
     static let sectionDividerAlpha: CGFloat = 0.16
     static let neutralHoverAlpha: CGFloat = 0.12
     static let groupedToggleHoverAlpha: CGFloat = 0.08
+    /// Floating chrome over arbitrary screen content, so it takes the same
+    /// shadow as a menu: wide and soft. It used to be 0.56, dark enough to read
+    /// as a drop-shadow filter painted under a rectangle rather than as a bar
+    /// hovering above the desktop, and over pale content it looked like a smudge.
     static let overlayShadow = Shadow(
-        opacity: 0.56,
-        radius: 24,
-        offset: CGSize(width: 0, height: -10)
+        opacity: 0.22,
+        radius: 28,
+        offset: CGSize(width: 0, height: -8)
     )
 
     static var effectiveContrastFloorAlpha: CGFloat {

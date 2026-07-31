@@ -16,6 +16,15 @@ import ServiceManagement
 enum PreferencesContent {
     static let formMaxWidth: CGFloat = 640
 
+    /// Tabs already rebuilt on `KritSettingsGroup`/`KritSettingsRow`. The rest
+    /// stay on SwiftUI's grouped `Form` until they are converted, so the two
+    /// styles can coexist while the migration runs instead of every tab having
+    /// to land in one commit.
+    private static let nativeStyled: Set<PreferencesTab> = [
+        .general, .capture, .recording, .preview, .editor, .shortcuts,
+        .permissions, .about,
+    ]
+
     static func makeRootView(for tab: PreferencesTab) -> AnyView {
         let root: AnyView
         switch tab {
@@ -30,11 +39,11 @@ enum PreferencesContent {
         case .about:     root = AnyView(AboutForm())
         }
 
-        return AnyView(
-            PreferencesSection(tab: tab) { root }
-                .id(tab.rawValue)
-                .kritTheme()
-        )
+        let shell: AnyView = nativeStyled.contains(tab)
+            ? AnyView(KritPreferencesShell(tab: tab) { root })
+            : AnyView(PreferencesSection(tab: tab) { root })
+
+        return AnyView(shell.id(tab.rawValue).kritTheme())
     }
 
     static func makeView(for tab: PreferencesTab) -> NSView {
@@ -82,6 +91,25 @@ private struct PreferencesSection<Content: View>: View {
         .padding(.top, KritSpacing.m)
         .frame(maxWidth: PreferencesContent.formMaxWidth, maxHeight: .infinity, alignment: .topLeading)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+/// The shell for tabs rebuilt on KRIT's own settings vocabulary: the same
+/// wayfinding header, then groups drawn with the app's tokens instead of the
+/// system's grouped `Form`, which paints over them.
+private struct KritPreferencesShell<Content: View>: View {
+    let tab: PreferencesTab
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PreferencesHeader(tab: tab)
+            ZStack(alignment: .top) {
+                KritSettingsPage { content }
+                KritEdgeDissolve()
+            }
+        }
+        .background(Color.kritContent)
     }
 }
 
@@ -161,179 +189,195 @@ private struct GeneralForm: View {
     @State private var automationEnabled = Settings.automationEnabled
 
     var body: some View {
-        Section("Appearance") {
-            Picker(selection: $appearance) {
-                ForEach(AppearanceMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
+        KritSettingsGroup("Appearance") {
+            KritSettingsRow("Theme",
+                            symbol: "circle.lefthalf.filled",
+                            tint: Color(.systemIndigo),
+                            subtitle: "Match the system, or always use Light or Dark.") {
+                Picker("", selection: $appearance) {
+                    ForEach(AppearanceMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
                 }
-            } label: {
-                rowLabel("Theme", "circle.lefthalf.filled", .indigo)
-                Text("Match the system, or always use Light or Dark.")
-            }
-            .pickerStyle(.segmented)
-            .onChange(of: appearance) { newValue in
-                Settings.appearanceMode = newValue
-                AppearanceMode.applyCurrent()
-            }
-        }
-
-        Section("Startup") {
-            Toggle(isOn: $launchAtLogin) {
-                rowLabel("Launch KRIT at login", "power", .green)
-                Text("Start the menu bar app automatically.")
-            }
-            .onChange(of: launchAtLogin) { newValue in
-                do {
-                    if newValue { try SMAppService.mainApp.register() }
-                    else { try SMAppService.mainApp.unregister() }
-                } catch {
-                    // Re-read so the toggle reverts if the system rejected it.
-                    launchAtLogin = SMAppService.mainApp.status == .enabled
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .onChange(of: appearance) { newValue in
+                    Settings.appearanceMode = newValue
+                    AppearanceMode.applyCurrent()
                 }
             }
         }
 
-        Section("Sounds") {
-            Toggle(isOn: $playSounds) {
-                rowLabel("Play sounds", "speaker.wave.2.fill", .pink)
-                Text("Capture, copy, save, and recording cues.")
-            }
-            .onChange(of: playSounds) { Settings.playSounds = $0 }
-
-            Picker(selection: $captureSound) {
-                ForEach(CaptureSoundStyle.allCases, id: \.self) { style in
-                    Text(style.displayName).tag(style)
-                }
-            } label: {
-                rowLabel("Capture sound", "waveform", .purple)
-            }
-            .onChange(of: captureSound) { newValue in
-                Settings.captureSoundStyle = newValue
-                // Play the chosen cue so picking is tactile.
-                SoundManager.play(newValue == .classic ? .captureClassic : .captureBigSur)
+        KritSettingsGroup("Startup") {
+            KritSettingsRow("Launch KRIT at login",
+                            symbol: "power",
+                            tint: Color(.systemGreen),
+                            subtitle: "Start the menu bar app automatically.") {
+                Toggle("", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { newValue in
+                        do {
+                            if newValue { try SMAppService.mainApp.register() }
+                            else { try SMAppService.mainApp.unregister() }
+                        } catch {
+                            // Re-read so the toggle reverts if the system rejected it.
+                            launchAtLogin = SMAppService.mainApp.status == .enabled
+                        }
+                    }
             }
         }
 
-        Section("Menu bar") {
-            Toggle(isOn: $showMenuBarIcon) {
-                rowLabel("Show menu bar icon", "menubar.rectangle", .blue)
-                Text("Hidden? Reopen KRIT from Spotlight or Finder to get back to Preferences.")
+        KritSettingsGroup("Sounds") {
+            KritSettingsRow("Play sounds",
+                            symbol: "speaker.wave.2.fill",
+                            tint: Color(.systemPink),
+                            subtitle: "Capture, copy, save, and recording cues.") {
+                Toggle("", isOn: $playSounds)
+                    .onChange(of: playSounds) { Settings.playSounds = $0 }
             }
-            .onChange(of: showMenuBarIcon) { Settings.showMenuBarIcon = $0 }
-            Toggle(isOn: $hideDesktopIcons) {
-                rowLabel("Hide desktop icons while capturing", "menubar.dock.rectangle", .gray)
+            KritRowDivider()
+            KritSettingsRow("Capture sound",
+                            symbol: "waveform",
+                            tint: Color(.systemPurple),
+                            subtitle: "Shutter cue played on every capture.") {
+                Picker("", selection: $captureSound) {
+                    ForEach(CaptureSoundStyle.allCases, id: \.self) { style in
+                        Text(style.displayName).tag(style)
+                    }
+                }
+                .fixedSize()
+                .onChange(of: captureSound) { newValue in
+                    Settings.captureSoundStyle = newValue
+                    // Play the chosen cue so picking is tactile.
+                    SoundManager.play(newValue == .classic ? .captureClassic : .captureBigSur)
+                }
             }
-            .onChange(of: hideDesktopIcons) { Settings.hideDesktopIconsWhileCapturing = $0 }
-            Toggle(isOn: $showDockDuringCapture) {
-                rowLabel("Show Dock icon during capture", "dock.rectangle", .teal)
-                Text("KRIT briefly appears in the Dock while you pick a capture area. Off keeps it hidden.")
-            }
-            .onChange(of: showDockDuringCapture) { Settings.showDockIconDuringCapture = $0 }
         }
 
-        Section("After capture") {
-            Toggle(isOn: $copyToClipboard) {
-                rowLabel("Copy screenshots to clipboard", "doc.on.clipboard.fill", .blue)
-                Text("New screenshots are copied automatically.")
+        KritSettingsGroup("Menu bar") {
+            KritSettingsRow("Show menu bar icon",
+                            symbol: "menubar.rectangle",
+                            tint: Color(.systemBlue),
+                            subtitle: "Hidden? Reopen KRIT from Spotlight or Finder to get back here.") {
+                Toggle("", isOn: $showMenuBarIcon)
+                    .onChange(of: showMenuBarIcon) { Settings.showMenuBarIcon = $0 }
             }
-            .onChange(of: copyToClipboard) { Settings.afterCaptureCopyToClipboard = $0 }
-
-            Toggle(isOn: $saveAutomatically) {
-                rowLabel("Save automatically", "square.and.arrow.down.fill", .green)
-                Text("Write each capture to the save location without asking.")
+            KritRowDivider()
+            KritSettingsRow("Hide desktop icons while capturing",
+                            symbol: "menubar.dock.rectangle",
+                            tint: Color(.systemGray)) {
+                Toggle("", isOn: $hideDesktopIcons)
+                    .onChange(of: hideDesktopIcons) { Settings.hideDesktopIconsWhileCapturing = $0 }
             }
-            .onChange(of: saveAutomatically) { Settings.afterCaptureSaveAutomatically = $0 }
+            KritRowDivider()
+            KritSettingsRow("Show Dock icon during capture",
+                            symbol: "dock.rectangle",
+                            tint: Color(.systemTeal),
+                            subtitle: "KRIT briefly appears in the Dock while you pick an area.") {
+                Toggle("", isOn: $showDockDuringCapture)
+                    .onChange(of: showDockDuringCapture) { Settings.showDockIconDuringCapture = $0 }
+            }
         }
 
-        Section("Selection") {
-            Toggle(isOn: $magnifierOnControl) {
-                rowLabel("Show magnifier only while holding Control", "plus.magnifyingglass", .orange)
-                Text("Keeps the crosshair light; hold ⌃ for the zoom loupe and guide lines.")
+        KritSettingsGroup("After capture") {
+            KritSettingsRow("Copy screenshots to clipboard",
+                            symbol: "doc.on.clipboard.fill",
+                            tint: Color(.systemBlue),
+                            subtitle: "New screenshots are copied automatically.") {
+                Toggle("", isOn: $copyToClipboard)
+                    .onChange(of: copyToClipboard) { Settings.afterCaptureCopyToClipboard = $0 }
             }
-            .onChange(of: magnifierOnControl) { Settings.magnifierRequiresControl = $0 }
+            KritRowDivider()
+            KritSettingsRow("Save automatically",
+                            symbol: "square.and.arrow.down.fill",
+                            tint: Color(.systemGreen),
+                            subtitle: "Write each capture to the save location without asking.") {
+                Toggle("", isOn: $saveAutomatically)
+                    .onChange(of: saveAutomatically) { Settings.afterCaptureSaveAutomatically = $0 }
+            }
         }
 
-        Section("Presentation zoom") {
-            Picker(selection: $zoomFeel) {
-                ForEach(PresentationZoomFeel.allCases) { feel in
-                    Text(feel.label).tag(feel)
-                }
-            } label: {
-                rowLabel("Feel", "wand.and.stars", .cyan)
-                Text("How the zoom settles: Precise stops dead, Natural eases in, Bouncy adds a springy overshoot.")
+        KritSettingsGroup("Selection") {
+            KritSettingsRow("Magnifier only while holding Control",
+                            symbol: "plus.magnifyingglass",
+                            tint: .kritAccent,
+                            subtitle: "Keeps the crosshair light; hold ⌃ for the loupe and guides.") {
+                Toggle("", isOn: $magnifierOnControl)
+                    .onChange(of: magnifierOnControl) { Settings.magnifierRequiresControl = $0 }
             }
-            .pickerStyle(.segmented)
-            .onChange(of: zoomFeel) { Settings.presentationZoomFeel = $0 }
+        }
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 10) {
-                    SettingIcon(symbol: "water.waves", color: .cyan)
-                    Text("Smoothing")
-                    Spacer()
-                    Text(String(format: "%.2f s", PresentationZoomController.responseTime(forSmoothness: zoomSmoothness)))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
+        KritSettingsGroup("Presentation zoom") {
+            KritSettingsRow("Feel",
+                            symbol: "wand.and.stars",
+                            tint: Color(.systemCyan),
+                            subtitle: "Precise stops dead, Natural eases in, Bouncy overshoots.") {
+                Picker("", selection: $zoomFeel) {
+                    ForEach(PresentationZoomFeel.allCases) { feel in
+                        Text(feel.label).tag(feel)
+                    }
                 }
-                Slider(value: $zoomSmoothness, in: 0...1) {
-                    EmptyView()
-                } minimumValueLabel: {
-                    Text("Snappy").font(.caption).foregroundStyle(.secondary)
-                } maximumValueLabel: {
-                    Text("Glide").font(.caption).foregroundStyle(.secondary)
-                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .onChange(of: zoomFeel) { Settings.presentationZoomFeel = $0 }
+            }
+            KritRowDivider()
+            KritSliderRow(title: "Smoothing",
+                          symbol: "water.waves",
+                          tint: Color(.systemCyan),
+                          value: $zoomSmoothness,
+                          range: 0...1,
+                          readout: String(format: "%.2f s",
+                                          PresentationZoomController.responseTime(forSmoothness: zoomSmoothness)),
+                          caption: "How long each move takes. Applies live while a zoom is running.")
                 .onChange(of: zoomSmoothness) { Settings.presentationZoomSmoothness = $0 }
-                Text("How long each move takes. Applies live — adjust it while a zoom is running to feel the difference.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            KritRowDivider()
+            KritSliderRow(title: "Zoom level",
+                          symbol: "plus.magnifyingglass",
+                          tint: Color(.systemCyan),
+                          value: $zoomLevel,
+                          range: PresentationZoomController.minLevel...PresentationZoomController.maxLevel,
+                          step: 0.25,
+                          readout: String(format: "%g×", zoomLevel),
+                          caption: "The first zoom-in jumps straight to this level.")
+                .onChange(of: zoomLevel) { Settings.presentationZoomLevel = $0 }
+        }
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 10) {
-                    SettingIcon(symbol: "plus.magnifyingglass", color: .cyan)
-                    Text("Zoom level")
-                    Spacer()
-                    Text(String(format: "%g×", zoomLevel))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                Slider(value: $zoomLevel, in: PresentationZoomController.minLevel...PresentationZoomController.maxLevel, step: 0.25)
-                    .onChange(of: zoomLevel) { Settings.presentationZoomLevel = $0 }
-                Text("Arming keeps the screen at normal size; the first zoom-in jumps straight to this level. Tap to step ×1.25, hold to ramp continuously; zoom out walks back to normal.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        KritSettingsGroup("Screen annotation") {
+            KritSettingsRow("Keep drawing after closing",
+                            symbol: "scribble",
+                            tint: Color(.systemOrange),
+                            subtitle: "Closing the toolbar keeps your marks on screen. Off clears them.") {
+                Toggle("", isOn: $annotationKeepOnExit)
+                    .onChange(of: annotationKeepOnExit) { Settings.liveAnnotationKeepOnExit = $0 }
             }
         }
 
-        Section("Screen annotation") {
-            Toggle(isOn: $annotationKeepOnExit) {
-                rowLabel("Keep drawing after closing", "scribble", .orange)
-                Text("Closing the annotation toolbar keeps your marks on screen for next time. Off clears them.")
+        KritSettingsGroup("AI") {
+            KritSettingsRow("Cloud AI features",
+                            symbol: "sparkles",
+                            tint: Color(.systemPurple),
+                            subtitle: "On-device AI always works. This adds cloud features through your own Claude subscription; KRIT never stores an API key.") {
+                Toggle("", isOn: $aiCloudEnabled)
+                    .onChange(of: aiCloudEnabled) { Settings.aiCloudEnabled = $0 }
             }
-            .onChange(of: annotationKeepOnExit) { Settings.liveAnnotationKeepOnExit = $0 }
-        }
-
-        Section("AI") {
-            Toggle(isOn: $aiCloudEnabled) {
-                rowLabel("Cloud AI features", "sparkles", .purple)
-                Text("On-device AI (text recognition, translation) always works. Turn this on to also use cloud features through your own Claude subscription — KRIT runs the Claude Code app you installed and never stores an API key.")
-            }
-            .onChange(of: aiCloudEnabled) { Settings.aiCloudEnabled = $0 }
-
             if aiCloudEnabled && !claudeFound {
-                Text("Claude Code not found — install it and run claude setup-token, then reopen this window.")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
+                KritRowDivider()
+                KritSettingsNote("Claude Code not found. Install it, run claude setup-token, then reopen this window.",
+                                 symbol: "exclamationmark.triangle.fill",
+                                 tint: Color(.systemOrange))
             }
         }
 
-        Section("Automation") {
-            Toggle(isOn: $automationEnabled) {
-                rowLabel("Allow scripting & the krit CLI", "terminal", .teal)
-                Text("Off by default. On, KRIT runs a local command port and answers krit:// URLs so the bundled CLI, Shortcuts, and agents can drive it. This lets other apps on this Mac take screenshots and read the accessibility tree through KRIT, so leave it off unless you use the CLI.")
-            }
-            .onChange(of: automationEnabled) {
-                Settings.automationEnabled = $0
-                (NSApp.delegate as? AppDelegate)?.refreshAutomationPort()
+        KritSettingsGroup("Automation") {
+            KritSettingsRow("Allow scripting and the krit CLI",
+                            symbol: "terminal",
+                            tint: Color(.systemTeal),
+                            subtitle: "Off by default. On, KRIT answers krit:// URLs and runs a local command port, letting other apps on this Mac capture through it.") {
+                Toggle("", isOn: $automationEnabled)
+                    .onChange(of: automationEnabled) {
+                        Settings.automationEnabled = $0
+                        (NSApp.delegate as? AppDelegate)?.refreshAutomationPort()
+                    }
             }
         }
         .task {
@@ -357,58 +401,58 @@ private struct CaptureForm: View {
     @State private var windowBackground = Settings.windowCaptureBackground
 
     var body: some View {
-        Section("Export format") {
-            Picker(selection: $format) {
-                Text("PNG").tag("png")
-                Text("JPEG").tag("jpeg")
-                Text("WebP").tag("webp")
-                Text("PDF").tag("pdf")
-            } label: {
-                rowLabel("File format", "doc.fill", .blue)
-            }
-            .onChange(of: format) { Settings.screenshotFormat = $0 }
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 10) {
-                    SettingIcon(symbol: "slider.horizontal.3", color: .indigo)
-                    Text("JPEG quality")
-                    Spacer()
-                    Text("\(Int(jpegQuality * 100))%")
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
+        KritSettingsGroup("Export format") {
+            KritSettingsRow("File format",
+                            symbol: "doc.fill",
+                            tint: Color(.systemBlue),
+                            subtitle: "Applied to every new screenshot.") {
+                Picker("", selection: $format) {
+                    Text("PNG").tag("png")
+                    Text("JPEG").tag("jpeg")
+                    Text("WebP").tag("webp")
+                    Text("PDF").tag("pdf")
                 }
-                Slider(value: $jpegQuality, in: 0.1...1.0)
-                    .onChange(of: jpegQuality) { Settings.jpegQuality = $0 }
+                .fixedSize()
+                .onChange(of: format) { Settings.screenshotFormat = $0 }
+            }
+            KritRowDivider()
+            KritSliderRow(title: "JPEG quality",
+                          symbol: "slider.horizontal.3",
+                          tint: Color(.systemIndigo),
+                          value: $jpegQuality,
+                          range: 0.1...1.0,
+                          readout: "\(Int(jpegQuality * 100))%")
+                .onChange(of: jpegQuality) { Settings.jpegQuality = $0 }
+        }
+
+        KritSettingsGroup("Countdown") {
+            KritSettingsRow("Self-timer",
+                            symbol: "timer",
+                            tint: Color(.systemOrange),
+                            subtitle: "Counts 3, 2, 1 before the capture fires. Esc cancels.") {
+                Picker("", selection: $countdown) {
+                    Text("Off").tag(0)
+                    Text("3 seconds").tag(3)
+                    Text("5 seconds").tag(5)
+                    Text("10 seconds").tag(10)
+                }
+                .fixedSize()
+                .onChange(of: countdown) { Settings.captureCountdownSeconds = $0 }
             }
         }
 
-        Section("Countdown") {
-            Picker(selection: $countdown) {
-                Text("Off").tag(0)
-                Text("3 seconds").tag(3)
-                Text("5 seconds").tag(5)
-                Text("10 seconds").tag(10)
-            } label: {
-                rowLabel("Self-timer", "timer", .orange)
-                Text("Counts 3, 2, 1 before the capture fires. Esc cancels.")
-            }
-            .onChange(of: countdown) { Settings.captureCountdownSeconds = $0 }
-        }
-
-        Section("Window capture") {
+        KritSettingsGroup("Window capture") {
             WindowBackgroundPicker(selection: $windowBackground)
-            .onChange(of: windowBackground) { Settings.windowCaptureBackground = $0 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 11)
+                .onChange(of: windowBackground) { Settings.windowCaptureBackground = $0 }
         }
 
-        Section("Save location") {
-            HStack(spacing: 10) {
-                SettingIcon(symbol: "folder.fill", color: .blue)
-                Text("Screenshots folder")
-                Spacer()
-                Text(saveLocation)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+        KritSettingsGroup("Save location") {
+            KritSettingsRow("Screenshots folder",
+                            symbol: "folder.fill",
+                            tint: Color(.systemBlue),
+                            subtitle: saveLocation) {
                 Button("Choose…") { chooseFolder() }
             }
         }
@@ -561,104 +605,112 @@ private struct RecordingForm: View {
     @State private var gifMaxDimension = Settings.recordingGIFMaxDimension
 
     var body: some View {
-        Section("Video") {
-            Picker(selection: $quality) {
-                Text("Balanced").tag("balanced")
-                Text("High").tag("high")
-                Text("Max").tag("max")
-            } label: {
-                rowLabel("Quality", "video.fill", .red)
-                Text("Max keeps more detail for demos but makes larger files.")
+        KritSettingsGroup("Video") {
+            KritSettingsRow("Quality",
+                            symbol: "video.fill",
+                            tint: Color(.systemRed),
+                            subtitle: "Max keeps more detail for demos but makes larger files.") {
+                Picker("", selection: $quality) {
+                    Text("Balanced").tag("balanced")
+                    Text("High").tag("high")
+                    Text("Max").tag("max")
+                }
+                .fixedSize()
+                .onChange(of: quality) { Settings.recordingQuality = $0 }
             }
-            .onChange(of: quality) { Settings.recordingQuality = $0 }
-
-            Picker(selection: $fps) {
-                Text("30 fps").tag(30)
-                Text("60 fps").tag(60)
-            } label: {
-                rowLabel("Frame rate", "speedometer", .orange)
+            KritRowDivider()
+            KritSettingsRow("Frame rate", symbol: "speedometer", tint: Color(.systemOrange)) {
+                Picker("", selection: $fps) {
+                    Text("30 fps").tag(30)
+                    Text("60 fps").tag(60)
+                }
+                .fixedSize()
+                .onChange(of: fps) { Settings.recordingFPS = $0 }
             }
-            .onChange(of: fps) { Settings.recordingFPS = $0 }
-
-            Toggle(isOn: $showsCursor) {
-                rowLabel("Show cursor", "cursorarrow", .gray)
+            KritRowDivider()
+            KritSettingsRow("Show cursor", symbol: "cursorarrow", tint: Color(.systemGray)) {
+                Toggle("", isOn: $showsCursor)
+                    .onChange(of: showsCursor) { Settings.recordingShowsCursor = $0 }
             }
-            .onChange(of: showsCursor) { Settings.recordingShowsCursor = $0 }
         }
 
-        Section("Audio") {
-            Toggle(isOn: $systemAudio) {
-                rowLabel("Record system audio", "speaker.wave.2.fill", .purple)
-                Text("Excludes KRIT's own sounds to avoid feedback.")
+        KritSettingsGroup("Audio") {
+            KritSettingsRow("Record system audio",
+                            symbol: "speaker.wave.2.fill",
+                            tint: Color(.systemPurple),
+                            subtitle: "Excludes KRIT's own sounds to avoid feedback.") {
+                Toggle("", isOn: $systemAudio)
+                    .onChange(of: systemAudio) { Settings.recordingSystemAudio = $0 }
             }
-            .onChange(of: systemAudio) { Settings.recordingSystemAudio = $0 }
-
-            Toggle(isOn: $microphone) {
-                rowLabel("Record microphone", "mic.fill", .pink)
+            KritRowDivider()
+            KritSettingsRow("Record microphone", symbol: "mic.fill", tint: Color(.systemPink)) {
+                Toggle("", isOn: $microphone)
+                    .onChange(of: microphone) { Settings.recordingMicrophone = $0 }
             }
-            .onChange(of: microphone) { Settings.recordingMicrophone = $0 }
-
-            DevicePicker(
-                title: "Microphone",
-                symbol: "mic.circle.fill",
-                color: .pink,
-                options: devices.microphones,
-                selection: $micDevice
-            )
-            .onChange(of: micDevice) { Settings.recordingMicrophoneDeviceID = $0 }
+            KritRowDivider()
+            KritSettingsRow("Microphone", symbol: "mic.circle.fill", tint: Color(.systemPink)) {
+                DevicePicker(options: devices.microphones, selection: $micDevice)
+                    .onChange(of: micDevice) { Settings.recordingMicrophoneDeviceID = $0 }
+            }
         }
 
-        Section("Webcam") {
-            Toggle(isOn: $webcam) {
-                rowLabel("Webcam overlay", "camera.fill", .teal)
-                Text("Circular picture in picture in the corner. Needs camera permission.")
+        KritSettingsGroup("Webcam") {
+            KritSettingsRow("Webcam overlay",
+                            symbol: "camera.fill",
+                            tint: Color(.systemTeal),
+                            subtitle: "Circular picture in picture in the corner. Needs camera permission.") {
+                Toggle("", isOn: $webcam)
+                    .onChange(of: webcam) { Settings.recordingWebcam = $0 }
             }
-            .onChange(of: webcam) { Settings.recordingWebcam = $0 }
-
-            DevicePicker(
-                title: "Camera",
-                symbol: "camera.circle.fill",
-                color: .teal,
-                options: devices.cameras,
-                selection: $webcamDevice
-            )
-            .onChange(of: webcamDevice) { Settings.recordingWebcamDeviceID = $0 }
+            KritRowDivider()
+            KritSettingsRow("Camera", symbol: "camera.circle.fill", tint: Color(.systemTeal)) {
+                DevicePicker(options: devices.cameras, selection: $webcamDevice)
+                    .onChange(of: webcamDevice) { Settings.recordingWebcamDeviceID = $0 }
+            }
         }
 
-        Section("Clicks and keystrokes") {
-            Toggle(isOn: $showsClicks) {
-                rowLabel("Highlight mouse clicks", "cursorarrow.click", .blue)
+        KritSettingsGroup("Clicks and keystrokes") {
+            KritSettingsRow("Highlight mouse clicks",
+                            symbol: "cursorarrow.click",
+                            tint: Color(.systemBlue)) {
+                Toggle("", isOn: $showsClicks)
+                    .onChange(of: showsClicks) { Settings.recordingShowsClicks = $0 }
             }
-            .onChange(of: showsClicks) { Settings.recordingShowsClicks = $0 }
-
-            Toggle(isOn: $showsKeystrokes) {
-                rowLabel("Show pressed keys", "keyboard.fill", .indigo)
-                Text("Keystroke HUD inside the recording. Needs Accessibility permission.")
+            KritRowDivider()
+            KritSettingsRow("Show pressed keys",
+                            symbol: "keyboard.fill",
+                            tint: Color(.systemIndigo),
+                            subtitle: "Keystroke HUD inside the recording. Needs Accessibility permission.") {
+                Toggle("", isOn: $showsKeystrokes)
+                    .onChange(of: showsKeystrokes) { Settings.recordingShowsKeystrokes = $0 }
             }
-            .onChange(of: showsKeystrokes) { Settings.recordingShowsKeystrokes = $0 }
         }
 
-        Section("GIF export") {
-            Picker(selection: $gifFPS) {
-                Text("10 fps").tag(10)
-                Text("15 fps").tag(15)
-                Text("24 fps").tag(24)
-                Text("30 fps").tag(30)
-            } label: {
-                rowLabel("Frame rate", "speedometer", .orange)
+        KritSettingsGroup("GIF export") {
+            KritSettingsRow("Frame rate", symbol: "speedometer", tint: Color(.systemOrange)) {
+                Picker("", selection: $gifFPS) {
+                    Text("10 fps").tag(10)
+                    Text("15 fps").tag(15)
+                    Text("24 fps").tag(24)
+                    Text("30 fps").tag(30)
+                }
+                .fixedSize()
+                .onChange(of: gifFPS) { Settings.recordingGIFFPS = $0 }
             }
-            .onChange(of: gifFPS) { Settings.recordingGIFFPS = $0 }
-
-            Picker(selection: $gifMaxDimension) {
-                Text("480 px").tag(480)
-                Text("640 px").tag(640)
-                Text("800 px").tag(800)
-                Text("1024 px").tag(1024)
-            } label: {
-                rowLabel("Max size", "arrow.up.left.and.arrow.down.right", .green)
-                Text("Largest dimension in pixels; frames downscale to fit.")
+            KritRowDivider()
+            KritSettingsRow("Max size",
+                            symbol: "arrow.up.left.and.arrow.down.right",
+                            tint: Color(.systemGreen),
+                            subtitle: "Largest dimension in pixels; frames downscale to fit.") {
+                Picker("", selection: $gifMaxDimension) {
+                    Text("480 px").tag(480)
+                    Text("640 px").tag(640)
+                    Text("800 px").tag(800)
+                    Text("1024 px").tag(1024)
+                }
+                .fixedSize()
+                .onChange(of: gifMaxDimension) { Settings.recordingGIFMaxDimension = $0 }
             }
-            .onChange(of: gifMaxDimension) { Settings.recordingGIFMaxDimension = $0 }
         }
         .task { await devices.refresh() }
         .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
@@ -672,21 +724,22 @@ private struct RecordingForm: View {
 
 /// Picker over stable device options. The selected unique ID remains compatible
 /// with the existing UserDefaults value used by RecordingEngine.
+///
+/// The label lives on the settings row now, so this is only the control: it sits
+/// where every other trailing control does instead of carrying its own title.
 private struct DevicePicker: View {
-    let title: String
-    var symbol: String = "circle"
-    var color: Color = .gray
     let options: [PreferencesDeviceOption]
     @Binding var selection: String
 
     var body: some View {
-        Picker(selection: $selection) {
+        Picker("", selection: $selection) {
             ForEach(options) { option in
                 Text(option.name).tag(option.id)
             }
-        } label: {
-            rowLabel(title, symbol, color)
         }
+        .labelsHidden()
+        .frame(maxWidth: 190)
+        .fixedSize()
     }
 }
 
@@ -698,36 +751,44 @@ private struct PreviewForm: View {
     @State private var onLeft = Settings.overlayOnLeft
 
     var body: some View {
-        Section("Size") {
-            Picker(selection: $size) {
-                ForEach(OverlaySize.allCases, id: \.self) { value in
-                    Text(value.displayName).tag(value)
+        KritSettingsGroup("Size") {
+            KritSettingsRow("Preview size",
+                            symbol: "arrow.up.left.and.arrow.down.right",
+                            tint: Color(.systemIndigo)) {
+                Picker("", selection: $size) {
+                    ForEach(OverlaySize.allCases, id: \.self) { value in
+                        Text(value.displayName).tag(value)
+                    }
                 }
-            } label: {
-                rowLabel("Preview size", "arrow.up.left.and.arrow.down.right", .indigo)
+                .fixedSize()
+                .onChange(of: size) { Settings.overlaySize = $0 }
             }
-            .onChange(of: size) { Settings.overlaySize = $0 }
         }
 
-        Section("Behavior") {
-            Picker(selection: $timeout) {
-                Text("3 seconds").tag(3.0)
-                Text("6 seconds").tag(6.0)
-                Text("10 seconds").tag(10.0)
-                Text("30 seconds").tag(30.0)
-                Text("Never").tag(-1.0)
-            } label: {
-                rowLabel("Auto dismiss", "clock.fill", .orange)
+        KritSettingsGroup("Behaviour") {
+            KritSettingsRow("Auto dismiss", symbol: "clock.fill", tint: Color(.systemOrange)) {
+                Picker("", selection: $timeout) {
+                    Text("3 seconds").tag(3.0)
+                    Text("6 seconds").tag(6.0)
+                    Text("10 seconds").tag(10.0)
+                    Text("30 seconds").tag(30.0)
+                    Text("Never").tag(-1.0)
+                }
+                .fixedSize()
+                .onChange(of: timeout) { Settings.overlayTimeout = $0 }
             }
-            .onChange(of: timeout) { Settings.overlayTimeout = $0 }
-
-            Picker(selection: $onLeft) {
-                Text("Left").tag(true)
-                Text("Right").tag(false)
-            } label: {
-                rowLabel("Screen side", "arrow.left.and.right.square.fill", .teal)
+            KritRowDivider()
+            KritSettingsRow("Screen side",
+                            symbol: "arrow.left.and.right.square.fill",
+                            tint: Color(.systemTeal)) {
+                Picker("", selection: $onLeft) {
+                    Text("Left").tag(true)
+                    Text("Right").tag(false)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .onChange(of: onLeft) { Settings.overlayOnLeft = $0 }
             }
-            .onChange(of: onLeft) { Settings.overlayOnLeft = $0 }
         }
     }
 }
@@ -737,6 +798,7 @@ private struct PreviewForm: View {
 private struct EditorForm: View {
     @State private var lineWidth = Settings.annotationLineWidth
     @State private var defaultTemplate = Settings.defaultTemplateName
+    @State private var chromeOpacity = Settings.editorChromeOpacity
 
     private var templateOptions: [(String, String)] {
         var options: [(String, String)] = [("None", "")]
@@ -745,35 +807,50 @@ private struct EditorForm: View {
     }
 
     var body: some View {
-        Section("Annotations") {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 10) {
-                    SettingIcon(symbol: "pencil.tip", color: .red)
-                    Text("Default thickness")
-                    Spacer()
-                    Text("\(Int(lineWidth)) pt")
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                Text("New arrows, lines, and shapes start at this stroke width.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                Slider(value: $lineWidth, in: 1...20, step: 1)
-                    .onChange(of: lineWidth) { Settings.annotationLineWidth = $0 }
-            }
+        KritSettingsGroup("Annotations") {
+            KritSliderRow(title: "Default thickness",
+                          symbol: "pencil.tip",
+                          tint: Color(.systemRed),
+                          value: $lineWidth,
+                          range: 1...20,
+                          step: 1,
+                          readout: "\(Int(lineWidth)) pt",
+                          caption: "New arrows, lines, and shapes start at this stroke width.")
+                .onChange(of: lineWidth) { Settings.annotationLineWidth = $0 }
         }
 
-        Section("Templates") {
-            Picker(selection: $defaultTemplate) {
-                ForEach(templateOptions, id: \.1) { option in
-                    Text(option.0).tag(option.1)
+        KritSettingsGroup("Appearance") {
+            KritSliderRow(title: "Chrome opacity",
+                          symbol: "circle.lefthalf.filled",
+                          tint: Color(.systemIndigo),
+                          value: $chromeOpacity,
+                          range: 0.35...1,
+                          step: 0.05,
+                          readout: "\(Int((chromeOpacity * 100).rounded()))%",
+                          caption: "How solid the editor's panel and stage are. Lower lets your wallpaper read through; over a busy desktop, raise it until the controls are comfortable again.")
+                .onChange(of: chromeOpacity) {
+                    Settings.editorChromeOpacity = $0
+                    // Open editors restyle live; without this the slider only
+                    // takes effect the next time one is opened, which reads as
+                    // the setting not working.
+                    NotificationCenter.default.post(name: Settings.editorChromeOpacityChanged, object: nil)
                 }
-            } label: {
-                rowLabel("Default template", "doc.on.doc.fill", .purple)
-                Text("Applied automatically to new captures.")
-            }
-            .onChange(of: defaultTemplate) {
-                TemplateStore.setDefault(name: $0.isEmpty ? nil : $0)
+        }
+
+        KritSettingsGroup("Templates") {
+            KritSettingsRow("Default template",
+                            symbol: "doc.on.doc.fill",
+                            tint: Color(.systemPurple),
+                            subtitle: "Applied automatically to new captures.") {
+                Picker("", selection: $defaultTemplate) {
+                    ForEach(templateOptions, id: \.1) { option in
+                        Text(option.0).tag(option.1)
+                    }
+                }
+                .fixedSize()
+                .onChange(of: defaultTemplate) {
+                    TemplateStore.setDefault(name: $0.isEmpty ? nil : $0)
+                }
             }
         }
     }
@@ -783,54 +860,61 @@ private struct EditorForm: View {
 
 private struct ShortcutsForm: View {
     var body: some View {
-        Section("Screenshots") {
-            shortcutRow("All-in-one", "square.dashed.inset.filled", .blue, .allInOne)
-            shortcutRow("Capture area", "rectangle.dashed", .blue, .captureArea)
-            shortcutRow("Capture window", "macwindow", .teal, .captureWindow)
-            shortcutRow("Capture full screen", "rectangle.on.rectangle", .indigo, .captureFullscreen)
-            shortcutRow("Repeat last area", "arrow.counterclockwise", .orange, .capturePreviousArea)
-            shortcutRow("Snap and paste", "doc.on.clipboard", .green, .snapAndPaste)
-            shortcutRow("Toggle capture history", "clock.arrow.circlepath", .purple, .captureHistory)
+        KritSettingsGroup("Screenshots") {
+            shortcutRow("All-in-one", "square.dashed.inset.filled", Color(.systemBlue), .allInOne)
+            KritRowDivider()
+            shortcutRow("Capture area", "rectangle.dashed", .kritAccent, .captureArea)
+            KritRowDivider()
+            shortcutRow("Capture window", "macwindow", Color(.systemTeal), .captureWindow)
+            KritRowDivider()
+            shortcutRow("Capture full screen", "rectangle.on.rectangle", Color(.systemIndigo), .captureFullscreen)
+            KritRowDivider()
+            shortcutRow("Repeat last area", "arrow.counterclockwise", Color(.systemOrange), .capturePreviousArea)
+            KritRowDivider()
+            shortcutRow("Snap and paste", "doc.on.clipboard", Color(.systemGreen), .snapAndPaste)
+            KritRowDivider()
+            shortcutRow("Toggle capture history", "clock.arrow.circlepath", Color(.systemPurple), .captureHistory)
         }
 
-        Section("Recording") {
-            shortcutRow("Record screen", "record.circle", .red, .recordScreen)
+        KritSettingsGroup("Recording") {
+            shortcutRow("Record screen", "record.circle", Color(.systemRed), .recordScreen)
         }
 
-        Section("Tools") {
-            shortcutRow("Capture text (OCR)", "text.viewfinder", .pink, .ocrCapture)
-            shortcutRow("Scrolling capture", "scroll", .brown, .scrollingCapture)
-            shortcutRow("Pick color", "eyedropper", .mint, .pickColor)
-            shortcutRow("Annotate screen", "scribble", .orange, .liveAnnotation)
+        KritSettingsGroup("Tools") {
+            shortcutRow("Capture text (OCR)", "text.viewfinder", Color(.systemPink), .ocrCapture)
+            KritRowDivider()
+            shortcutRow("Scrolling capture", "scroll", Color(.systemBrown), .scrollingCapture)
+            KritRowDivider()
+            shortcutRow("Pick colour", "eyedropper", Color(.systemMint), .pickColor)
+            KritRowDivider()
+            shortcutRow("Annotate screen", "scribble", Color(.systemOrange), .liveAnnotation)
         }
 
-        Section("Presentation zoom") {
-            shortcutRow("Toggle presentation zoom", "plus.magnifyingglass", .cyan, .presentationZoom)
-            shortcutRow("Zoom in", "plus.magnifyingglass", .cyan, .presentationZoomIn)
-            shortcutRow("Zoom out", "minus.magnifyingglass", .cyan, .presentationZoomOut)
+        KritSettingsGroup("Presentation zoom") {
+            shortcutRow("Toggle presentation zoom", "plus.magnifyingglass", Color(.systemCyan), .presentationZoom)
+            KritRowDivider()
+            shortcutRow("Zoom in", "plus.magnifyingglass", Color(.systemCyan), .presentationZoomIn)
+            KritRowDivider()
+            shortcutRow("Zoom out", "minus.magnifyingglass", Color(.systemCyan), .presentationZoomOut)
         }
 
-        Section {
-            HStack(spacing: 10) {
-                SettingIcon(symbol: "arrow.uturn.backward", color: .gray)
-                Text("Restore defaults")
-                Spacer()
+        KritSettingsGroup {
+            KritSettingsRow("Restore defaults",
+                            symbol: "arrow.uturn.backward",
+                            tint: Color(.systemGray),
+                            subtitle: "Click any shortcut above to change it. They stay global while KRIT runs.") {
                 Button("Restore") {
                     KeyboardShortcuts.reset(KeyboardShortcuts.Name.allCapture)
                 }
             }
-        } footer: {
-            Text("Click a shortcut to change it. Shortcuts are global while KRIT runs.")
         }
     }
 
-    /// One shortcut row: icon chip + title on the left, the recorder field on the
-    /// right.
+    /// One shortcut row: glyph tile and title on the left, the recorder field on
+    /// the right, in the same 44pt rhythm as every other settings row.
     @ViewBuilder
-    private func shortcutRow(_ title: String, _ symbol: String, _ color: Color, _ name: KeyboardShortcuts.Name) -> some View {
-        HStack(spacing: 10) {
-            rowLabel(title, symbol, color)
-            Spacer()
+    private func shortcutRow(_ title: String, _ symbol: String, _ tint: Color, _ name: KeyboardShortcuts.Name) -> some View {
+        KritSettingsRow(title, symbol: symbol, tint: tint) {
             KeyboardShortcuts.Recorder("", name: name)
         }
     }
@@ -1016,19 +1100,37 @@ private struct PresetRow: View {
 
 /// A neutral Settings-style glyph. KRIT coral stays reserved for selected rows
 /// and actions, not repeated inside every setting row.
+/// The macOS Settings glyph tile: a filled rounded square with a white symbol.
+///
+/// The colour is categorical, not decorative: it is how a row is found again
+/// after the first read, the same way System Settings and Shortcuts use it. That
+/// is also the line between this and the pastel icon-tile cliché, which tints
+/// the glyph in a wash of its own colour and means nothing. Here the fill is
+/// full strength and the glyph is always white.
 private struct SettingIcon: View {
     let symbol: String
+    let color: Color
 
-    init(symbol: String, color _: Color) {
+    init(symbol: String, color: Color) {
         self.symbol = symbol
+        self.color = color
     }
 
     var body: some View {
-        Image(systemName: symbol)
-            .symbolRenderingMode(.hierarchical)
-            .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(.secondary)
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(color)
             .frame(width: 22, height: 22)
+            .overlay(
+                Image(systemName: symbol)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+            )
+            // A hairline keeps the tile from bleeding into a same-hue surface
+            // and gives the fill an edge instead of a soft stop.
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(Color.black.opacity(0.10), lineWidth: KritColors.hairlineWidth)
+            )
             .accessibilityHidden(true)
     }
 }
@@ -1050,83 +1152,81 @@ private struct AboutForm: View {
     @State private var autoCheck = UpdaterManager.shared.automaticChecks
 
     var body: some View {
-        Section {
-            HStack(spacing: 16) {
-                Image(nsImage: NSApp.applicationIconImage
-                    ?? NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: nil)
-                    ?? NSImage())
-                    .resizable()
-                    .frame(width: 64, height: 64)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("KRIT")
-                        .font(.system(size: 22, weight: .bold))
-                    Text("Version \(version) (\(build))")
-                        .foregroundStyle(.secondary)
-                    Text("Screenshots and screen recording for macOS.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
+        // The identity block leads: app mark, version, one line on what it is.
+        // No group label above it, because a header would only repeat the name
+        // sitting right below it in 22pt.
+        HStack(spacing: 16) {
+            Image(nsImage: NSApp.applicationIconImage
+                ?? NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: nil)
+                ?? NSImage())
+                .resizable()
+                .frame(width: 64, height: 64)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("KRIT")
+                    .kritType(.largeTitle)
+                    .foregroundStyle(Color.kritTextStrong)
+                Text("Version \(version) (\(build))")
+                    .kritType(.body)
+                    .foregroundStyle(Color.kritTextSecondary)
+                Text("Screenshots and screen recording for macOS.")
+                    .kritType(.caption)
+                    .foregroundStyle(Color.kritTextTertiary)
             }
-            .padding(.vertical, 6)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 14)
+        .kritCardSurface()
+
+        KritSettingsGroup("Updates") {
+            KritSettingsRow("Software updates",
+                            symbol: "arrow.triangle.2.circlepath",
+                            tint: Color(.systemBlue)) {
+                Button("Check") { UpdaterManager.shared.checkForUpdates() }
+            }
+            KritRowDivider()
+            KritSettingsRow("Check automatically",
+                            symbol: "clock.arrow.circlepath",
+                            tint: Color(.systemGreen)) {
+                Toggle("", isOn: $autoCheck)
+                    .onChange(of: autoCheck) { UpdaterManager.shared.automaticChecks = $0 }
+            }
+            KritRowDivider()
+            KritSettingsRow("What's new",
+                            symbol: "sparkles",
+                            tint: Color(.systemPink)) {
+                Button("Show") { WhatsNewWindowController.showNow() }
+            }
         }
 
-        Section("Updates") {
-            LabeledContent {
-                Button("Open Updates") { UpdaterManager.shared.checkForUpdates() }
-            } label: {
-                Label { Text("Software Updates") } icon: { SettingIcon(symbol: "arrow.triangle.2.circlepath", color: .blue) }
-            }
-
-            Toggle(isOn: $autoCheck) {
-                Label { Text("Automatically check for updates") } icon: { SettingIcon(symbol: "clock.arrow.circlepath", color: .green) }
-            }
-            .onChange(of: autoCheck) { UpdaterManager.shared.automaticChecks = $0 }
-
-            Button {
-                WhatsNewWindowController.showNow()
-            } label: {
-                Label { Text("What's New") } icon: { SettingIcon(symbol: "sparkles", color: .pink) }
-            }
-            .buttonStyle(.plain)
-        }
-
-        Section {
-            LabeledContent {
+        KritSettingsGroup("Feedback") {
+            KritSettingsRow("Report a bug",
+                            symbol: "ladybug.fill",
+                            tint: Color(.systemRed),
+                            subtitle: "Opens a pre-filled issue on GitHub.") {
                 Button("Report") { open("\(repo)/issues/new?labels=bug") }
-            } label: {
-                Label { Text("Report a Bug") } icon: { SettingIcon(symbol: "ladybug.fill", color: .red) }
             }
-
-            LabeledContent {
+            KritRowDivider()
+            KritSettingsRow("Request a feature",
+                            symbol: "lightbulb.fill",
+                            tint: Color(.systemOrange)) {
                 Button("Request") { open("\(repo)/issues/new?labels=enhancement") }
-            } label: {
-                Label { Text("Request a Feature") } icon: { SettingIcon(symbol: "lightbulb.fill", color: .orange) }
             }
-
-            LabeledContent {
+            KritRowDivider()
+            KritSettingsRow("Star on GitHub",
+                            symbol: "star.fill",
+                            tint: Color(.systemYellow)) {
                 Button("Star") { open(repo) }
-            } label: {
-                Label { Text("Star on GitHub") } icon: { SettingIcon(symbol: "star.fill", color: .yellow) }
             }
-        } header: {
-            Text("Feedback")
-        } footer: {
-            Text("Found a bug or have an idea? KRIT is open source, everything goes straight to GitHub.")
         }
 
-        Section("Links") {
-            LabeledContent {
+        KritSettingsGroup("Source") {
+            KritSettingsRow("KRIT on GitHub",
+                            symbol: "chevron.left.forwardslash.chevron.right",
+                            tint: Color(.systemGray),
+                            subtitle: "© 2026 Leonardo Candiani. MIT licence, free and open source.") {
                 Button("Open") { open(repo) }
-            } label: {
-                Label { Text("Source on GitHub") } icon: { SettingIcon(symbol: "chevron.left.forwardslash.chevron.right", color: .gray) }
             }
-        }
-
-        Section {
-            EmptyView()
-        } footer: {
-            Text("© 2026 Leonardo Candiani. MIT License, free and open source.")
         }
     }
 
@@ -1148,30 +1248,30 @@ private struct PermissionsForm: View {
     @State private var microphone: PermissionStatus = .notDetermined
 
     var body: some View {
-        Section {
+        KritSettingsGroup("Privacy") {
             PermissionRow(
                 title: "Screen Recording", detail: "Capture your screen for screenshots and recordings.",
-                symbol: "rectangle.dashed.badge.record", color: .red, status: screen
+                symbol: "rectangle.dashed.badge.record", color: Color(.systemRed), status: screen
             ) { PermissionsManager.openScreenRecordingSettings() }
-
+            KritRowDivider()
             PermissionRow(
                 title: "Accessibility", detail: "Lets KRIT run global shortcuts and overlay gestures.",
-                symbol: "accessibility", color: .blue, status: accessibility
+                symbol: "accessibility", color: Color(.systemBlue), status: accessibility
             ) { PermissionsManager.openAccessibilitySettings() }
-
+            KritRowDivider()
             PermissionRow(
                 title: "Camera", detail: "Record a camera overlay alongside your screen.",
-                symbol: "camera.fill", color: .green, status: camera
+                symbol: "camera.fill", color: Color(.systemGreen), status: camera
             ) { PermissionsManager.openCameraSettings() }
-
+            KritRowDivider()
             PermissionRow(
                 title: "Microphone", detail: "Capture your voice while recording.",
-                symbol: "mic.fill", color: .orange, status: microphone
+                symbol: "mic.fill", color: Color(.systemOrange), status: microphone
             ) { PermissionsManager.openMicrophoneSettings() }
-        } header: {
-            Text("Privacy")
-        } footer: {
-            Text("KRIT only asks for what a capture tool needs. Use Open Settings to grant a permission in System Settings; the status here refreshes when you come back.")
+            KritRowDivider()
+            KritSettingsNote("KRIT only asks for what a capture tool needs. The status here refreshes when you come back from System Settings.",
+                             symbol: "hand.raised.fill",
+                             tint: Color(.systemGray))
         }
         .onAppear(perform: refresh)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
@@ -1198,21 +1298,10 @@ private struct PermissionRow: View {
     let onOpen: () -> Void
 
     var body: some View {
-        LabeledContent {
+        KritSettingsRow(title, symbol: symbol, tint: color, subtitle: detail) {
             HStack(spacing: 10) {
                 StatusPill(status: status)
                 Button("Open Settings", action: onOpen)
-            }
-        } label: {
-            Label {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } icon: {
-                SettingIcon(symbol: symbol, color: color)
             }
         }
     }
