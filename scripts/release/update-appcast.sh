@@ -25,7 +25,11 @@ DOWNLOAD_URL="${6:-https://github.com/leonardocandiani/krit/releases/download/v$
 [ -f "$APPCAST_FILE" ] || { echo "Appcast file not found: $APPCAST_FILE" >&2; exit 1; }
 
 FILE_SIZE=$(stat -f%z "$DMG_PATH" 2>/dev/null || stat -c%s "$DMG_PATH")
-PUB_DATE=$(date -u '+%a, %d %b %Y %H:%M:%S +0000')
+# LC_ALL=C is load-bearing: %a and %b follow the shell's locale, so running a
+# release from a pt_BR shell emitted "sex, 31 jul 2026". RFC 822 requires the
+# English abbreviations, and Sparkle parses pubDate with a POSIX locale, so a
+# localised date silently produces an item it cannot date.
+PUB_DATE=$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')
 
 ITEM_FILE="${APPCAST_FILE}.item.tmp"
 cat > "$ITEM_FILE" << EOF
