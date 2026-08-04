@@ -66,25 +66,6 @@ enum PreferencesTab: Int, CaseIterable {
         }
     }
 
-    /// The colour of this section's glyph tile. Categorical, the way System
-    /// Settings uses it: after the first read, the row is found by colour and
-    /// position rather than by re-reading nine labels. Recording is the one
-    /// that has to be red, because that is what a record control means
-    /// everywhere else on the system.
-    var tileColor: NSColor {
-        switch self {
-        case .general:     return .systemGray
-        case .capture:     return KritColors.accent
-        case .recording:   return .systemRed
-        case .preview:     return .systemTeal
-        case .editor:      return .systemPurple
-        case .shortcuts:   return .systemIndigo
-        case .presets:     return .systemPink
-        case .permissions: return .systemGreen
-        case .about:       return .systemBlue
-        }
-    }
-
     /// Section this tab belongs to in the sidebar, or nil when it needs no
     /// header above it. Grouping nine flat rows into three named blocks is what
     /// turns a list into a map.
@@ -109,6 +90,7 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
 
     private let windowSize = NSSize(width: 860, height: 620)
     private let sidebarWidth: CGFloat = 196
+    private static let fallbackSidebarIconCenterX: CGFloat = 16
 
     private var sidebar: NativePreferencesSidebar!
     private var contentHostingView: NSHostingView<AnyView>!
@@ -154,10 +136,17 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         root.autoresizingMask = [.width, .height]
         window.contentView = root
 
+        let sidebarIconCenterX = Self.closeButtonCenterX(in: window, relativeTo: root)
+            ?? Self.fallbackSidebarIconCenterX
+
         // A native source list owns keyboard navigation, selection and VoiceOver.
         // The sidebar material is structural on every supported macOS version;
         // Liquid Glass stays reserved for floating chrome such as HUDs and docks.
-        sidebar = NativePreferencesSidebar(width: sidebarWidth, height: windowSize.height) { [weak self] tab in
+        sidebar = NativePreferencesSidebar(
+            width: sidebarWidth,
+            height: windowSize.height,
+            iconCenterX: sidebarIconCenterX
+        ) { [weak self] tab in
             self?.select(tab: tab, animated: true)
         }
         let sidebarBacking = NSVisualEffectView()
@@ -202,6 +191,12 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         contentBlur.addSubview(contentHostingView)
     }
 
+    private static func closeButtonCenterX(in window: NSWindow, relativeTo view: NSView) -> CGFloat? {
+        guard let closeButton = window.standardWindowButton(.closeButton) else { return nil }
+        let center = NSPoint(x: closeButton.bounds.midX, y: closeButton.bounds.midY)
+        return view.convert(center, from: closeButton).x
+    }
+
     // MARK: - Section switching
 
     private func select(tab: PreferencesTab, animated: Bool, forceReload: Bool = false) {
@@ -237,6 +232,26 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
 
 // MARK: - Native source-list sidebar
 
+private enum PreferencesSidebarMetrics {
+    static let iconSize: CGFloat = 13
+    static let iconCenterInRow: CGFloat = 12
+    static let surfaceHorizontalInset: CGFloat = 0
+    static let labelLeading = iconCenterInRow + iconSize / 2 + 10
+}
+
+@MainActor
+private final class PreferencesSourceListTableView: NSTableView {
+    override func frameOfCell(atColumn column: Int, row: Int) -> NSRect {
+        var frame = super.frameOfCell(atColumn: column, row: row)
+        // Source-list style reserves a leading gutter inside every cell. KRIT's
+        // icons use the traffic-light axis instead, so the custom cell owns that
+        // gutter while the table keeps native selection and keyboard behavior.
+        frame.size.width += frame.minX
+        frame.origin.x = 0
+        return frame
+    }
+}
+
 /// AppKit's source list supplies the navigation behavior a Settings window is
 /// expected to have: arrow keys, selected-row semantics, focus and VoiceOver.
 /// KRIT only customizes the selected fill and the compact cell content.
@@ -258,7 +273,8 @@ final class NativePreferencesSidebar: NSObject, NSTableViewDataSource, NSTableVi
         }
     }
 
-    private let tableView = NSTableView()
+    private let tableView = PreferencesSourceListTableView()
+    private var updateButton: SidebarFooterButton!
     private let rows: [Row] = PreferencesTab.allCases.flatMap { tab -> [Row] in
         guard let group = tab.group else { return [.tab(tab)] }
         return [.header(group), .tab(tab)]
@@ -271,7 +287,13 @@ final class NativePreferencesSidebar: NSObject, NSTableViewDataSource, NSTableVi
         rows.firstIndex { $0.tab == tab }
     }
 
-    init(width: CGFloat, height: CGFloat, onSelect: @escaping (PreferencesTab) -> Void) {
+    init(
+        width: CGFloat,
+        height: CGFloat,
+        iconCenterX: CGFloat = 16,
+        onSelect: @escaping (PreferencesTab) -> Void
+    ) {
+        let rowHorizontalInset = max(0, iconCenterX - PreferencesSidebarMetrics.iconCenterInRow)
         self.onSelect = onSelect
         view = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         super.init()
@@ -305,22 +327,22 @@ final class NativePreferencesSidebar: NSObject, NSTableViewDataSource, NSTableVi
         // Update check lives at the foot of the sidebar, out of the section
         // list: it is an action, not a destination, and putting it among the
         // tabs would make it read as a tenth place to go.
-        let update = SidebarFooterButton(title: "Check for updates", symbol: "arrow.trianglehead.2.clockwise") {
+        updateButton = SidebarFooterButton(title: "Check for updates", symbol: "arrow.trianglehead.2.clockwise") {
             UpdaterManager.shared.checkForUpdates()
         }
-        update.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(update)
+        updateButton.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(updateButton)
 
         NSLayoutConstraint.activate([
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: rowHorizontalInset),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -rowHorizontalInset),
             scrollView.topAnchor.constraint(equalTo: view.topAnchor, constant: 58),
-            scrollView.bottomAnchor.constraint(equalTo: update.topAnchor, constant: -10),
+            scrollView.bottomAnchor.constraint(equalTo: updateButton.topAnchor, constant: -10),
 
-            update.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
-            update.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
-            update.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
-            update.heightAnchor.constraint(equalToConstant: 32),
+            updateButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: rowHorizontalInset),
+            updateButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -rowHorizontalInset),
+            updateButton.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
+            updateButton.heightAnchor.constraint(equalToConstant: 32),
         ])
     }
 
@@ -392,6 +414,43 @@ final class NativePreferencesSidebar: NSObject, NSTableViewDataSource, NSTableVi
         guard tableView.selectedRow >= 0 else { return nil }
         return rows[tableView.selectedRow].tab
     }
+
+    var uiTestFirstIconCenterX: CGFloat? {
+        uiTestFirstIconFrame?.midX
+    }
+
+    var uiTestFirstRowFrame: NSRect? {
+        view.layoutSubtreeIfNeeded()
+        guard let row = rows.firstIndex(where: { $0.tab != nil }) else { return nil }
+        return view.convert(tableView.rect(ofRow: row), from: tableView)
+    }
+
+    var uiTestFirstIconFrame: NSRect? {
+        view.layoutSubtreeIfNeeded()
+        tableView.layoutSubtreeIfNeeded()
+        guard let row = rows.firstIndex(where: { $0.tab != nil }),
+              let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: true)
+                as? NativePreferencesSidebarCell else { return nil }
+        cell.layoutSubtreeIfNeeded()
+        return view.convert(cell.uiTestIconFrame, from: cell)
+    }
+
+    var uiTestFirstSelectionSurfaceFrame: NSRect? {
+        view.layoutSubtreeIfNeeded()
+        tableView.layoutSubtreeIfNeeded()
+        guard let row = rows.firstIndex(where: { $0.tab != nil }),
+              let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: true)
+                as? NativePreferencesSidebarCell else { return nil }
+        cell.layoutSubtreeIfNeeded()
+        return view.convert(cell.uiTestSelectionSurfaceFrame, from: cell)
+    }
+
+    var uiTestFooterIconCenterX: CGFloat {
+        view.layoutSubtreeIfNeeded()
+        updateButton.layoutSubtreeIfNeeded()
+        let center = NSPoint(x: updateButton.uiTestIconCenterX, y: updateButton.bounds.midY)
+        return view.convert(center, from: updateButton).x
+    }
 }
 
 @MainActor
@@ -435,14 +494,19 @@ private final class SidebarFooterButton: NSView {
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
 
-        let content = NSLayoutGuide()
-        addLayoutGuide(content)
         NSLayoutConstraint.activate([
-            content.centerXAnchor.constraint(equalTo: centerXAnchor),
-            glyph.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            glyph.centerXAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: PreferencesSidebarMetrics.iconCenterInRow
+            ),
             glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
-            label.leadingAnchor.constraint(equalTo: glyph.trailingAnchor, constant: 6),
-            label.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            glyph.widthAnchor.constraint(equalToConstant: 13),
+            glyph.heightAnchor.constraint(equalToConstant: 13),
+            label.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: PreferencesSidebarMetrics.labelLeading
+            ),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
 
@@ -471,6 +535,8 @@ private final class SidebarFooterButton: NSView {
         let alpha: CGFloat = hovered ? 0.20 : 0.12
         crossfadeBackground(to: KritColors.accent.withAlphaComponent(alpha))
     }
+
+    var uiTestIconCenterX: CGFloat { glyph.frame.midX }
 }
 
 /// An all-caps group label above a run of sidebar rows. Tracked wide and set in
@@ -484,7 +550,10 @@ private final class PreferencesSidebarHeader: NSView {
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            label.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: PreferencesSidebarMetrics.labelLeading
+            ),
             label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
             // Sits low in its row so the label hugs the group it introduces
             // rather than floating between two groups.
@@ -513,11 +582,7 @@ private final class NativePreferencesSidebarRowView: NSTableRowView {
 @MainActor
 private final class NativePreferencesSidebarCell: NSTableCellView {
 
-    /// The filled rounded square the glyph sits on, matching the Settings
-    /// pattern. It owns its own layer so source-list vibrancy cannot
-    /// reinterpret the fill, which is the same reason the row's selection is
-    /// drawn here instead of in `drawSelection`.
-    private let tile = NSView()
+    private let selectionSurface = NSView()
     private let glyph = NSImageView()
     private let label = NSTextField(labelWithString: "")
     private var isSelected = false
@@ -530,27 +595,16 @@ private final class NativePreferencesSidebarCell: NSTableCellView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
-        wantsLayer = true
-        layer?.cornerRadius = ChromeFactory.Radius.control
-        layer?.cornerCurve = .continuous
-
-        tile.wantsLayer = true
-        // Concentric with the row's own radius: the tile is inset inside it, so
-        // its corner has to be the smaller one or the two shapes stop being
-        // parallel.
-        tile.layer?.cornerRadius = 6
-        tile.layer?.cornerCurve = .continuous
-        tile.layer?.borderWidth = KritColors.hairlineWidth
-        tile.layer?.borderColor = NSColor.black.withAlphaComponent(0.10).cgColor
-        tile.translatesAutoresizingMaskIntoConstraints = false
-        tile.setAccessibilityElement(false)
-        addSubview(tile)
+        selectionSurface.wantsLayer = true
+        selectionSurface.layer?.cornerRadius = ChromeFactory.Radius.control
+        selectionSurface.layer?.cornerCurve = .continuous
+        selectionSurface.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(selectionSurface)
 
         glyph.imageScaling = .scaleProportionallyDown
         glyph.translatesAutoresizingMaskIntoConstraints = false
         glyph.setAccessibilityElement(false)
-        glyph.contentTintColor = .white
-        tile.addSubview(glyph)
+        addSubview(glyph)
 
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -559,15 +613,27 @@ private final class NativePreferencesSidebarCell: NSTableCellView {
         imageView = glyph
 
         NSLayoutConstraint.activate([
-            tile.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            tile.centerYAnchor.constraint(equalTo: centerYAnchor),
-            tile.widthAnchor.constraint(equalToConstant: 22),
-            tile.heightAnchor.constraint(equalToConstant: 22),
-            glyph.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
-            glyph.centerYAnchor.constraint(equalTo: tile.centerYAnchor),
-            glyph.widthAnchor.constraint(equalToConstant: 13),
-            glyph.heightAnchor.constraint(equalToConstant: 13),
-            label.leadingAnchor.constraint(equalTo: tile.trailingAnchor, constant: 10),
+            selectionSurface.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: PreferencesSidebarMetrics.surfaceHorizontalInset
+            ),
+            selectionSurface.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -PreferencesSidebarMetrics.surfaceHorizontalInset
+            ),
+            selectionSurface.topAnchor.constraint(equalTo: topAnchor),
+            selectionSurface.bottomAnchor.constraint(equalTo: bottomAnchor),
+            glyph.centerXAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: PreferencesSidebarMetrics.iconCenterInRow
+            ),
+            glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
+            glyph.widthAnchor.constraint(equalToConstant: PreferencesSidebarMetrics.iconSize),
+            glyph.heightAnchor.constraint(equalToConstant: PreferencesSidebarMetrics.iconSize),
+            label.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: PreferencesSidebarMetrics.labelLeading
+            ),
             label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
@@ -602,30 +668,32 @@ private final class NativePreferencesSidebarCell: NSTableCellView {
         isSelected = selected
         glyph.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: nil)
         glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
-        tile.layer?.backgroundColor = tab.tileColor.cgColor
         label.stringValue = tab.title
         setAccessibilityLabel(tab.title)
         applyAppearance()
     }
 
     private func applyAppearance() {
-        // The tile keeps its colour in every state: it identifies the row, so
-        // dimming it on hover would cost the one thing it is there for. Only
-        // the row fill and the label weight answer to selection.
         let role: KritType = isSelected ? .bodyEmphasis : .body
         label.attributedStringValue = role.string(
             tab.title,
             color: isSelected ? KritColors.textStrong : KritColors.textPrimary
         )
+        glyph.contentTintColor = isSelected
+            ? KritColors.accent
+            : (isHovered ? KritColors.textPrimary : KritColors.textSecondary)
 
         if isSelected {
-            layer?.backgroundColor = KritColors.navigationSelectionFill.cgColor
+            selectionSurface.layer?.backgroundColor = KritColors.navigationSelectionFill.cgColor
         } else if isHovered {
-            layer?.backgroundColor = KritColors.navigationHoverFill.cgColor
+            selectionSurface.layer?.backgroundColor = KritColors.navigationHoverFill.cgColor
         } else {
-            layer?.backgroundColor = NSColor.clear.cgColor
+            selectionSurface.layer?.backgroundColor = NSColor.clear.cgColor
         }
     }
+
+    var uiTestIconFrame: NSRect { glyph.frame }
+    var uiTestSelectionSurfaceFrame: NSRect { selectionSurface.frame }
 }
 
 // MARK: - UI test hooks
@@ -689,4 +757,10 @@ extension PreferencesWindowController {
     func uiTestClose() { window?.close() }
 
     var uiTestSidebarWidth: CGFloat { sidebarWidth }
+
+    var uiTestSidebarIconCenterX: CGFloat? { sidebar.uiTestFirstIconCenterX }
+    var uiTestSidebarRowFrame: NSRect? { sidebar.uiTestFirstRowFrame }
+    var uiTestSidebarIconFrame: NSRect? { sidebar.uiTestFirstIconFrame }
+    var uiTestSidebarSelectionSurfaceFrame: NSRect? { sidebar.uiTestFirstSelectionSurfaceFrame }
+    var uiTestSidebarFooterIconCenterX: CGFloat { sidebar.uiTestFooterIconCenterX }
 }

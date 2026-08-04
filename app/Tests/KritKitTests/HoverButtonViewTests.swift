@@ -30,4 +30,15 @@ final class NativePreferencesSidebarTests: XCTestCase {
         XCTAssertEqual(sidebar.uiTestSelectedTab, .capture)
         XCTAssertTrue(callbacks.isEmpty, "Controller-driven selection must not recurse through its callback")
     }
+
+    func testPlacesSidebarIconsOnTheRequestedCenterline() throws {
+        let sidebar = NativePreferencesSidebar(width: 196, height: 620, iconCenterX: 16) { _ in }
+        sidebar.setSelected(.general)
+
+        XCTAssertEqual(try XCTUnwrap(sidebar.uiTestFirstIconCenterX), 16, accuracy: 0.5)
+        XCTAssertEqual(try XCTUnwrap(sidebar.uiTestFirstRowFrame).minX, 4, accuracy: 0.5)
+        XCTAssertEqual(try XCTUnwrap(sidebar.uiTestFirstSelectionSurfaceFrame).minX, 4, accuracy: 0.5)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(sidebar.uiTestFirstIconFrame).minX, 9)
+        XCTAssertEqual(sidebar.uiTestFooterIconCenterX, 16, accuracy: 0.5)
+    }
 }

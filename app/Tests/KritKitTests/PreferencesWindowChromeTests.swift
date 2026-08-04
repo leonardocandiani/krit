@@ -42,6 +42,27 @@ final class PreferencesWindowChromeTests: XCTestCase {
         }
     }
 
+    func testSidebarIconsShareTheCloseButtonCenterline() throws {
+        try withPreferencesWindow { controller, window in
+            let contentView = try XCTUnwrap(window.contentView)
+            contentView.layoutSubtreeIfNeeded()
+            let closeButton = try XCTUnwrap(window.standardWindowButton(.closeButton))
+            let closeButtonCenter = NSPoint(x: closeButton.bounds.midX, y: closeButton.bounds.midY)
+            let closeButtonCenterX = contentView.convert(closeButtonCenter, from: closeButton).x
+
+            let sidebarIconCenterX = try XCTUnwrap(controller.uiTestSidebarIconCenterX)
+            let sidebarRowFrame = try XCTUnwrap(controller.uiTestSidebarRowFrame)
+            let sidebarIconFrame = try XCTUnwrap(controller.uiTestSidebarIconFrame)
+            let selectionSurfaceFrame = try XCTUnwrap(controller.uiTestSidebarSelectionSurfaceFrame)
+
+            XCTAssertEqual(sidebarIconCenterX, closeButtonCenterX, accuracy: 0.5)
+            XCTAssertEqual(sidebarRowFrame.minX, 4, accuracy: 0.5)
+            XCTAssertEqual(selectionSurfaceFrame.minX, 4, accuracy: 0.5)
+            XCTAssertGreaterThanOrEqual(sidebarIconFrame.minX, 9)
+            XCTAssertEqual(controller.uiTestSidebarFooterIconCenterX, closeButtonCenterX, accuracy: 0.5)
+        }
+    }
+
     func testSidebarHasNoStaticBrandLabelAndKeepsSourceListAccessible() {
         let sidebar = NativePreferencesSidebar(width: 196, height: 620) { _ in }
         let labels = descendants(of: sidebar.view, as: NSTextField.self)
