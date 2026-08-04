@@ -4,6 +4,15 @@ All notable changes to KRIT, newest first.
 
 ## Unreleased
 
+## 0.31.1
+
+### Fixed
+
+- Preferences sidebar glyphs now share the native traffic-light centerline.
+- Selected and hovered sidebar rows keep a professional left margin without shrinking the click target.
+- The sidebar keeps native source-list keyboard navigation and VoiceOver semantics.
+
+
 ## 0.31.0
 
 KRIT 0.31.0 rebuilds the screenshot editor and puts every screen on one visual system.
