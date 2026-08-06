@@ -475,10 +475,9 @@ final class AnnotationWindowController: NSWindowController {
 
         editorScrollView = scrollView
 
-        // ES4: editor bottom bar, zoom popup (left), Drag me pill (center, file
-        // promise out), Share/Pin/Copy/Save cluster (right, Save tinted coral).
+        // ES4: editor action pill with zoom, preview, drag-out, Share and Pin.
         let bar = EditorBottomBar()
-        bar.frame = Self.actionPillFrame(stageX: 0, stageWidth: winW, winH: winH, bar: nil)
+        bar.frame = Self.actionPillFrame(stageX: 0, stageWidth: winW, winH: winH, bar: bar)
         bar.autoresizingMask = []
         bar.onZoomChanged = { [weak self] mag in
             // Zoom manual: o usuário assume o controle, o auto-fit para de mexer
@@ -1376,9 +1375,8 @@ final class AnnotationToolbar: NSView {
     /// The preset to ring as active when the style popover opens. Read at present
     /// time so the popover reflects the current text (or the active default).
     var currentStylePreset: TextStylePreset = .regular
-    /// Top toolbar carries "Save as…" and the primary "Copy & Close". Copy /
-    /// Pin / Share / quick Save live in the bottom bar (ES4), so those closures are
-    /// gone from here, one place per action.
+    /// Top toolbar carries "Save as…" and the primary "Copy & Close". Share and
+    /// Pin live in the action pill, one place per action.
     var onSaveAs: (() -> Void)?
     var onDone: (() -> Void)?
     var onApplyCrop: (() -> Void)?
@@ -2450,11 +2448,9 @@ private extension NSImage {
 
 // MARK: - Editor bottom bar (ES4)
 
-/// The editor's bottom bar: zoom popup (left), a "Drag me" pill that drags the
-/// edited flattened image out as a file (center), and the Share / Pin / Copy /
-/// Save cluster (right, Save tinted coral as the primary). A small "Save as…"
-/// secondary sits beside Save (ES6). Spans the window width; the controller
-/// positions it via layoutStage.
+/// The editor's floating action pill: zoom, Annotate/Preview, an explicit
+/// drag-out source, Share and Pin. The controller sizes and centers it over the
+/// stage through layoutStage.
 @MainActor
 final class EditorBottomBar: NSView {
 
@@ -2579,10 +2575,19 @@ final class EditorBottomBar: NSView {
         onPreviewModeChanged?(sender.selectedSegment == 1)
     }
 
-    /// Width the pill needs for everything it is currently showing.
+    /// Preferred width with the full drag-out affordance reserved. Measuring the
+    /// row as-is is circular: a narrow first frame hides the drag control, then a
+    /// fitting-size read omits that hidden view and can never make room for it
+    /// again when the editor settles.
     var fittingWidth: CGFloat {
-        contentRow?.layoutSubtreeIfNeeded()
-        return max(240, contentRow?.fittingSize.width ?? 240)
+        guard let row = contentRow, let pill = dragPill else { return 240 }
+        row.layoutSubtreeIfNeeded()
+        let views = row.arrangedSubviews
+        let controlsWidth = views.reduce(CGFloat(0)) { partial, view in
+            partial + (view === pill ? BottomBarDragPill.fullWidth : view.fittingSize.width)
+        }
+        let gapsWidth = row.spacing * CGFloat(max(0, views.count - 1))
+        return max(240, controlsWidth + gapsWidth + row.edgeInsets.left + row.edgeInsets.right)
     }
 
     override func layout() {
@@ -2670,16 +2675,15 @@ final class EditorBottomBar: NSView {
     }
 }
 
-// MARK: - Bottom bar "Drag me" pill (ES4)
+// MARK: - Bottom bar drag-out control (ES4)
 
 /// A pill that drags the edited flattened image out as a real file, reusing the
 /// proven overlay/HistoryPanel pattern: a plain file URL (Finder, most apps) plus
 /// an NSFilePromiseProvider fallback (Slack, Mail, browsers).
 ///
-/// HIG note: this is NOT a glass surface. The pill is a control hosted on the
-/// footer, which is the bottom arm of the L-chrome material, so it sits ON
-/// material, not floating over the content stage. Glass over material is
-/// forbidden, so it keeps a flat fill that matches the other footer controls.
+/// The drag source lives inside the action glass beside Share and Pin. It uses
+/// the same white glyph and pointer-state wash as those controls instead of
+/// drawing another opaque surface inside the capsule.
 @MainActor
 final class BottomBarDragPill: NSView, NSDraggingSource {
 
@@ -2688,22 +2692,28 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
     var onDragDelivered: (() -> Void)?
 
     /// Graceful degradation under narrow windows (the Snapzy footer pattern):
-    /// full (grip + label), compact (grip only), hidden (zero width) so the
+    /// full (icon + label), compact (icon only), hidden (zero width) so the
     /// centered pill never overlaps the zoom popup or the action cluster.
     enum PillMode { case full, compact, hidden }
     private(set) var mode: PillMode = .full
 
-    static let fullWidth: CGFloat = 116
-    static let compactWidth: CGFloat = 36
+    static let fullWidth: CGFloat = 96
+    static let compactWidth: CGFloat = EditorBottomBar.controlSize
     static let dragThreshold: CGFloat = 4
     static let previewMaxSize = NSSize(width: 120, height: 120)
+    static let dragTitle = "Drag out"
+    static var dragSymbolName: String? {
+        ["cursorarrow.motionlines", "hand.point.up.left"].first {
+            NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil
+        }
+    }
 
     func setMode(_ newMode: PillMode) {
         guard newMode != mode else { return }
         mode = newMode
         isHidden = newMode == .hidden
         widthConstraint?.constant = newMode == .compact ? Self.compactWidth : Self.fullWidth
-        toolTip = newMode == .compact ? "Drag me: drag the edited image out" : "Drag the edited image out"
+        toolTip = "Drag the edited image to another app or Finder"
         needsDisplay = true
     }
 
@@ -2747,17 +2757,16 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
         super.init(frame: frameRect)
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
-        // Sized to read as a peer of the native rounded footer buttons (~21pt
-        // tall): the pill stays custom because it is a drag SOURCE (NSDraggingSource
-        // can't ride a stock NSButton cleanly), but it sits on the same ruler.
+        // The view stays custom because it is a drag source, but its hit surface
+        // uses the exact control ruler shared by Share and Pin.
         let width = widthAnchor.constraint(equalToConstant: Self.fullWidth)
         width.isActive = true
         widthConstraint = width
-        heightAnchor.constraint(equalToConstant: 22).isActive = true
-        toolTip = "Drag the edited image out"
+        heightAnchor.constraint(equalToConstant: EditorBottomBar.controlSize).isActive = true
+        toolTip = "Drag the edited image to another app or Finder"
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
-        setAccessibilityLabel("Drag edited image")
+        setAccessibilityLabel("Drag image out")
         setAccessibilityHelp("Drag this control to another app or Finder")
     }
 
@@ -2787,52 +2796,52 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        // 6pt corner matches the native rounded button bezel beside it; the fill
-        // is the shared footer-control color so the pill reads as a peer.
-        let radius = ChromeFactory.Radius.pill
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
-        let fill = pressed
-            ? KritColors.cornerButtonPressed
-            : (hovering ? KritColors.cornerButtonHover : KritColors.editorActionBackground)
-        fill.setFill()
-        path.fill()
-        KritColors.editorDockBorder.setStroke()
-        path.lineWidth = 1
-        path.stroke()
+        let path = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        if pressed {
+            NSColor.white.withAlphaComponent(0.26).setFill()
+            path.fill()
+        } else if hovering {
+            NSColor.white.withAlphaComponent(0.16).setFill()
+            path.fill()
+        }
 
-        let title = "Drag me"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor.labelColor.withAlphaComponent(0.86),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.92),
         ]
-        // Grip dots (2x3), the universal "this can be dragged" affordance and
-        // the same visual language as the recording preflight's grip. A doc
-        // icon said "file", the dots say "grab here". Compact mode keeps only
-        // the grip, centered.
         let showLabel = mode == .full
-        let textSize = showLabel ? (title as NSString).size(withAttributes: attrs) : .zero
-        let dotRadius: CGFloat = 1.2
-        let dotStep: CGFloat = 4.4
-        let gripW = dotStep + dotRadius * 2
-        let gripH = dotStep * 2 + dotRadius * 2
+        let textSize = showLabel ? (Self.dragTitle as NSString).size(withAttributes: attrs) : .zero
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        let glyph = Self.dragSymbolName
+            .flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: "Drag image out") }
+            .flatMap { $0.withSymbolConfiguration(config) }
+            .map { $0.tinted(with: NSColor.white.withAlphaComponent(0.92)) }
+        let glyphSize = glyph?.size ?? NSSize(width: 12, height: 12)
         let gap: CGFloat = showLabel ? 6 : 0
-        let totalW = gripW + gap + textSize.width
+        let totalW = glyphSize.width + gap + textSize.width
         var x = bounds.midX - totalW / 2
-        NSColor.labelColor.withAlphaComponent(0.5).setFill()
-        let gripTop = bounds.midY - gripH / 2
-        for column in 0..<2 {
-            for row in 0..<3 {
-                let dot = NSRect(
-                    x: x + CGFloat(column) * dotStep,
-                    y: gripTop + CGFloat(row) * dotStep,
-                    width: dotRadius * 2, height: dotRadius * 2
-                )
-                NSBezierPath(ovalIn: dot).fill()
+        if let glyph {
+            glyph.draw(at: NSPoint(x: x, y: bounds.midY - glyphSize.height / 2),
+                       from: NSRect.zero, operation: NSCompositingOperation.sourceOver, fraction: 1)
+        } else {
+            // Old systems without either SF Symbol keep a visible drag handle.
+            NSColor.white.withAlphaComponent(0.72).setFill()
+            for column in 0..<2 {
+                for row in 0..<3 {
+                    NSBezierPath(ovalIn: NSRect(
+                        x: x + CGFloat(column) * 4,
+                        y: bounds.midY - 5 + CGFloat(row) * 4,
+                        width: 2, height: 2
+                    )).fill()
+                }
             }
         }
         if showLabel {
-            x += gripW + gap
-            (title as NSString).draw(at: NSPoint(x: x, y: bounds.midY - textSize.height / 2), withAttributes: attrs)
+            x += glyphSize.width + gap
+            (Self.dragTitle as NSString).draw(
+                at: NSPoint(x: x, y: bounds.midY - textSize.height / 2),
+                withAttributes: attrs
+            )
         }
     }
 

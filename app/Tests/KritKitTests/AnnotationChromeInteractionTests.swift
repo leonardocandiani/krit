@@ -66,6 +66,27 @@ final class AnnotationChromeInteractionTests: XCTestCase {
         XCTAssertTrue(pill.hitTest(NSPoint(x: 58, y: -6)) === pill)
     }
 
+    func testEditorOpensWithVisibleFullDragOutAffordance() throws {
+        let image = NSImage(size: NSSize(width: 900, height: 580))
+        let editor = AnnotationWindowController(image: image, historyItem: nil, historyManager: nil)
+        defer { editor.window?.close() }
+
+        let content = try XCTUnwrap(editor.window?.contentView)
+        content.layoutSubtreeIfNeeded()
+        let pill = try XCTUnwrap(descendants(of: BottomBarDragPill.self, in: content).first)
+
+        XCTAssertFalse(pill.isHidden, "The editor must expose drag-out when it first opens")
+        guard case .full = pill.mode else {
+            return XCTFail("The editor has enough room for the labeled drag-out control")
+        }
+        XCTAssertEqual(pill.frame.width, BottomBarDragPill.fullWidth, accuracy: 0.5)
+    }
+
+    func testBottomBarDragPillUsesAnExplicitPlatformDragIcon() {
+        XCTAssertNotNil(BottomBarDragPill.dragSymbolName)
+        XCTAssertEqual(BottomBarDragPill.dragTitle, "Drag out")
+    }
+
     func testBottomBarDragPillDoesNotRequestImageBeforeDragThreshold() throws {
         let pill = BottomBarDragPill(frame: NSRect(x: 0, y: 0, width: 116, height: 22))
         var providerCalls = 0
