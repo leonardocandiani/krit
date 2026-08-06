@@ -6,6 +6,19 @@
     <description>KRIT update feed</description>
     <language>en</language>
     <item>
+      <title>Version 0.31.2</title>
+      <sparkle:version>20260806.1014.58</sparkle:version>
+      <sparkle:shortVersionString>0.31.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Thu, 06 Aug 2026 13:17:34 +0000</pubDate>
+      <link>https://github.com/leonardocandiani/krit/releases/tag/v0.31.2</link>
+      <enclosure
+        url="https://github.com/leonardocandiani/krit/releases/download/v0.31.2/KRIT-v0.31.2-macOS.dmg"
+        sparkle:edSignature="ysD5xB4Wl9iWfrqJVLs2tfkeKQKbXFyOFfN0Z9VHjssFn0sFnEAyHhWISDp5fnkbcsbaKli0E3ubT3ijrqjrBA=="
+        length="20417193"
+        type="application/octet-stream"/>
+    </item>
+    <item>
       <title>Version 0.31.1</title>
       <sparkle:version>20260804.1801.00</sparkle:version>
       <sparkle:shortVersionString>0.31.1</sparkle:shortVersionString>
