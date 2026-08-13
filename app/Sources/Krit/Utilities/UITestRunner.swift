@@ -86,6 +86,7 @@ final class UITestRunner: NSObject {
             case "blur-map":     report = await Self.runBlurMapSuite()
             case "overlay-trace": report = await Self.runOverlayCaptureTrace()
             case "window-capture": report = await Self.runWindowCaptureSuite()
+            case "aside-window-capture": report = await Self.runAsideWindowCaptureSuite()
             case "history-restore": report = await Self.runHistoryRestoreSuite()
             case "preset-gallery": report = await Self.runPresetGallery()
             case "preset-save": report = await Self.runPresetSaveSuite()
@@ -146,6 +147,10 @@ final class UITestRunner: NSObject {
             case "overlay-handoff-drag": report = await Self.runOverlayHandoffDrag()
             case "overlay-handoff-early-drag": report = await Self.runOverlayHandoffEarlyDrag()
             case "overlay-first-drag-matrix": report = await Self.runOverlayFirstDragMatrix()
+            case "overlay-file-drag-directions": report = await Self.runOverlayFileDragDirections()
+            case "overlay-file-drop-materialization": report = await Self.runOverlayFileDropMaterialization()
+            case "editor-file-drop-materialization": report = await Self.runEditorFileDropMaterialization()
+            case "overlay-rapid-retry": report = await Self.runOverlayRapidRetry()
             case "interactive-follow-up": report = await Self.runInteractiveFollowUp()
             case "activation-lifetime": report = await Self.runActivationLifetime()
             case "history-representation": report = await Self.runHistoryRepresentation()
@@ -2411,6 +2416,20 @@ final class UITestRunner: NSObject {
         allPass = allPass && (progress["allPass"] as? Bool == true)
         await close(progressCard)
 
+        guard let topHighlightCard = await makeCard() else {
+            report["error"] = "top-highlight card did not appear"
+            report["cases"] = cases
+            report["allPass"] = false
+            return report
+        }
+        let topHighlight = await dragOutcome(
+            card: topHighlightCard,
+            from: NSPoint(x: topHighlightCard.frame.midX, y: topHighlightCard.frame.maxY - 1)
+        )
+        cases["topHighlight"] = topHighlight
+        allPass = allPass && (topHighlight["allPass"] as? Bool == true)
+        await close(topHighlightCard)
+
         guard let cornerCard = await makeCard(),
               await waitForControls(),
               let cornerRoot = cornerCard.contentView,
@@ -2484,6 +2503,1185 @@ final class UITestRunner: NSObject {
 
         report["cases"] = cases
         report["allPass"] = allPass
+        return report
+    }
+
+    // MARK: - Scenario: overlay-file-drag-directions
+
+    /// A file drag must become a real AppKit dragging session for ordinary human
+    /// trajectories, not only for a mathematically horizontal pull. The source
+    /// callbacks prove that the drag preview began, followed the cursor and ended.
+    private static func runOverlayFileDragDirections() async -> [String: Any] {
+        var report: [String: Any] = ["scenario": "overlay-file-drag-directions"]
+        guard AXIsProcessTrusted() else {
+            report["skipped"] = "Accessibility permission is required for physical drag events"
+            report["allPass"] = false
+            return report
+        }
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let primaryScreen = NSScreen.screens.first(where: {
+                  ScreenCaptureCatalog.displayID(of: $0) == CGMainDisplayID()
+              }) ?? NSScreen.main ?? NSScreen.screens.first else {
+            report["error"] = "no app delegate or screen"
+            report["allPass"] = false
+            return report
+        }
+
+        let originalTimeout = Settings.overlayTimeout
+        let originalOverlayOnLeft = Settings.overlayOnLeft
+        Settings.overlayTimeout = 30
+        defer {
+            Settings.overlayTimeout = originalTimeout
+            Settings.overlayOnLeft = originalOverlayOnLeft
+        }
+
+        // Keep the real Desktop/Finder out of this source-side matrix. Finder can
+        // accept a file promise even after the pointer returns over the source,
+        // then deliver `endedAt` after the next case has reset its counters. A
+        // transparent normal-level window rejects every drop while the floating
+        // QuickAccess card remains the top physical mouse target.
+        let rejectingDropSurfaces = NSScreen.screens.map { targetScreen -> NSWindow in
+            let window = NSPanel(
+                contentRect: targetScreen.frame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            window.level = .normal
+            window.isOpaque = false
+            window.backgroundColor = NSColor.black.withAlphaComponent(0.001)
+            window.ignoresMouseEvents = false
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            window.orderFrontRegardless()
+            return window
+        }
+        defer {
+            rejectingDropSurfaces.forEach {
+                $0.orderOut(nil)
+                $0.close()
+            }
+        }
+
+        let image = solidImage(size: NSSize(width: 640, height: 360), color: .systemBlue)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-file-directions-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        func quartzPoint(_ appKitPoint: NSPoint) -> CGPoint {
+            CGPoint(x: appKitPoint.x, y: primaryScreen.frame.maxY - appKitPoint.y)
+        }
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+        func cancelActiveDrag() {
+            CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true)?
+                .post(tap: .cghidEventTap)
+            CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false)?
+                .post(tap: .cghidEventTap)
+        }
+        func makeCard(on targetScreen: NSScreen) async -> NSWindow? {
+            let targetCursor = NSPoint(
+                x: targetScreen.visibleFrame.midX,
+                y: targetScreen.visibleFrame.midY
+            )
+            post(.mouseMoved, at: quartzPoint(targetCursor))
+            try? await Task.sleep(nanoseconds: 120_000_000)
+
+            let before = QuickAccessOverlay.uiTestWindows.count
+            let item = HistoryItem(
+                id: UUID(),
+                createdAt: Date(),
+                imagePath: directory.appendingPathComponent("capture-\(UUID().uuidString).png").path,
+                thumbnailPath: directory.appendingPathComponent("thumb-\(UUID().uuidString).png").path,
+                captureRect: nil
+            )
+            QuickAccessOverlay.show(
+                image: image,
+                historyItem: item,
+                historyManager: appDelegate.historyManager,
+                screen: targetScreen,
+                entrance: .slide
+            )
+            for _ in 0..<50 {
+                if QuickAccessOverlay.uiTestWindows.count > before,
+                   let card = QuickAccessOverlay.uiTestWindows.last,
+                   card.isVisible,
+                   card.alphaValue > 0.95,
+                   targetScreen.frame.contains(NSPoint(x: card.frame.midX, y: card.frame.midY)) {
+                    return card
+                }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            return nil
+        }
+        func close(_ card: NSWindow) async {
+            guard QuickAccessOverlay.uiTestWindows.contains(where: { $0 === card }) else { return }
+            QuickAccessOverlay.uiTestCloseNewest()
+            // AppKit may keep its private drag-image window above the source for a
+            // short teardown interval after `endedAt`. Do not let that transient
+            // window steal the next fresh card's physical mouse-down.
+            try? await Task.sleep(nanoseconds: 800_000_000)
+        }
+        func allSubviews(of root: NSView) -> [NSView] {
+            [root] + root.subviews.flatMap(allSubviews)
+        }
+        func waitForMouseTarget(_ card: NSWindow, at point: NSPoint) async -> Bool {
+            for attempt in 0...1_000 {
+                if attempt.isMultiple(of: 20) {
+                    card.orderFrontRegardless()
+                }
+                if NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0) == card.windowNumber {
+                    return true
+                }
+                if attempt < 1_000 {
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+            }
+            return false
+        }
+        func startPoint(on card: NSWindow, hotspot: String) async -> NSPoint? {
+            switch hotspot {
+            case "body":
+                return NSPoint(x: card.frame.midX, y: card.frame.midY)
+            case "progress":
+                return NSPoint(x: card.frame.midX, y: card.frame.minY + 1)
+            case "top-highlight":
+                return NSPoint(x: card.frame.midX, y: card.frame.maxY - 1)
+            default:
+                QuickAccessOverlay.uiTestMarkNewestPresentationReady()
+                QuickAccessOverlay.uiTestSetNewestHovered(true)
+                try? await Task.sleep(nanoseconds: 220_000_000)
+                guard let content = card.contentView,
+                      let control = allSubviews(of: content).first(where: {
+                          $0.accessibilityIdentifier() == hotspot
+                      }) else { return nil }
+                let pointInWindow = control.convert(
+                    NSPoint(x: control.bounds.midX, y: control.bounds.midY),
+                    to: nil
+                )
+                return card.convertPoint(toScreen: pointInWindow)
+            }
+        }
+        func runCase(
+            name: String,
+            on targetScreen: NSScreen,
+            hotspot: String = "body",
+            dx: CGFloat,
+            dy: CGFloat
+        ) async -> [String: Any] {
+            let displayID = ScreenCaptureCatalog.displayID(of: targetScreen) ?? 0
+            guard let card = await makeCard(on: targetScreen) else {
+                return ["name": name, "error": "card did not appear", "passed": false]
+            }
+
+            guard let startAppKit = await startPoint(on: card, hotspot: hotspot) else {
+                await close(card)
+                return ["name": name, "hotspot": hotspot, "error": "hotspot not found", "passed": false]
+            }
+            guard await waitForMouseTarget(card, at: startAppKit) else {
+                await close(card)
+                return [
+                    "name": name,
+                    "hotspot": hotspot,
+                    "displayID": Int(displayID),
+                    "error": "card was not the physical mouse target",
+                    "passed": false,
+                ]
+            }
+            let start = quartzPoint(startAppKit)
+            QuickAccessOverlay.uiTestResetDragSessionTrace()
+            post(.mouseMoved, at: start)
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            post(.leftMouseDown, at: start)
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            let steps = 10
+            var point = start
+            for step in 1...steps {
+                point = CGPoint(
+                    x: start.x + dx * CGFloat(step) / CGFloat(steps),
+                    y: start.y + dy * CGFloat(step) / CGFloat(steps)
+                )
+                post(.leftMouseDragged, at: point)
+                try? await Task.sleep(nanoseconds: 18_000_000)
+            }
+            // Escape is AppKit's deterministic cancellation path for an active
+            // NSDraggingSession. It delivers `endedAt` without negotiating a file
+            // promise with whatever application happens to sit under the cursor.
+            cancelActiveDrag()
+            try? await Task.sleep(nanoseconds: 60_000_000)
+            post(.leftMouseUp, at: point)
+
+            var trace: [String: Any] = [:]
+            for _ in 0..<250 {
+                trace = QuickAccessOverlay.uiTestDragSessionTrace()
+                if trace["ended"] as? Int == 1 { break }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+
+            let willBegin = trace["willBegin"] as? Int ?? 0
+            let moves = trace["moves"] as? Int ?? 0
+            let ended = trace["ended"] as? Int ?? 0
+            let maxDistance = trace["maxDistance"] as? Double ?? 0
+            let result: [String: Any] = [
+                "name": name,
+                "hotspot": hotspot,
+                "displayID": Int(displayID),
+                "willBegin": willBegin,
+                "moves": moves,
+                "ended": ended,
+                "maxDistance": maxDistance,
+                "passed": willBegin == 1 && moves > 0 && ended == 1 && maxDistance > 20,
+            ]
+            await close(card)
+            return result
+        }
+
+        var cases: [[String: Any]] = []
+        for overlayOnLeft in [true, false] {
+            Settings.overlayOnLeft = overlayOnLeft
+            let side = overlayOnLeft ? "left" : "right"
+            let inward: CGFloat = overlayOnLeft ? 1 : -1
+            let matrix: [(name: String, hotspot: String, dx: CGFloat, dy: CGFloat)] = [
+                ("horizontal-inward", "body", inward * 120, 0),
+                ("diagonal-inward-down", "body", inward * 60, 60),
+                ("diagonal-inward-up", "body", inward * 60, -60),
+                ("progress", "progress", inward * 120, 0),
+                ("progress-diagonal", "progress", inward * 60, 60),
+                ("top-highlight", "top-highlight", inward * 120, 0),
+                ("top-highlight-diagonal", "top-highlight", inward * 60, -60),
+                ("close", "quickAccess.close", inward * 120, 0),
+                ("pin", "quickAccess.pin", inward * 120, 0),
+                ("edit", "quickAccess.edit", inward * 120, 0),
+                ("corner-save", "quickAccess.corner.save", inward * 120, 0),
+                ("corner-save-diagonal", "quickAccess.corner.save", inward * 60, -60),
+                ("copy", "quickAccess.copy", inward * 120, 0),
+                ("copy-diagonal", "quickAccess.copy", inward * 60, 60),
+                ("pill-save", "quickAccess.pill.save", inward * 120, 0),
+                ("pill-save-diagonal", "quickAccess.pill.save", inward * 60, -60),
+            ]
+            for targetScreen in NSScreen.screens {
+                let displayID = ScreenCaptureCatalog.displayID(of: targetScreen) ?? 0
+                let display = targetScreen === primaryScreen ? "primary" : "display-\(displayID)"
+                for testCase in matrix {
+                    cases.append(await runCase(
+                        name: "\(side)-\(display)-\(testCase.name)",
+                        on: targetScreen,
+                        hotspot: testCase.hotspot,
+                        dx: testCase.dx,
+                        dy: testCase.dy
+                    ))
+                }
+            }
+        }
+        let testedDisplays = NSScreen.screens.compactMap {
+            ScreenCaptureCatalog.displayID(of: $0).map(Int.init)
+        }
+        report["testedDisplays"] = testedDisplays
+        report["testedDisplayCount"] = testedDisplays.count
+        report["multiDisplayStatus"] = testedDisplays.count > 1 ? "exercised" : "not-applicable"
+        report["cases"] = cases
+        report["allPass"] = cases.allSatisfy { ($0["passed"] as? Bool) == true }
+        return report
+    }
+
+    // MARK: - Scenario: overlay-file-drop-materialization
+
+    /// Exercises the editor's real `Drag out` pill with hardware-level mouse
+    /// events. The latency gate matters as much as eventual delivery: blocking
+    /// the main thread to flatten, encode and write before `beginDraggingSession`
+    /// makes a normal human drag look dead even if a long press eventually works.
+    private static func runEditorFileDropMaterialization() async -> [String: Any] {
+        var report: [String: Any] = ["scenario": "editor-file-drop-materialization"]
+        guard AXIsProcessTrusted() else {
+            report["skipped"] = "Accessibility permission is required for physical drag events"
+            report["allPass"] = false
+            return report
+        }
+        guard let screen = NSScreen.screens.first(where: {
+            ScreenCaptureCatalog.displayID(of: $0) == CGMainDisplayID()
+        }) ?? NSScreen.main ?? NSScreen.screens.first else {
+            report["error"] = "no primary screen"
+            report["allPass"] = false
+            return report
+        }
+
+        let savedDefaultTemplate = TemplateStore.defaultTemplate?.name
+        let savedFormat = Settings.screenshotFormat
+        TemplateStore.setDefault(name: nil)
+        Settings.screenshotFormat = "png"
+        defer {
+            TemplateStore.setDefault(name: savedDefaultTemplate)
+            Settings.screenshotFormat = savedFormat
+        }
+
+        // Retina-class, high-frequency content keeps this representative of the
+        // screenshots that exposed the dead-feeling drag instead of letting a
+        // solid-color PNG compress instantly.
+        let pointSize = NSSize(width: 1920, height: 1080)
+        let pixelSize = NSSize(width: 3840, height: 2160)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: nil,
+                  width: Int(pixelSize.width),
+                  height: Int(pixelSize.height),
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            report["error"] = "could not allocate source image"
+            report["allPass"] = false
+            return report
+        }
+        context.setFillColor(NSColor(srgbRed: 0.08, green: 0.11, blue: 0.18, alpha: 1).cgColor)
+        context.fill(CGRect(origin: .zero, size: pixelSize))
+        for x in stride(from: 0, to: Int(pixelSize.width), by: 24) {
+            let hue = CGFloat((x * 17) % 360) / 360
+            context.setFillColor(NSColor(calibratedHue: hue, saturation: 0.72, brightness: 0.92, alpha: 0.8).cgColor)
+            context.fill(CGRect(
+                x: x,
+                y: (x * 29) % Int(pixelSize.height),
+                width: 18,
+                height: 420
+            ))
+        }
+        guard let sourceCGImage = context.makeImage() else {
+            report["error"] = "could not realize source image"
+            report["allPass"] = false
+            return report
+        }
+        let source = NSImage(size: pointSize)
+        let sourceRep = NSBitmapImageRep(cgImage: sourceCGImage)
+        sourceRep.size = pointSize
+        source.addRepresentation(sourceRep)
+
+        AnnotationWindowController.open(image: source)
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        guard let controller = AnnotationWindowController.uiTestLastController,
+              let editorWindow = controller.window,
+              let rootView = editorWindow.contentView,
+              let dragPill = findView(in: rootView, where: { $0 is BottomBarDragPill }) as? BottomBarDragPill else {
+            report["error"] = "editor or Drag out pill did not open"
+            report["allPass"] = false
+            return report
+        }
+
+        // This marker exists only in the edited canvas, never in the source
+        // bitmap. Removing it just after the drag starts proves the promised
+        // bytes came from the frozen drag-start artifact instead of consulting
+        // the live editor when the receiver eventually asks for the file.
+        let frozenMarker = RectangleAnnotation(
+            rect: CGRect(x: 300, y: 250, width: 600, height: 360)
+        )
+        frozenMarker.color = NSColor(srgbRed: 1, green: 0, blue: 1, alpha: 1)
+        frozenMarker.lineWidth = 32
+        controller.uiTestCanvas.objects.append(frozenMarker)
+        controller.uiTestCanvas.needsDisplay = true
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-editor-file-drop-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        } catch {
+            controller.uiTestMarkCurrentDocumentClean()
+            editorWindow.performClose(nil)
+            report["error"] = "could not create isolated drop directory: \(error)"
+            report["allPass"] = false
+            return report
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let probe = UITestFileDropDestination(
+            outputDirectory: root,
+            promiseReceiveDelay: 0.8
+        )
+        let destinationFrame = NSRect(
+            x: screen.visibleFrame.minX + 8,
+            y: screen.visibleFrame.minY + 8,
+            width: 104,
+            height: 64
+        )
+        let destinationWindow = NSPanel(
+            contentRect: destinationFrame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        // Keep the receiver physically outside the editor instead of stacking a
+        // higher-level panel over the source window. Same-app overlap can hold
+        // AppKit in drag tracking even after a synthetic mouse-up, which tests
+        // panel z-order rather than the editor's file-promise contract.
+        destinationWindow.level = .normal
+        destinationWindow.isOpaque = false
+        destinationWindow.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.16)
+        destinationWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        destinationWindow.sharingType = .none
+        destinationWindow.contentView = probe
+        destinationWindow.orderFrontRegardless()
+        defer {
+            dragPill.uiTestOnDragSnapshotCreated = nil
+            destinationWindow.orderOut(nil)
+            destinationWindow.close()
+            controller.uiTestMarkCurrentDocumentClean()
+            if editorWindow.isVisible { editorWindow.performClose(nil) }
+        }
+
+        editorWindow.orderFrontRegardless()
+        destinationWindow.orderFrontRegardless()
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        let startInWindow = dragPill.convert(
+            NSPoint(x: dragPill.bounds.midX, y: dragPill.bounds.midY),
+            to: nil
+        )
+        let startAppKit = editorWindow.convertPoint(toScreen: startInWindow)
+        let targetAppKit = NSPoint(x: destinationFrame.midX, y: destinationFrame.midY)
+        let targetDeadline = ProcessInfo.processInfo.systemUptime + 3
+        var startTargetReady = false
+        var destinationTargetReady = false
+        while ProcessInfo.processInfo.systemUptime < targetDeadline {
+            editorWindow.orderFrontRegardless()
+            destinationWindow.orderFrontRegardless()
+            startTargetReady = NSWindow.windowNumber(
+                at: startAppKit,
+                belowWindowWithWindowNumber: 0
+            ) == editorWindow.windowNumber
+            destinationTargetReady = NSWindow.windowNumber(
+                at: targetAppKit,
+                belowWindowWithWindowNumber: 0
+            ) == destinationWindow.windowNumber
+            if startTargetReady, destinationTargetReady { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let startHitView = editorWindow.contentView?.hitTest(startInWindow)
+            .map { String(describing: type(of: $0)) } ?? "none"
+        let directPillContains = dragPill.containsHitPoint(
+            NSPoint(x: dragPill.bounds.midX, y: dragPill.bounds.midY)
+        )
+        report["startTargetReady"] = startTargetReady
+        report["startHitView"] = startHitView
+        report["directPillContains"] = directPillContains
+        report["pillFrame"] = NSStringFromRect(dragPill.frame)
+        report["pillBounds"] = NSStringFromRect(dragPill.bounds)
+        report["pillHidden"] = dragPill.isHidden
+        report["pillSuperview"] = dragPill.superview.map { String(describing: type(of: $0)) } ?? "none"
+        report["pillSuperviewFrame"] = dragPill.superview.map { NSStringFromRect($0.frame) } ?? "none"
+        report["startInWindow"] = NSStringFromPoint(startInWindow)
+        report["destinationTargetReady"] = destinationTargetReady
+        guard startTargetReady, destinationTargetReady else {
+            report["error"] = "physical start or destination was occluded"
+            report["allPass"] = false
+            return report
+        }
+
+        let primaryHeight = screen.frame.maxY
+        let start = CGPoint(x: startAppKit.x, y: primaryHeight - startAppKit.y)
+        let target = CGPoint(x: targetAppKit.x, y: primaryHeight - targetAppKit.y)
+        let mouseDownAt = ProcessInfo.processInfo.systemUptime
+        dragPill.uiTestResetDragTrace()
+        var markerRemovedAfterSnapshot = false
+        dragPill.uiTestOnDragSnapshotCreated = { [weak controller] in
+            guard let canvas = controller?.uiTestCanvas else { return }
+            canvas.objects.removeAll { $0.id == frozenMarker.id }
+            canvas.needsDisplay = true
+            markerRemovedAfterSnapshot = true
+        }
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+
+        // Post from outside the main actor. `beginDraggingSession` enters AppKit
+        // event tracking on the main thread; if the scenario task itself posts
+        // the first threshold-crossing drag, it can strand its own mouse-up behind
+        // that tracking loop.
+        let inputPoster = Task.detached(priority: .userInitiated) {
+            func post(_ type: CGEventType, at point: CGPoint) {
+                CGEvent(
+                    mouseEventSource: nil,
+                    mouseType: type,
+                    mouseCursorPosition: point,
+                    mouseButton: .left
+                )?.post(tap: .cghidEventTap)
+            }
+            post(.mouseMoved, at: start)
+            try? await Task.sleep(for: .milliseconds(80))
+            post(.leftMouseDown, at: start)
+            try? await Task.sleep(for: .milliseconds(40))
+            for step in 1...30 {
+                let progress = CGFloat(step) / 30
+                post(.leftMouseDragged, at: CGPoint(
+                    x: start.x + (target.x - start.x) * progress,
+                    y: start.y + (target.y - start.y) * progress
+                ))
+                try? await Task.sleep(for: .milliseconds(12))
+            }
+            post(.leftMouseUp, at: target)
+        }
+        try? await Task.sleep(for: .seconds(2))
+        inputPoster.cancel()
+        CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseUp,
+            mouseCursorPosition: target,
+            mouseButton: .left
+        )?.post(tap: .cghidEventTap)
+        let mousePosterCompleted = true
+        report["mousePosterCompleted"] = mousePosterCompleted
+        let dragEndDeadline = ProcessInfo.processInfo.systemUptime + 2
+        while ProcessInfo.processInfo.systemUptime < dragEndDeadline,
+              (dragPill.uiTestDragTrace["endedSession"] as? Int ?? 0) == 0 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        let deadline = ProcessInfo.processInfo.systemUptime + 12
+        while ProcessInfo.processInfo.systemUptime < deadline,
+              !(probe.materializationSettled && probe.concludeCount == 1) {
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+
+        let sourceTrace = dragPill.uiTestDragTrace
+        let files = probe.outputFiles()
+        let file = files.first
+        let fileBytes = file.flatMap {
+            try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        } ?? 0
+        let startsWithPNGMagic: Bool
+        if let file, let data = try? Data(contentsOf: file) {
+            startsWithPNGMagic = Array(data.prefix(8)) == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        } else {
+            startsWithPNGMagic = false
+        }
+        let frozenMarkerPixelCount: Int
+        if let file,
+           let image = NSImage(contentsOf: file),
+           let cgImage = image.bestCGImage,
+           let pixels = rgbaPixels(cgImage) {
+            frozenMarkerPixelCount = stride(from: 0, to: pixels.count, by: 4).reduce(into: 0) { count, offset in
+                if pixels[offset] > 235,
+                   pixels[offset + 1] < 32,
+                   pixels[offset + 2] > 235,
+                   pixels[offset + 3] > 235 {
+                    count += 1
+                }
+            }
+        } else {
+            frozenMarkerPixelCount = 0
+        }
+        let destinationEnterLatencyMs = probe.firstEnteredAtUptime.map {
+            ($0 - mouseDownAt) * 1000
+        } ?? -1
+        let beginSessionLatencyMs = sourceTrace["beginLatencyMs"] as? Double ?? -1
+        let sourceLifecyclePass = (sourceTrace["mouseDown"] as? Int ?? 0) == 1
+            && (sourceTrace["thresholdCross"] as? Int ?? 0) == 1
+            && (sourceTrace["beginSession"] as? Int ?? 0) == 1
+            && (sourceTrace["sessionMoves"] as? Int ?? 0) > 0
+            && (sourceTrace["endedSession"] as? Int ?? 0) == 1
+            && (sourceTrace["dropAccepted"] as? Bool) == true
+        let destinationLifecyclePass = probe.enteredCount >= 1
+            && probe.prepareCount == 1
+            && probe.performCount == 1
+            && probe.concludeCount == 1
+        let deliveryPass = files.count == 1
+            && fileBytes > 0
+            && file?.pathExtension.lowercased() == "png"
+            && startsWithPNGMagic
+            && frozenMarkerPixelCount > 1_000
+        let editorClosed = !editorWindow.isVisible
+        let immediateStartPass = beginSessionLatencyMs >= 0 && beginSessionLatencyMs < 250
+        let transportPass = probe.observedTransport == "file-promise"
+
+        report["beginSessionLatencyMs"] = beginSessionLatencyMs
+        report["destinationEnterLatencyMs"] = destinationEnterLatencyMs
+        report["sourceTrace"] = sourceTrace
+        report["transport"] = probe.observedTransport ?? "none"
+        report["sourceLifecyclePass"] = sourceLifecyclePass
+        report["destinationLifecyclePass"] = destinationLifecyclePass
+        report["destinationLifecycle"] = [
+            "entered": probe.enteredCount,
+            "prepare": probe.prepareCount,
+            "perform": probe.performCount,
+            "conclude": probe.concludeCount,
+        ]
+        report["fileCount"] = files.count
+        report["fileBytes"] = fileBytes
+        report["pngMagicPass"] = startsWithPNGMagic
+        report["frozenMarkerPixelCount"] = frozenMarkerPixelCount
+        report["markerRemovedAfterSnapshot"] = markerRemovedAfterSnapshot
+        report["editorClosed"] = editorClosed
+        report["immediateStartPass"] = immediateStartPass
+        report["allPass"] = mousePosterCompleted
+            && sourceLifecyclePass
+            && destinationLifecyclePass
+            && deliveryPass
+            && markerRemovedAfterSnapshot
+            && transportPass
+            && immediateStartPass
+            && editorClosed
+        return report
+    }
+
+    /// Drops a fresh screenshot card into a real in-process AppKit destination.
+    /// Each supported export format proves both deterministic transports all the
+    /// way through to one non-empty file: URL with a cache, promise without one.
+    private static func runOverlayFileDropMaterialization() async -> [String: Any] {
+        var report: [String: Any] = ["scenario": "overlay-file-drop-materialization"]
+        guard AXIsProcessTrusted() else {
+            report["skipped"] = "Accessibility permission is required for physical drag events"
+            report["allPass"] = false
+            return report
+        }
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let screen = NSScreen.screens.first(where: {
+                  ScreenCaptureCatalog.displayID(of: $0) == CGMainDisplayID()
+              }) ?? NSScreen.main ?? NSScreen.screens.first else {
+            report["error"] = "no app delegate or primary screen"
+            report["allPass"] = false
+            return report
+        }
+
+        let originalTimeout = Settings.overlayTimeout
+        let originalFormat = Settings.screenshotFormat
+        Settings.overlayTimeout = 30
+        defer {
+            Settings.overlayTimeout = originalTimeout
+            Settings.screenshotFormat = originalFormat
+        }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-file-drop-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        } catch {
+            report["error"] = "could not create isolated drop directory: \(error)"
+            report["allPass"] = false
+            return report
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let primaryHeight = screen.frame.maxY
+        func quartzPoint(_ appKitPoint: NSPoint) -> CGPoint {
+            CGPoint(x: appKitPoint.x, y: primaryHeight - appKitPoint.y)
+        }
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+        func poll(
+            timeout: TimeInterval,
+            intervalNanoseconds: UInt64 = 20_000_000,
+            until condition: () -> Bool
+        ) async -> Bool {
+            let deadline = ProcessInfo.processInfo.systemUptime + timeout
+            while !condition() {
+                guard ProcessInfo.processInfo.systemUptime < deadline else { return false }
+                try? await Task.sleep(nanoseconds: intervalNanoseconds)
+            }
+            return true
+        }
+        func waitForMouseTarget(_ card: NSWindow, at point: NSPoint) async -> Bool {
+            await poll(timeout: 3, intervalNanoseconds: 5_000_000) {
+                card.orderFrontRegardless()
+                return NSWindow.windowNumber(
+                    at: point,
+                    belowWindowWithWindowNumber: 0
+                ) == card.windowNumber
+            }
+        }
+        func makeCard(
+            image: NSImage,
+            caseDirectory: URL,
+            entrance: QuickAccessOverlay.EntranceStyle
+        ) async -> NSWindow? {
+            let cursorTarget = NSPoint(x: screen.visibleFrame.midX, y: screen.visibleFrame.midY)
+            post(.mouseMoved, at: quartzPoint(cursorTarget))
+            try? await Task.sleep(nanoseconds: 100_000_000)
+
+            let before = QuickAccessOverlay.uiTestWindows.count
+            let item = HistoryItem(
+                id: UUID(),
+                createdAt: Date(),
+                imagePath: caseDirectory.appendingPathComponent("history.png").path,
+                thumbnailPath: caseDirectory.appendingPathComponent("thumb.png").path,
+                captureRect: nil
+            )
+            QuickAccessOverlay.show(
+                image: image,
+                historyItem: item,
+                historyManager: appDelegate.historyManager,
+                presentedArtifact: CaptureArtifact(image: image),
+                screen: screen,
+                entrance: entrance
+            )
+            var card: NSWindow?
+            _ = await poll(timeout: 4) {
+                guard QuickAccessOverlay.uiTestWindows.count > before,
+                      let newest = QuickAccessOverlay.uiTestWindows.last,
+                      newest.isVisible,
+                      newest.alphaValue > 0.95,
+                      screen.frame.contains(NSPoint(x: newest.frame.midX, y: newest.frame.midY)) else {
+                    return false
+                }
+                card = newest
+                return true
+            }
+            return card
+        }
+        func closeIfNeeded(_ card: NSWindow) async {
+            guard QuickAccessOverlay.uiTestWindows.contains(where: { $0 === card }) else { return }
+            QuickAccessOverlay.uiTestCloseNewest()
+            _ = await poll(timeout: 2) {
+                !QuickAccessOverlay.uiTestWindows.contains(where: { $0 === card })
+            }
+        }
+
+        func magicMatches(_ file: URL?, extension ext: String) -> Bool {
+            guard let file,
+                  let data = try? Data(contentsOf: file),
+                  !data.isEmpty else { return false }
+            let bytes = Array(data.prefix(12))
+            switch ext.lowercased() {
+            case "png":
+                return bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            case "jpg", "jpeg":
+                return bytes.starts(with: [0xFF, 0xD8, 0xFF])
+            case "pdf":
+                return bytes.starts(with: Array("%PDF-".utf8))
+            case "webp":
+                return bytes.count >= 12
+                    && Array(bytes[0..<4]) == Array("RIFF".utf8)
+                    && Array(bytes[8..<12]) == Array("WEBP".utf8)
+            default:
+                return false
+            }
+        }
+
+        func markerColor(format: String, promiseOnly: Bool) -> NSColor {
+            let rgb: (CGFloat, CGFloat, CGFloat)
+            switch (format, promiseOnly) {
+            case ("png", false): rgb = (0.90, 0.10, 0.10)
+            case ("png", true): rgb = (0.10, 0.80, 0.20)
+            case ("jpg", false): rgb = (0.10, 0.25, 0.90)
+            case ("jpg", true): rgb = (0.90, 0.75, 0.10)
+            case ("pdf", false): rgb = (0.80, 0.10, 0.70)
+            case ("pdf", true): rgb = (0.10, 0.75, 0.80)
+            case ("webp", false): rgb = (0.95, 0.40, 0.05)
+            default: rgb = (0.45, 0.15, 0.85)
+            }
+            return NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
+        }
+
+        func markerMatches(_ file: URL?, expected: NSColor) -> Bool {
+            guard let file,
+                  let image = NSImage(contentsOf: file),
+                  let tiff = image.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiff),
+                  bitmap.pixelsWide > 20,
+                  bitmap.pixelsHigh > 0,
+                  let actual = bitmap.colorAt(
+                      x: 16,
+                      y: bitmap.pixelsHigh / 2
+                  )?.usingColorSpace(.sRGB),
+                  let expected = expected.usingColorSpace(.sRGB) else { return false }
+            let tolerance: CGFloat = 0.22
+            return abs(actual.redComponent - expected.redComponent) < tolerance
+                && abs(actual.greenComponent - expected.greenComponent) < tolerance
+                && abs(actual.blueComponent - expected.blueComponent) < tolerance
+        }
+
+        func runCase(
+            name: String,
+            format: String,
+            expectedTransport: String,
+            forcePromiseOnly: Bool,
+            entrance: QuickAccessOverlay.EntranceStyle
+        ) async -> [String: Any] {
+            Settings.screenshotFormat = format
+            let resolvedFormat = ImageExporter.preferredFormat().ext
+            let expectedMarker = markerColor(format: format, promiseOnly: forcePromiseOnly)
+            let image = sampleShot(markerColor: expectedMarker)
+            let entranceName: String
+            switch entrance {
+            case .slide: entranceName = "slide"
+            case .handoff: entranceName = "handoff"
+            }
+            let caseDirectory = root.appendingPathComponent(name, isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(
+                    at: caseDirectory,
+                    withIntermediateDirectories: true
+                )
+            } catch {
+                return ["name": name, "error": "could not create case directory: \(error)", "passed": false]
+            }
+
+            guard let card = await makeCard(
+                image: image,
+                caseDirectory: caseDirectory,
+                entrance: entrance
+            ) else {
+                return ["name": name, "error": "fresh card did not appear", "passed": false]
+            }
+
+            if forcePromiseOnly {
+                // This is the actual post-capture race: the handoff card is already
+                // visible and draggable while its background export is still in
+                // flight. Invalidate immediately so the physical first gesture
+                // must complete through NSFilePromiseProvider.
+                QuickAccessOverlay.uiTestInvalidatePreparedDragFile()
+            } else {
+                let prepared = await poll(timeout: 8, intervalNanoseconds: 25_000_000) {
+                    QuickAccessOverlay.uiTestDragPrep(forceInline: false)["mode"] as? String == "prepared"
+                }
+                guard prepared else {
+                    await closeIfNeeded(card)
+                    return ["name": name, "error": "prepared drag URL did not become ready", "passed": false]
+                }
+            }
+            let prepMode = QuickAccessOverlay.uiTestDragPrep(forceInline: false)["mode"] as? String ?? "unknown"
+
+            let probe = UITestFileDropDestination(outputDirectory: caseDirectory)
+            let destinationSize = NSSize(width: 300, height: 220)
+            let visible = screen.visibleFrame
+            let targetY = min(
+                max(card.frame.midY, visible.minY + destinationSize.height / 2 + 20),
+                visible.maxY - destinationSize.height / 2 - 20
+            )
+            let destinationFrame = NSRect(
+                x: visible.midX - destinationSize.width / 2,
+                y: targetY - destinationSize.height / 2,
+                width: destinationSize.width,
+                height: destinationSize.height
+            )
+            let destinationWindow = NSPanel(
+                contentRect: destinationFrame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            destinationWindow.level = .statusBar
+            destinationWindow.isOpaque = false
+            destinationWindow.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.12)
+            destinationWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            destinationWindow.sharingType = .none
+            destinationWindow.contentView = probe
+            destinationWindow.orderFrontRegardless()
+            defer {
+                destinationWindow.orderOut(nil)
+                destinationWindow.close()
+            }
+
+            let startAppKit = NSPoint(x: card.frame.midX, y: card.frame.midY)
+            guard await waitForMouseTarget(card, at: startAppKit) else {
+                await closeIfNeeded(card)
+                return [
+                    "name": name,
+                    "prepMode": prepMode,
+                    "error": "card was not the physical mouse target",
+                    "passed": false,
+                ]
+            }
+
+            QuickAccessOverlay.uiTestResetDragSessionTrace()
+            let start = quartzPoint(startAppKit)
+            let targetAppKit = NSPoint(x: destinationFrame.midX, y: destinationFrame.midY)
+            let target = quartzPoint(targetAppKit)
+            let destinationTargetReady = NSWindow.windowNumber(
+                at: targetAppKit,
+                belowWindowWithWindowNumber: 0
+            ) == destinationWindow.windowNumber
+            guard destinationTargetReady else {
+                await closeIfNeeded(card)
+                return [
+                    "name": name,
+                    "prepMode": prepMode,
+                    "error": "destination was not the physical mouse target",
+                    "passed": false,
+                ]
+            }
+            post(.mouseMoved, at: start)
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            post(.leftMouseDown, at: start)
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            for step in 1...36 {
+                let progress = CGFloat(step) / 36
+                let point = CGPoint(
+                    x: start.x + (target.x - start.x) * progress,
+                    y: start.y + (target.y - start.y) * progress
+                )
+                post(.leftMouseDragged, at: point)
+                try? await Task.sleep(nanoseconds: 15_000_000)
+            }
+            post(.leftMouseUp, at: target)
+
+            let settled = await poll(timeout: 12, intervalNanoseconds: 25_000_000) {
+                let trace = QuickAccessOverlay.uiTestDragSessionTrace()
+                return (trace["ended"] as? Int ?? 0) == 1
+                    && probe.materializationSettled
+                    && probe.concludeCount == 1
+                    && !QuickAccessOverlay.uiTestWindows.contains(where: { $0 === card })
+            }
+            if settled {
+                // Let delayed promise callbacks surface before asserting that the
+                // destination received exactly one file.
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+
+            let trace = QuickAccessOverlay.uiTestDragSessionTrace()
+            let files = probe.outputFiles()
+            let file = files.first
+            let fileBytes = file.flatMap {
+                try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            } ?? 0
+            let decodable = file.flatMap { NSImage(contentsOf: $0) }?.isValid == true
+            let extensionMatches = file?.pathExtension.lowercased() == resolvedFormat
+            let fileMagicMatches = magicMatches(file, extension: resolvedFormat)
+            let contentMatches = markerMatches(file, expected: expectedMarker)
+            let cardClosed = !QuickAccessOverlay.uiTestWindows.contains(where: { $0 === card })
+            let destinationLifecycle = probe.enteredCount >= 1
+                && probe.prepareCount == 1
+                && probe.performCount == 1
+                && probe.concludeCount == 1
+            let sourceLifecycle = (trace["willBegin"] as? Int ?? 0) == 1
+                && (trace["moves"] as? Int ?? 0) > 0
+                && (trace["ended"] as? Int ?? 0) == 1
+            let transportMatches = probe.observedTransport == expectedTransport
+            let modeMatches = forcePromiseOnly ? prepMode == "promise-only" : prepMode == "prepared"
+            let passed = settled
+                && modeMatches
+                && transportMatches
+                && probe.receivedItemCount == 1
+                && probe.errors.isEmpty
+                && files.count == 1
+                && fileBytes > 0
+                && decodable
+                && extensionMatches
+                && fileMagicMatches
+                && contentMatches
+                && sourceLifecycle
+                && destinationLifecycle
+                && cardClosed
+
+            if !cardClosed { await closeIfNeeded(card) }
+            return [
+                "name": name,
+                "format": format,
+                "resolvedFormat": resolvedFormat,
+                "entrance": entranceName,
+                "prepMode": prepMode,
+                "expectedTransport": expectedTransport,
+                "observedTransport": probe.observedTransport ?? "none",
+                "receivedItemCount": probe.receivedItemCount,
+                "fileCount": files.count,
+                "fileBytes": fileBytes,
+                "decodableImage": decodable,
+                "extensionMatches": extensionMatches,
+                "magicMatches": fileMagicMatches,
+                "contentMatches": contentMatches,
+                "sourceWillBegin": trace["willBegin"] as? Int ?? 0,
+                "sourceMoves": trace["moves"] as? Int ?? 0,
+                "sourceEnded": trace["ended"] as? Int ?? 0,
+                "destinationEntered": probe.enteredCount,
+                "destinationPrepare": probe.prepareCount,
+                "destinationPerform": probe.performCount,
+                "destinationConclude": probe.concludeCount,
+                "destinationErrors": probe.errors,
+                "cardClosed": cardClosed,
+                "destinationTargetReady": destinationTargetReady,
+                "settled": settled,
+                "passed": passed,
+            ]
+        }
+
+        var cases: [[String: Any]] = []
+        for format in ["png", "jpg", "pdf", "webp"] {
+            cases.append(await runCase(
+                name: "\(format)-prepared-cache-url",
+                format: format,
+                expectedTransport: "file-url",
+                forcePromiseOnly: false,
+                entrance: .slide
+            ))
+            cases.append(await runCase(
+                name: "\(format)-handoff-immediate-promise",
+                format: format,
+                expectedTransport: "file-promise",
+                forcePromiseOnly: true,
+                entrance: .handoff
+            ))
+        }
+        report["cases"] = cases
+        report["allPass"] = cases.allSatisfy { $0["passed"] as? Bool == true }
+        return report
+    }
+
+    // MARK: - Scenario: overlay-rapid-retry
+
+    /// A new grab owns the window immediately, even if the previous cancelled
+    /// gesture is still animating back to its slot. Samples while the second drag
+    /// remains held so a stale frame animator cannot hide behind the final release.
+    private static func runOverlayRapidRetry() async -> [String: Any] {
+        var report: [String: Any] = ["scenario": "overlay-rapid-retry"]
+        guard AXIsProcessTrusted() else {
+            report["skipped"] = "Accessibility permission is required for physical drag events"
+            report["allPass"] = false
+            return report
+        }
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let screen = NSScreen.screens.first(where: {
+                  ScreenCaptureCatalog.displayID(of: $0) == CGMainDisplayID()
+              }) ?? NSScreen.main ?? NSScreen.screens.first else {
+            report["error"] = "no app delegate or screen"
+            report["allPass"] = false
+            return report
+        }
+
+        let savedTimeout = Settings.overlayTimeout
+        Settings.overlayTimeout = 30
+        defer { Settings.overlayTimeout = savedTimeout }
+
+        let image = solidImage(size: NSSize(width: 640, height: 360), color: .systemPurple)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-overlay-rapid-retry-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        func quartzPoint(_ appKitPoint: NSPoint) -> CGPoint {
+            CGPoint(x: appKitPoint.x, y: screen.frame.maxY - appKitPoint.y)
+        }
+        func post(_ type: CGEventType, at point: CGPoint) {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+        func waitForMouseTarget(_ card: NSWindow, at point: NSPoint) async -> Bool {
+            for attempt in 0...50 {
+                if NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0) == card.windowNumber {
+                    return true
+                }
+                if attempt < 50 {
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+            }
+            return false
+        }
+        let item = HistoryItem(
+            id: UUID(),
+            createdAt: Date(),
+            imagePath: directory.appendingPathComponent("capture.png").path,
+            thumbnailPath: directory.appendingPathComponent("thumb.png").path,
+            captureRect: nil
+        )
+
+        let before = QuickAccessOverlay.uiTestWindows.count
+        QuickAccessOverlay.show(
+            image: image,
+            historyItem: item,
+            historyManager: appDelegate.historyManager,
+            screen: screen,
+            entrance: .slide
+        )
+        var createdCard: NSWindow?
+        for _ in 0..<50 {
+            if QuickAccessOverlay.uiTestWindows.count > before,
+               let card = QuickAccessOverlay.uiTestWindows.last,
+               card.isVisible,
+               card.alphaValue > 0.95 {
+                createdCard = card
+                break
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        guard let card = createdCard else {
+            report["error"] = "card did not appear"
+            report["allPass"] = false
+            return report
+        }
+        defer {
+            if QuickAccessOverlay.uiTestWindows.contains(where: { $0 === card }) {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+        }
+        let slotOrigin = card.frame.origin
+
+        let firstStartAppKit = NSPoint(x: card.frame.midX, y: card.frame.midY)
+        guard await waitForMouseTarget(card, at: firstStartAppKit) else {
+            report["error"] = "card was not the physical mouse target"
+            report["allPass"] = false
+            return report
+        }
+        let firstStart = quartzPoint(firstStartAppKit)
+        let firstEnd = CGPoint(x: firstStart.x, y: firstStart.y + 30)
+        QuickAccessOverlay.uiTestResetGestureEntryCount()
+        post(.mouseMoved, at: firstStart)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        post(.leftMouseDown, at: firstStart)
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        post(.leftMouseDragged, at: firstEnd)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        let firstPulled = QuickAccessOverlay.uiTestNewestFrameOrigin() ?? slotOrigin
+        post(.leftMouseUp, at: firstEnd)
+
+        // Retry while the 0.22 s snap-back is still active.
+        try? await Task.sleep(nanoseconds: 25_000_000)
+        let retryStartAppKit = NSPoint(x: firstStartAppKit.x, y: firstStartAppKit.y - 30)
+        guard await waitForMouseTarget(card, at: retryStartAppKit) else {
+            report["error"] = "card did not remain the physical mouse target for retry"
+            report["allPass"] = false
+            return report
+        }
+        let retryEnd = CGPoint(x: firstEnd.x, y: firstEnd.y + 30)
+        post(.leftMouseDown, at: firstEnd)
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        // The window can legitimately keep advancing its previous snap-back while
+        // the second press is held but has not moved yet. The new gesture owns the
+        // frame at its first drag sample, so measure the displacement from there.
+        let retryBase = QuickAccessOverlay.uiTestNewestFrameOrigin() ?? slotOrigin
+        post(.leftMouseDragged, at: retryEnd)
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        let retryImmediate = QuickAccessOverlay.uiTestNewestFrameOrigin() ?? retryBase
+
+        // Keep holding until after the previous 0.22 s animator would have ended.
+        try? await Task.sleep(nanoseconds: 140_000_000)
+        let retryHeld = QuickAccessOverlay.uiTestNewestFrameOrigin() ?? retryBase
+        post(.leftMouseUp, at: retryEnd)
+        try? await Task.sleep(nanoseconds: 250_000_000)
+
+        let firstMoved = slotOrigin.y - firstPulled.y > 20
+        let retryMovedImmediately = retryBase.y - retryImmediate.y > 20
+        let retryStayedOwned = retryBase.y - retryHeld.y > 20
+            && abs(retryHeld.y - retryImmediate.y) < 3
+        let gestureEntries = QuickAccessOverlay.uiTestGestureEntryCount()
+        report["slotY"] = Double(slotOrigin.y)
+        report["firstPulledY"] = Double(firstPulled.y)
+        report["retryBaseY"] = Double(retryBase.y)
+        report["retryImmediateY"] = Double(retryImmediate.y)
+        report["retryHeldY"] = Double(retryHeld.y)
+        report["firstMoved"] = firstMoved
+        report["retryMovedImmediately"] = retryMovedImmediately
+        report["retryStayedOwned"] = retryStayedOwned
+        report["gestureEntries"] = gestureEntries
+        report["physicalEvents"] = true
+        report["allPass"] = firstMoved
+            && retryMovedImmediately
+            && retryStayedOwned
+            && gestureEntries == 2
         return report
     }
 
@@ -4434,6 +5632,156 @@ final class UITestRunner: NSObject {
 
         ctrl.uiTestClose()
         r["allPass"] = dimensionsPass && alphaPass && chooserPreviewPass && modernPreviewAvoidedLegacy
+        return r
+    }
+
+    /// Exercises the production compatibility path against a live Aside window.
+    /// Aside owns a second transparent surface around its visible browser window,
+    /// so a generic AppKit test window cannot reproduce this failure mode.
+    private static func runAsideWindowCaptureSuite() async -> [String: Any] {
+        var r: [String: Any] = [:]
+        guard #available(macOS 14.0, *) else {
+            r["skipped"] = "needs macOS 14+"; r["allPass"] = false; return r
+        }
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            r["error"] = "no app delegate"; r["allPass"] = false; return r
+        }
+
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        let snapshot: ScreenCaptureWindowSnapshot
+        do {
+            snapshot = try await ScreenCaptureCatalog.shared.windows(.visibleContent)
+        } catch {
+            r["error"] = "window catalog failed: \(error.localizedDescription)"
+            r["allPass"] = false
+            return r
+        }
+        let candidates = snapshot.windows.map {
+            WindowCaptureDescriptor(
+                id: CGWindowID($0.windowID),
+                ownerProcessID: $0.owningApplication?.processID,
+                ownerBundleIdentifier: $0.owningApplication?.bundleIdentifier,
+                layer: $0.windowLayer,
+                frame: $0.frame,
+                title: $0.title
+            )
+        }
+        let shadowHost = candidates.first(where: { candidate in
+            candidate.ownerBundleIdentifier == "at.studio.AsideBrowser"
+                && WindowCaptureTargetResolver.targetID(
+                    selected: candidate,
+                    candidates: candidates
+                ) != candidate.id
+        })
+        let directContent = candidates.first(where: { candidate in
+            candidate.ownerBundleIdentifier == "at.studio.AsideBrowser"
+                && candidate.layer == 0
+                && !(candidate.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                && candidate.frame.width >= 500
+                && candidate.frame.height >= 500
+        })
+        guard let selected = shadowHost ?? directContent else {
+            r["skipped"] = "no live Aside content window"
+            r["allPass"] = false
+            return r
+        }
+        let targetID = WindowCaptureTargetResolver.targetID(
+            selected: selected,
+            candidates: candidates
+        )
+        r["selectedWindowID"] = Int(selected.id)
+        r["resolvedWindowID"] = Int(targetID)
+        r["usedShadowHostPair"] = selected.id != targetID
+
+        guard let image = await appDelegate.uiTestCaptureEngine.uiTestIsolatedWindowImage(
+            windowID: selected.id
+        ), let rawCG = image.bestCGImage else {
+            r["error"] = "production Aside grab returned no pixels"
+            r["allPass"] = false
+            return r
+        }
+
+        try? FileManager.default.createDirectory(
+            atPath: "/tmp/krit-aside-window-capture",
+            withIntermediateDirectories: true
+        )
+        func savePNG(_ image: CGImage, name: String) {
+            let path = "/tmp/krit-aside-window-capture/\(name).png"
+            if let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+            r["\(name)Path"] = path
+        }
+        savePNG(rawCG, name: "normalized-raw")
+        r["rawPixels"] = ["w": rawCG.width, "h": rawCG.height]
+
+        var insetPass = false
+        if let insets = opaqueContentInsets(rawCG) {
+            r["contentInsets"] = ["l": insets.l, "r": insets.r, "t": insets.t, "b": insets.b]
+            let tolerance = Int(Double(max(rawCG.width, rawCG.height)) * 0.02)
+            insetPass = max(insets.l, insets.r, insets.t, insets.b) <= tolerance
+            r["contentInsetTolerance"] = tolerance
+        }
+        r["contentInsetPass"] = insetPass
+
+        let options = AnnotationWindowController.windowShotBackground(
+            for: image,
+            captureRect: selected.frame
+        )
+        let composed = ScreenshotBackgroundComposer.composeIfNeeded(image, options: options)
+        let composedCG = composed.bestCGImage
+        var composedSlotPass = false
+        if let composedCG {
+            savePNG(composedCG, name: "composed")
+            r["composedPixels"] = ["w": composedCG.width, "h": composedCG.height]
+
+            // Compare the opaque interior of the source with the exact slot the
+            // compositor produced. A transparent framing surface becomes desktop
+            // pixels here and creates the reported second rounded rectangle, so
+            // it cannot match the raw interior even when the output itself exists.
+            let renderScale = max(
+                CGFloat(composedCG.width) / max(composed.size.width, 1),
+                CGFloat(composedCG.height) / max(composed.size.height, 1)
+            )
+            let slot = ScreenshotBackgroundComposer.imageSlotRect(
+                imageSize: image.size,
+                canvasSize: composed.size,
+                options: options
+            )
+            let slotPixels = CGRect(
+                x: (slot.minX * renderScale).rounded(),
+                y: (slot.minY * renderScale).rounded(),
+                width: (slot.width * renderScale).rounded(),
+                height: (slot.height * renderScale).rounded()
+            ).intersection(CGRect(x: 0, y: 0, width: composedCG.width, height: composedCG.height))
+            if let slotCG = composedCG.cropping(to: slotPixels) {
+                let commonWidth = min(rawCG.width, slotCG.width)
+                let commonHeight = min(rawCG.height, slotCG.height)
+                let edgeInset = max(8, Int(options.cornerRadius * renderScale) + 4)
+                let interiorWidth = commonWidth - edgeInset * 2
+                let interiorHeight = commonHeight - edgeInset * 2
+                if interiorWidth > 0, interiorHeight > 0,
+                   let rawInterior = rawCG.cropping(to: CGRect(
+                    x: edgeInset, y: edgeInset,
+                    width: interiorWidth, height: interiorHeight
+                   )),
+                   let slotInterior = slotCG.cropping(to: CGRect(
+                    x: edgeInset, y: edgeInset,
+                    width: interiorWidth, height: interiorHeight
+                   )),
+                   let diff = meanAbsDiff(rawInterior, slotInterior) {
+                    r["composedSlotDiff"] = diff
+                    composedSlotPass = diff < 12
+                }
+            }
+        }
+        r["composedSlotPass"] = composedSlotPass
+
+        r["allPass"] = insetPass
+            && composedSlotPass
+            && rawCG.width > 0
+            && rawCG.height > 0
+            && composedCG != nil
         return r
     }
 
@@ -7959,7 +9307,7 @@ final class UITestRunner: NSObject {
     /// A stand-in capture that looks like a real screenshot rather than a flat
     /// fill: a window mock on a gradient. A chapado rectangle hides exactly the
     /// contrast problems a stage is supposed to reveal.
-    private static func sampleShot() -> NSImage {
+    private static func sampleShot(markerColor: NSColor? = nil) -> NSImage {
         let size = NSSize(width: 900, height: 580)
         let img = NSImage(size: size)
         img.lockFocus()
@@ -7986,6 +9334,10 @@ final class UITestRunner: NSObject {
         for row in 0..<7 {
             let w = [520.0, 470.0, 560.0, 380.0, 500.0, 430.0, 300.0][row]
             NSRect(x: 130, y: 390 - Double(row) * 44, width: w, height: 14).fill()
+        }
+        if let markerColor {
+            markerColor.setFill()
+            NSRect(x: 0, y: 0, width: 48, height: size.height).fill()
         }
         img.unlockFocus()
         return img
@@ -8042,6 +9394,171 @@ final class UITestRunner: NSObject {
         r["written"] = written
         r["allPass"] = written.count == PreferencesTab.allCases.count * 2
         return r
+    }
+}
+
+@MainActor
+private final class UITestFileDropDestination: NSView {
+    private static let promiseQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "Krit.UITestFileDropDestination"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        return queue
+    }()
+
+    let outputDirectory: URL
+    let promiseReceiveDelay: TimeInterval
+    private(set) var enteredCount = 0
+    private(set) var firstEnteredAtUptime: TimeInterval?
+    private(set) var prepareCount = 0
+    private(set) var performCount = 0
+    private(set) var concludeCount = 0
+    private(set) var observedTransport: String?
+    private(set) var receivedItemCount = 0
+    private(set) var errors: [String] = []
+    private var pendingPromiseFiles = 0
+    private var materializedFiles = 0
+
+    init(outputDirectory: URL, promiseReceiveDelay: TimeInterval = 0) {
+        self.outputDirectory = outputDirectory
+        self.promiseReceiveDelay = promiseReceiveDelay
+        super.init(frame: .zero)
+        let promiseTypes = NSFilePromiseReceiver.readableDraggedTypes.map {
+            NSPasteboard.PasteboardType($0)
+        }
+        registerForDraggedTypes(Array(Set(promiseTypes + [.fileURL])))
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        enteredCount += 1
+        if firstEnteredAtUptime == nil {
+            firstEnteredAtUptime = ProcessInfo.processInfo.systemUptime
+        }
+        guard detectedTransport(in: sender.draggingPasteboard) != nil else { return [] }
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        detectedTransport(in: sender.draggingPasteboard) == nil ? [] : .copy
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        prepareCount += 1
+        return detectedTransport(in: sender.draggingPasteboard) != nil
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        performCount += 1
+        let pasteboard = sender.draggingPasteboard
+
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [
+            .urlReadingFileURLsOnly: true,
+        ]
+        if pasteboard.canReadObject(forClasses: [NSURL.self], options: options) {
+            guard let urls = pasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: options
+            ) as? [URL], urls.count == 1 else {
+                errors.append("expected exactly one concrete file URL")
+                return false
+            }
+            observedTransport = "file-url"
+            receivedItemCount = urls.count
+            let source = urls[0]
+            let destination = outputDirectory.appendingPathComponent(source.lastPathComponent)
+            do {
+                try FileManager.default.copyItem(at: source, to: destination)
+                materializedFiles = 1
+                return true
+            } catch {
+                errors.append(error.localizedDescription)
+                return false
+            }
+        }
+
+        observedTransport = "file-promise"
+        guard let receivers = pasteboard.readObjects(
+            forClasses: [NSFilePromiseReceiver.self]
+        ) as? [NSFilePromiseReceiver], receivers.count == 1 else {
+            errors.append("expected exactly one file-promise receiver")
+            return false
+        }
+        receivedItemCount = receivers.count
+        pendingPromiseFiles = receivers.count
+        if promiseReceiveDelay > 0 {
+            let delay = promiseReceiveDelay
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(delay))
+                self?.receivePromisedFiles(receivers)
+            }
+        } else {
+            receivePromisedFiles(receivers)
+        }
+        return true
+    }
+
+    private func receivePromisedFiles(_ receivers: [NSFilePromiseReceiver]) {
+        for receiver in receivers {
+            receiver.receivePromisedFiles(
+                atDestination: outputDirectory,
+                options: [:],
+                operationQueue: Self.promiseQueue
+            ) { [weak self] fileURL, error in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if let error {
+                        self.errors.append(error.localizedDescription)
+                    } else if FileManager.default.fileExists(atPath: fileURL.path) {
+                        self.materializedFiles += 1
+                    } else {
+                        self.errors.append("promise callback returned a missing file")
+                    }
+                    self.pendingPromiseFiles -= 1
+                }
+            }
+        }
+    }
+
+    override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        concludeCount += 1
+    }
+
+    var materializationSettled: Bool {
+        pendingPromiseFiles == 0
+            && (materializedFiles > 0 || !errors.isEmpty)
+    }
+
+    func outputFiles() -> [URL] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: outputDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return enumerator.compactMap { item in
+            guard let url = item as? URL,
+                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                return nil
+            }
+            return url
+        }
+    }
+
+    private func detectedTransport(in pasteboard: NSPasteboard) -> String? {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [
+            .urlReadingFileURLsOnly: true,
+        ]
+        if pasteboard.canReadObject(forClasses: [NSURL.self], options: options) {
+            return "file-url"
+        }
+        if pasteboard.canReadObject(forClasses: [NSFilePromiseReceiver.self]) {
+            return "file-promise"
+        }
+        return nil
     }
 }
 

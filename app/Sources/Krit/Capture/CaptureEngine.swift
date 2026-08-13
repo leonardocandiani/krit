@@ -54,6 +54,121 @@ struct IsolatedWindowCapturePlan: Equatable {
     }
 }
 
+struct NormalizedWindowCapture {
+    let image: CGImage
+    let logicalSize: CGSize
+    let didCrop: Bool
+}
+
+/// Some Chromium-based apps publish a transparent framing surface inside the
+/// SCWindow that ScreenCaptureKit returns. That surface is app-owned content,
+/// so `ignoreShadowsSingleWindow` cannot remove it. Limit pixel normalization
+/// to known offenders so real transparent windows from other apps stay intact.
+enum WindowCaptureImageNormalizer {
+    private static let framedWindowBundleIdentifiers: Set<String> = [
+        "at.studio.AsideBrowser"
+    ]
+
+    static func normalize(
+        _ image: CGImage,
+        logicalSize: CGSize,
+        bundleIdentifier: String?
+    ) -> NormalizedWindowCapture {
+        let unchanged = NormalizedWindowCapture(
+            image: image,
+            logicalSize: logicalSize,
+            didCrop: false
+        )
+        guard let bundleIdentifier,
+              framedWindowBundleIdentifiers.contains(bundleIdentifier),
+              logicalSize.width > 0,
+              logicalSize.height > 0,
+              let cropRect = nearlyOpaqueContentRect(in: image) else {
+            return unchanged
+        }
+
+        let left = cropRect.minX
+        let right = CGFloat(image.width) - cropRect.maxX
+        let top = cropRect.minY
+        let bottom = CGFloat(image.height) - cropRect.maxY
+        let tolerance = CGFloat(max(image.width, image.height)) * 0.02
+        guard min(left, right, top, bottom) > tolerance else {
+            return unchanged
+        }
+
+        let widthRatio = cropRect.width / CGFloat(image.width)
+        let heightRatio = cropRect.height / CGFloat(image.height)
+        guard widthRatio >= 0.6, heightRatio >= 0.6,
+              let cropped = image.cropping(to: cropRect) else {
+            return unchanged
+        }
+
+        let scaleX = CGFloat(image.width) / logicalSize.width
+        let scaleY = CGFloat(image.height) / logicalSize.height
+        let croppedLogicalSize = CGSize(
+            width: CGFloat(cropped.width) / scaleX,
+            height: CGFloat(cropped.height) / scaleY
+        )
+        return NormalizedWindowCapture(
+            image: cropped,
+            logicalSize: croppedLogicalSize,
+            didCrop: true
+        )
+    }
+
+    /// Finds the straight window edges along the middle row and column. Rounded
+    /// corner transparency remains inside this rect, while an external halo is
+    /// excluded. Requiring nearly opaque pixels avoids guessing at legitimately
+    /// translucent content.
+    private static func nearlyOpaqueContentRect(in image: CGImage) -> CGRect? {
+        let width = image.width
+        let height = image.height
+        guard width > 4,
+              height > 4,
+              image.bitsPerComponent == 8,
+              image.bitsPerPixel == 32,
+              let data = image.dataProvider?.data,
+              let pointer = CFDataGetBytePtr(data) else {
+            return nil
+        }
+
+        let alphaInfo = image.alphaInfo
+        let hasAlpha = alphaInfo == .premultipliedFirst
+            || alphaInfo == .first
+            || alphaInfo == .premultipliedLast
+            || alphaInfo == .last
+        guard hasAlpha else { return nil }
+
+        let alphaFirst = alphaInfo == .premultipliedFirst || alphaInfo == .first
+        let littleEndian = image.bitmapInfo.contains(.byteOrder32Little)
+        let alphaOffset = (alphaFirst != littleEndian) ? 0 : 3
+        let bytesPerRow = image.bytesPerRow
+        func alpha(x: Int, y: Int) -> UInt8 {
+            pointer[y * bytesPerRow + x * 4 + alphaOffset]
+        }
+
+        let midX = width / 2
+        let midY = height / 2
+        guard let minX = (0..<width).first(where: { alpha(x: $0, y: midY) > 250 }),
+              let maxX = stride(from: width - 1, through: 0, by: -1)
+                .first(where: { alpha(x: $0, y: midY) > 250 }),
+              let minY = (0..<height).first(where: { alpha(x: midX, y: $0) > 250 }),
+              let maxY = stride(from: height - 1, through: 0, by: -1)
+                .first(where: { alpha(x: midX, y: $0) > 250 }),
+              maxX >= minX,
+              maxY >= minY else {
+            return nil
+        }
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: maxX - minX + 1,
+            height: maxY - minY + 1
+        )
+    }
+}
+
 /// Aside publishes an untitled shadow window plus the real titled
 /// window as two separate ScreenCaptureKit entries. Resolve that exact geometry
 /// before capture instead of guessing from pixels and risking real alpha content.
@@ -1775,7 +1890,17 @@ final class CaptureEngine {
             config.ignoreShadowsSingleWindow = true
 
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            return Self.nsImage(from: cgImage, logicalSize: logicalSize)
+            let normalized = WindowCaptureImageNormalizer.normalize(
+                cgImage,
+                logicalSize: logicalSize,
+                bundleIdentifier: window.owningApplication?.bundleIdentifier
+            )
+            if normalized.didCrop {
+                Self.captureLog.info(
+                    "isolatedWindowImage: removed embedded transparent framing from \(cgImage.width)x\(cgImage.height) to \(normalized.image.width)x\(normalized.image.height)"
+                )
+            }
+            return Self.nsImage(from: normalized.image, logicalSize: normalized.logicalSize)
         } catch {
             let nsError = error as NSError
             Self.captureLog.error("isolatedWindowImage failed: domain=\(nsError.domain) code=\(nsError.code) \(nsError.localizedDescription)")

@@ -136,8 +136,10 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         root.autoresizingMask = [.width, .height]
         window.contentView = root
 
-        let sidebarIconCenterX = Self.closeButtonCenterX(in: window, relativeTo: root)
-            ?? Self.fallbackSidebarIconCenterX
+        // The titlebar reports fractional intermediate geometry while AppKit is
+        // constructing the full-size chrome. Build on the stable native 16 pt
+        // axis so sidebar padding does not depend on that construction timing.
+        let sidebarIconCenterX = Self.fallbackSidebarIconCenterX
 
         // A native source list owns keyboard navigation, selection and VoiceOver.
         // The sidebar material is structural on every supported macOS version;
@@ -235,6 +237,10 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
 private enum PreferencesSidebarMetrics {
     static let iconSize: CGFloat = 13
     static let iconCenterInRow: CGFloat = 12
+    // Auto Layout pixel-aligns the footer's odd-sized NSImageView 0.75 pt to the
+    // right. Counter that frame adjustment so its rendered center stays on the
+    // same axis as the source-list glyphs above it.
+    static let footerIconCenterInRow: CGFloat = iconCenterInRow - 0.75
     static let surfaceHorizontalInset: CGFloat = 0
     static let labelLeading = iconCenterInRow + iconSize / 2 + 10
 }
@@ -497,7 +503,7 @@ private final class SidebarFooterButton: NSView {
         NSLayoutConstraint.activate([
             glyph.centerXAnchor.constraint(
                 equalTo: leadingAnchor,
-                constant: PreferencesSidebarMetrics.iconCenterInRow
+                constant: PreferencesSidebarMetrics.footerIconCenterInRow
             ),
             glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
             glyph.widthAnchor.constraint(equalToConstant: 13),

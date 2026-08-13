@@ -2,6 +2,93 @@ import AppKit
 import CoreImage
 import QuartzCore
 
+enum QuickAccessDragRouting {
+    static let directionalDominance: CGFloat = 1.15
+
+    static func shouldBeginFileDrag(
+        intoScreen: CGFloat,
+        downward: CGFloat,
+        convertDistance: CGFloat
+    ) -> Bool {
+        let clearlyVerticalStandby = downward > intoScreen * directionalDominance
+        return intoScreen > convertDistance && !clearlyVerticalStandby
+    }
+}
+
+enum FileDragDeliveryOutcome: Equatable {
+    case waiting
+    case delivered
+    case failed
+}
+
+struct FileDragDeliveryGate {
+    let requiresPromiseCompletion: Bool
+    private var dropAccepted: Bool?
+    private var promiseSucceeded: Bool?
+
+    init(requiresPromiseCompletion: Bool) {
+        self.requiresPromiseCompletion = requiresPromiseCompletion
+    }
+
+    mutating func noteDrop(accepted: Bool) -> FileDragDeliveryOutcome {
+        dropAccepted = accepted
+        return outcome
+    }
+
+    mutating func notePromiseCompletion(succeeded: Bool) -> FileDragDeliveryOutcome {
+        promiseSucceeded = succeeded
+        return outcome
+    }
+
+    private var outcome: FileDragDeliveryOutcome {
+        guard let dropAccepted else { return .waiting }
+        guard dropAccepted else { return .failed }
+        guard requiresPromiseCompletion else { return .delivered }
+        guard let promiseSucceeded else { return .waiting }
+        return promiseSucceeded ? .delivered : .failed
+    }
+}
+
+private final class DragSessionReference: @unchecked Sendable {
+    let session: NSDraggingSession
+
+    init(_ session: NSDraggingSession) {
+        self.session = session
+    }
+}
+
+private struct DragExportDescriptor: Equatable, Sendable {
+    let encoding: CaptureEncoding
+    let fileExtension: String
+    let fileType: String
+
+    static func current() -> DragExportDescriptor {
+        let format = ImageExporter.preferredFormat()
+        return DragExportDescriptor(
+            encoding: CaptureEncoding.fileFormat(
+                extension: format.ext,
+                jpegQuality: Settings.jpegQuality
+            ),
+            fileExtension: format.ext,
+            fileType: format.uti
+        )
+    }
+}
+
+private final class PreparedDragFile: @unchecked Sendable {
+    let url: URL
+    let descriptor: DragExportDescriptor
+
+    init(url: URL, descriptor: DragExportDescriptor) {
+        self.url = url
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 /// Post-capture floating thumbnail with quick action buttons.
 /// Position and dismiss timeout are controlled via Preferences → Settings.
 @MainActor
@@ -425,6 +512,7 @@ private final class QuickAccessWindow: NSWindow {
     private weak var thumbView: DraggableImageView?
     private weak var backdropDimView: NSView?
     private var isHovered = false
+    private var isFileDeliveryPending = false
     private var mouseInsideOverlay = false
     private var swipeAccumX: CGFloat = 0
 
@@ -1066,6 +1154,15 @@ private final class QuickAccessWindow: NSWindow {
         // cannot re-gate the controls during the gesture.
         isEntering = false
         cancelVisualEntrance()
+        // A cancelled card gesture, file-drag regret, restore or stack reflow may
+        // still be animating the NSWindow frame. Stop that animator at its current
+        // visible position before latching the new origin; otherwise it keeps
+        // writing over cardDragUpdate and pulls the preview home while the next
+        // gesture is still held.
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            self.animator().setFrame(self.frame, display: true)
+        }
         // The user has deliberately grabbed the thumbnail. Once that gesture
         // settles, controls may appear normally even if the entrance animation was
         // interrupted before its completion callback ran.
@@ -1156,10 +1253,10 @@ private final class QuickAccessWindow: NSWindow {
         // still gets live feedback. Delete = clear horizontal pull toward the
         // stack's edge; standby = clear downward pull. Upward / into-the-screen
         // falls through to nil (snap back; the file-drag-out is routed earlier).
-        if towardEdge > signalFloor && towardEdge > 1.15 * abs(downward) {
+        if towardEdge > signalFloor && towardEdge > QuickAccessDragRouting.directionalDominance * abs(downward) {
             return (.delete, min(towardEdge / deleteConfirmDistance, 1))
         }
-        if downward > signalFloor && downward > 1.15 * abs(towardEdge) {
+        if downward > signalFloor && downward > QuickAccessDragRouting.directionalDominance * abs(towardEdge) {
             return (.standby, min(downward / standbyConfirmDistance, 1))
         }
         return nil
@@ -1353,10 +1450,16 @@ private final class QuickAccessWindow: NSWindow {
         let intoScreen = -towardEdge
         let downward = -dy
 
-        // INTO the screen, past the convert distance, and the inward pull beats
-        // the downward pull -> file drag. The card is pinned, so an inward pull
-        // means "take the file out", not "move the card inward".
-        if intoScreen > fileDragConvertDistance && intoScreen > abs(downward) {
+        // INTO the screen past the convert distance defaults to a file drag, even
+        // on an ordinary diagonal toward an app above or below the card. Only a
+        // clearly vertical downward pull stays reserved for standby. The previous
+        // strict 45-degree cone made equal diagonals arbitrarily dead and stole
+        // lower-screen destinations from drag-and-drop.
+        if QuickAccessDragRouting.shouldBeginFileDrag(
+            intoScreen: intoScreen,
+            downward: downward,
+            convertDistance: fileDragConvertDistance
+        ) {
             settleFileDragConversion()
             _ = beginFileDrag(event)
             return true
@@ -1458,7 +1561,7 @@ private final class QuickAccessWindow: NSWindow {
         ]
         gradient.startPoint = CGPoint(x: 0.5, y: 1)
         gradient.endPoint = CGPoint(x: 0.5, y: 0)
-        let highlight = NSView(frame: NSRect(x: 0, y: totalH - 3, width: thumbW, height: 3))
+        let highlight = PassthroughView(frame: NSRect(x: 0, y: totalH - 3, width: thumbW, height: 3))
         highlight.layer = gradient
         highlight.wantsLayer = true
         highlight.autoresizingMask = [.width, .minYMargin]
@@ -1534,6 +1637,9 @@ private final class QuickAccessWindow: NSWindow {
             thumb.onDoubleClick = { [weak self] in self?.editAction() }
         }
         thumb.onDragStarted = { [weak self] in self?.invalidateDismissTimer() }
+        thumb.onFileDeliveryPendingChanged = { [weak self] pending in
+            self?.setFileDeliveryPending(pending)
+        }
         thumb.onDragEnded = { [weak self] accepted in
             guard let self else { return }
             if accepted {
@@ -1800,7 +1906,8 @@ private final class QuickAccessWindow: NSWindow {
         // While zoomed (O5) the chrome stays hidden behind the big preview.
         guard hovered != isHovered, !isParked, !isPreviewZoomed else { return }
         isHovered = hovered
-        controlsOverlay?.isInteractive = hovered && controlsReadyForInteraction
+        let showControls = hovered && controlsReadyForInteraction && !isFileDeliveryPending
+        controlsOverlay?.isInteractive = showControls
 
         // Pause/resume auto-dismiss timer on hover (like CleanShot X)
         if hovered {
@@ -1812,7 +1919,25 @@ private final class QuickAccessWindow: NSWindow {
 
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.2
-            controlsOverlay?.animator().alphaValue = hovered && controlsReadyForInteraction ? 1 : 0
+            controlsOverlay?.animator().alphaValue = showControls ? 1 : 0
+        }
+    }
+
+    /// A file promise can outlive the pointer gesture. Keep every destructive or
+    /// mutating control out of the hit map until AppKit confirms materialization,
+    /// otherwise Close/Edit/Save can tear down the card underneath the delivery.
+    private func setFileDeliveryPending(_ pending: Bool) {
+        guard pending != isFileDeliveryPending else { return }
+        isFileDeliveryPending = pending
+        let showControls = isHovered
+            && controlsReadyForInteraction
+            && !pending
+            && !isParked
+            && !isPreviewZoomed
+        controlsOverlay?.isInteractive = showControls
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            controlsOverlay?.animator().alphaValue = showControls ? 1 : 0
         }
     }
 
@@ -2934,6 +3059,7 @@ private final class QuickAccessWindow: NSWindow {
         guard !didCleanup else { return }
         didCleanup = true
         cancelVisualEntrance()
+        thumbView?.cleanupDragResources()
         // Release O5 zoom ownership if this card closes while zoomed.
         if isPreviewZoomed { isPreviewZoomed = false }
         // P1: tear down the Space companion preview if this card owned it, and
@@ -3288,6 +3414,17 @@ private final class QuickAccessWindow: NSWindow {
 private final class DraggableImageView: NSView, NSDraggingSource {
 
     nonisolated(unsafe) static var uiTestDragSessionStartCount = 0
+    nonisolated(unsafe) private var uiTestDragSessionWillBeginCount = 0
+    nonisolated(unsafe) private var uiTestDragSessionMoveCount = 0
+    nonisolated(unsafe) private var uiTestDragSessionEndCount = 0
+    nonisolated(unsafe) private var uiTestDragSessionStartPoint = NSPoint.zero
+    nonisolated(unsafe) private var uiTestDragSessionMaxDistance: CGFloat = 0
+    nonisolated(unsafe) private static var uiTestLastCompletedDragSessionTrace: [String: Any] = [
+        "willBegin": 0,
+        "moves": 0,
+        "ended": 0,
+        "maxDistance": 0.0,
+    ]
 
     var dragImage: NSImage?
     var onDoubleClick: (() -> Void)?
@@ -3296,6 +3433,8 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     /// (operation != []); false when the user let go over nothing or the target
     /// refused, so the card can spring back instead of closing (the regret path).
     var onDragEnded: ((_ accepted: Bool) -> Void)?
+    /// Disables the whole card chrome while a promised file is materializing.
+    var onFileDeliveryPendingChanged: ((_ pending: Bool) -> Void)?
     /// Hand the whole drag to the card's continuous direction classifier (the card
     /// is pinned to the anchor line, so there is no free move). The card decides by
     /// direction: toward the screen edge = delete, into the screen = file drag,
@@ -3314,9 +3453,12 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     var fileURLOverride: (() -> URL?)?
 
     private var dragOrigin: NSPoint?
-    private var activeDragFileURL: URL?
-    private static var retainedDragFiles: Set<URL> = []
-    private static let dragFileCleanupDelay: TimeInterval = 300
+    private var activeDragSession: NSDraggingSession?
+    private var activeDragFileLease: PreparedDragFile?
+    private var fileDragDeliveryGeneration = 0
+    private var fileDragDeliveryGate: FileDragDeliveryGate?
+    private var filePromiseWriteStarted = false
+    private static let promiseWriteStartTimeout: TimeInterval = 5
 
     /// Temp PNG materialized ahead of the gesture. Encoding + writing a big
     /// Retina capture inside beginFileDrag stalled the main thread right as the
@@ -3324,60 +3466,42 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     /// background the moment the card is configured; the drag then starts with
     /// zero main-thread work. The generation guards a stale write landing after
     /// the image was swapped.
-    private var preparedDragFile: URL?
+    private var preparedDragFile: PreparedDragFile?
+    private var dragArtifact: CaptureArtifact?
     private var dragFileGeneration = 0
 
     /// Call after the card is fully configured. A concrete source file wins when
     /// it already exists; otherwise screenshot cards prepare a temporary artifact
     /// so a history write still in flight never leaves the gesture without a drag.
     func prepareForFileDrag(artifact: CaptureArtifact? = nil) {
-        if let stale = preparedDragFile, stale != activeDragFileURL {
-            try? FileManager.default.removeItem(at: stale)
-            Self.retainedDragFiles.remove(stale)
-        }
         preparedDragFile = nil
+        dragArtifact = nil
         dragFileGeneration += 1
         let generation = dragFileGeneration
         if let sourceURL = fileURLOverride?(),
            FileManager.default.fileExists(atPath: sourceURL.path) {
             return
         }
-        if let artifact {
-            let preferred = ImageExporter.preferredFormat()
-            let encoding = CaptureEncoding.fileFormat(
-                extension: preferred.ext,
-                jpegQuality: Settings.jpegQuality
+        guard let artifact = artifact ?? dragImage.flatMap({ CaptureArtifact(image: $0) }) else { return }
+        let descriptor = DragExportDescriptor.current()
+        dragArtifact = artifact
+        Task { [weak self] in
+            guard let export = await artifact.encoded(as: descriptor.encoding) else { return }
+            guard let self, self.dragFileGeneration == generation else { return }
+            guard export.ext == descriptor.fileExtension,
+                  export.uti == descriptor.fileType else { return }
+            let url = await Task.detached(priority: .utility) {
+                Self.makeTemporaryDragFile(data: export.data, ext: export.ext)
+            }.value
+            guard let url else { return }
+            guard self.dragFileGeneration == generation else {
+                try? FileManager.default.removeItem(at: url)
+                return
+            }
+            self.preparedDragFile = PreparedDragFile(
+                url: url,
+                descriptor: descriptor
             )
-            Task { [weak self] in
-                guard let export = await artifact.encoded(as: encoding) else { return }
-                let url = await Task.detached(priority: .utility) {
-                    Self.makeTemporaryDragFile(data: export.data, ext: export.ext)
-                }.value
-                guard let url else { return }
-                guard let self, self.dragFileGeneration == generation else {
-                    try? FileManager.default.removeItem(at: url)
-                    return
-                }
-                self.preparedDragFile = url
-                Self.retainedDragFiles.insert(url)
-            }
-            return
-        }
-
-        guard let cg = dragImage?.bestCGImage else { return }
-        let frame = cg
-        let pts = dragImage?.size ?? CGSize(width: cg.width, height: cg.height)
-        Task.detached(priority: .utility) {
-            guard let export = ImageExporter.encodedForExport(cg: frame, pointSize: pts),
-                  let url = Self.makeTemporaryDragFile(data: export.data, ext: export.ext) else { return }
-            await MainActor.run { [weak self] in
-                guard let self, self.dragFileGeneration == generation else {
-                    try? FileManager.default.removeItem(at: url)
-                    return
-                }
-                self.preparedDragFile = url
-                Self.retainedDragFiles.insert(url)
-            }
         }
     }
 
@@ -3385,6 +3509,7 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     override var mouseDownCanMoveWindow: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
+        guard activeDragSession == nil, fileDragDeliveryGate == nil else { return }
         // Click on the zoomed preview collapses it (O5) before any drag/edit.
         if onClickWhileZoomed?() == true { return }
         if event.clickCount == 2 {
@@ -3425,61 +3550,100 @@ private final class DraggableImageView: NSView, NSDraggingSource {
     /// Start the file-drag-out session for this card. Called either directly (when no
     /// move machine is wired or the card declined a down-drag) or as the MOVE->FILE
     /// conversion callback once the cursor leaves the card. Video cards drag the real
-    /// clip; screenshot cards drag a temp PNG with a promise fallback.
+    /// clip; screenshots use a concrete URL when their cache is ready and a file
+    /// promise when the first gesture beats that cache.
     func beginFileDrag(with event: NSEvent) {
-        guard let dragImg = dragImage else { return }
+        guard activeDragSession == nil,
+              fileDragDeliveryGate == nil,
+              let dragImg = dragImage else { return }
 
         // Video: drag the real recording on disk (the file lives in the user's
         // folder, so no temp materialization, no cleanup, no promise fallback).
         if let videoURL = fileURLOverride?(),
            FileManager.default.fileExists(atPath: videoURL.path) {
             onDragStarted?()
+            fileDragDeliveryGate = nil
             let item = NSDraggingItem(pasteboardWriter: videoURL as NSURL)
             item.setDraggingFrame(bounds, contents: dragImg)
             if KritTestHarness.isEnabled { Self.uiTestDragSessionStartCount += 1 }
-            beginDraggingSession(with: [item], event: event, source: self)
+            let session = beginDraggingSession(with: [item], event: event, source: self)
+            activeDragSession = session
             return
         }
 
         onDragStarted?()
 
         // The session must start NOW with the gesture's event; any synchronous
-        // encode here is exactly the reported card-to-file hitch. Two shapes:
-        //  - pre-export done (normal case): concrete file URL + promise, as before
-        //  - gesture beat the background encode: promise ONLY; the encode then
-        //    happens at DROP time on the promise's own queue, never on this gesture.
-        //    The promise is the canonical path HistoryPanelController already uses.
-        var items: [NSDraggingItem] = []
-        if let prepared = preparedDragFile {
-            activeDragFileURL = prepared
-            Self.retainedDragFiles.insert(prepared)
-            // Plain file URL covers Finder and apps that read a concrete file.
-            let fileItem = NSDraggingItem(pasteboardWriter: prepared as NSURL)
-            fileItem.setDraggingFrame(bounds, contents: dragImg)
-            items.append(fileItem)
+        // encode here is exactly the reported card-to-file hitch. Pick exactly
+        // one transport for this attempt: a concrete URL when the matching cache
+        // exists, otherwise a promise backed by the same in-flight artifact.
+        let descriptor = DragExportDescriptor.current()
+        let preparedForDrag: PreparedDragFile?
+        if let preparedDragFile,
+           preparedDragFile.descriptor == descriptor,
+           FileManager.default.fileExists(atPath: preparedDragFile.url.path) {
+            preparedForDrag = preparedDragFile
         } else {
-            activeDragFileURL = nil
+            preparedDragFile = nil
+            preparedForDrag = nil
         }
 
-        // File-promise for apps (Slack, Mail, VS Code, browsers) that request a
-        // promised file instead of reading the URL directly.
-        let promise = NSFilePromiseProvider(
-            fileType: ImageExporter.preferredFormat().uti,
-            delegate: OverlayImageFilePromiseDelegate(image: dragImg)
-        )
-        let promiseItem = NSDraggingItem(pasteboardWriter: promise)
-        promiseItem.setDraggingFrame(bounds, contents: dragImg)
-        items.append(promiseItem)
+        fileDragDeliveryGeneration += 1
+        let deliveryGeneration = fileDragDeliveryGeneration
+        activeDragFileLease = nil
+        filePromiseWriteStarted = false
+        let item: NSDraggingItem
+        if let preparedForDrag {
+            activeDragFileLease = preparedForDrag
+            fileDragDeliveryGate = FileDragDeliveryGate(requiresPromiseCompletion: false)
+            item = NSDraggingItem(pasteboardWriter: preparedForDrag.url as NSURL)
+        } else {
+            dragFileGeneration += 1
+            guard let artifact = dragArtifact ?? CaptureArtifact(image: dragImg) else {
+                onDragEnded?(false)
+                return
+            }
+            dragArtifact = artifact
+            fileDragDeliveryGate = FileDragDeliveryGate(requiresPromiseCompletion: true)
+            onFileDeliveryPendingChanged?(true)
+            let promiseWriteStarted: @Sendable () -> Void = { [weak self] in
+                Task<Void, Never> { @MainActor [weak self] in
+                    self?.handlePromiseWriteStarted(generation: deliveryGeneration)
+                }
+            }
+            let promiseCompletion: @Sendable (Bool) -> Void = { [weak self] succeeded in
+                Task<Void, Never> { @MainActor [weak self] in
+                    self?.handlePromiseCompletion(
+                        succeeded: succeeded,
+                        generation: deliveryGeneration
+                    )
+                }
+            }
+            let provider = RetainedFilePromiseProvider.make(
+                fileType: descriptor.fileType,
+                delegate: OverlayImageFilePromiseDelegate(
+                    artifact: artifact,
+                    encoding: descriptor.encoding,
+                    fileExtension: descriptor.fileExtension,
+                    fileType: descriptor.fileType,
+                    onWriteStarted: promiseWriteStarted,
+                    onCompletion: promiseCompletion
+                )
+            )
+            item = NSDraggingItem(pasteboardWriter: provider)
+        }
+        item.setDraggingFrame(bounds, contents: dragImg)
 
         if KritTestHarness.isEnabled { Self.uiTestDragSessionStartCount += 1 }
-        beginDraggingSession(with: items, event: event, source: self)
+        let session = beginDraggingSession(with: [item], event: event, source: self)
+        activeDragSession = session
     }
 
     /// Test hook: measures ONLY the main-thread materialization step a drag-out
-    /// would run right now; no session starts. Modes mirror the product paths:
-    /// "prepared" (pre-export done, concrete URL + promise) and "promise-only"
-    /// (gesture beat the encode), both ~0ms. forceInline re-runs the REMOVED
-    /// legacy synchronous encode on the same image, as evidence of the old cost.
+    /// would run right now; no session starts. "prepared" means a concrete URL is
+    /// ready, while "promise-only" means the same in-flight artifact will finish
+    /// at drop time. Both begin in ~0ms. forceInline re-runs the removed legacy
+    /// synchronous encode as evidence of the old cost.
     func uiTestDragPrep(forceInline: Bool) -> [String: Any] {
         guard let dragImg = dragImage else { return ["error": "no drag image"] }
         let t0 = CACurrentMediaTime()
@@ -3493,7 +3657,22 @@ private final class DraggableImageView: NSView, NSDraggingSource {
         } else if preparedDragFile != nil {
             mode = "prepared"
         }
-        return ["ms": (CACurrentMediaTime() - t0) * 1000, "mode": mode]
+        var result: [String: Any] = [
+            "ms": (CACurrentMediaTime() - t0) * 1000,
+            "mode": mode,
+        ]
+        if let preparedDragFile {
+            result["path"] = preparedDragFile.url.path
+        }
+        return result
+    }
+
+    /// Makes the next screenshot drag exercise the promise path even when its
+    /// background export already finished. Bumping the generation also prevents
+    /// an in-flight export from repopulating the prepared URL after this hook.
+    func uiTestInvalidatePreparedDragFile() {
+        dragFileGeneration += 1
+        preparedDragFile = nil
     }
 
     nonisolated private static func makeTemporaryDragFile(data: Data, ext: String = "png") -> URL? {
@@ -3515,32 +3694,163 @@ private final class DraggableImageView: NSView, NSDraggingSource {
         .copy
     }
 
+    nonisolated func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) {
+        guard KritTestHarness.isEnabled else { return }
+        uiTestDragSessionWillBeginCount += 1
+        uiTestDragSessionStartPoint = screenPoint
+        uiTestDragSessionMaxDistance = 0
+    }
+
+    nonisolated func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) {
+        guard KritTestHarness.isEnabled else { return }
+        uiTestDragSessionMoveCount += 1
+        uiTestDragSessionMaxDistance = max(
+            uiTestDragSessionMaxDistance,
+            hypot(
+                screenPoint.x - uiTestDragSessionStartPoint.x,
+                screenPoint.y - uiTestDragSessionStartPoint.y
+            )
+        )
+    }
+
     nonisolated func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        if KritTestHarness.isEnabled {
+            uiTestDragSessionEndCount += 1
+            Self.uiTestLastCompletedDragSessionTrace = [
+                "willBegin": uiTestDragSessionWillBeginCount,
+                "moves": uiTestDragSessionMoveCount,
+                "ended": uiTestDragSessionEndCount,
+                "maxDistance": Double(uiTestDragSessionMaxDistance),
+            ]
+        }
         // An empty operation mask means nothing accepted the drop (dropped over
         // empty space, or the target refused). Anything else is a real accept.
         let accepted = operation != []
+        let sessionReference = DragSessionReference(session)
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.scheduleActiveDragFileCleanup()
+            guard let self,
+                  self.activeDragSession === sessionReference.session else { return }
+            self.activeDragSession = nil
+            let completedFileLease = self.activeDragFileLease
+            self.activeDragFileLease = nil
+            if accepted, let completedFileLease {
+                Self.retainDeliveredFile(completedFileLease)
+            }
             // Releasing PAST the screen edge with no taker is the "throw it
             // away" gesture, so the card closes instead of springing back.
             // Releasing over empty space INSIDE the screen stays the regret
             // path: the card returns to its slot.
             let offscreen = !NSScreen.screens.contains { $0.frame.contains(screenPoint) }
-            self.onDragEnded?(accepted || offscreen)
+            if offscreen {
+                self.fileDragDeliveryGate = nil
+                self.onFileDeliveryPendingChanged?(false)
+                self.onDragEnded?(true)
+                return
+            }
+            guard var gate = self.fileDragDeliveryGate else {
+                self.onDragEnded?(accepted)
+                return
+            }
+            let outcome = gate.noteDrop(accepted: accepted)
+            self.fileDragDeliveryGate = gate
+            self.resolveFileDragDelivery(outcome)
+            if outcome == .waiting, accepted, !self.filePromiseWriteStarted {
+                self.schedulePromiseWriteStartTimeout(generation: self.fileDragDeliveryGeneration)
+            }
         }
     }
 
-    private func scheduleActiveDragFileCleanup() {
-        guard let url = activeDragFileURL else { return }
-        activeDragFileURL = nil
-        Self.scheduleDragFileCleanup(url)
+    private func handlePromiseWriteStarted(generation: Int) {
+        guard generation == fileDragDeliveryGeneration,
+              fileDragDeliveryGate != nil else { return }
+        filePromiseWriteStarted = true
     }
 
-    private static func scheduleDragFileCleanup(_ url: URL) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + dragFileCleanupDelay) {
-            try? FileManager.default.removeItem(at: url)
-            retainedDragFiles.remove(url)
+    private func handlePromiseCompletion(succeeded: Bool, generation: Int) {
+        guard generation == fileDragDeliveryGeneration,
+              var gate = fileDragDeliveryGate else { return }
+        let outcome = gate.notePromiseCompletion(succeeded: succeeded)
+        fileDragDeliveryGate = gate
+        resolveFileDragDelivery(outcome)
+    }
+
+    private func resolveFileDragDelivery(_ outcome: FileDragDeliveryOutcome) {
+        switch outcome {
+        case .delivered:
+            fileDragDeliveryGate = nil
+            filePromiseWriteStarted = false
+            onFileDeliveryPendingChanged?(false)
+            onDragEnded?(true)
+        case .failed:
+            fileDragDeliveryGate = nil
+            filePromiseWriteStarted = false
+            onFileDeliveryPendingChanged?(false)
+            onDragEnded?(false)
+        case .waiting:
+            break
+        }
+    }
+
+    /// A target can report an accepted promise drop without ever asking AppKit to
+    /// materialize it. Recover only from that pre-write limbo. Once writePromiseTo
+    /// starts, the real encoder owns the duration and is never cut off by a timer.
+    private func schedulePromiseWriteStartTimeout(generation: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.promiseWriteStartTimeout) { [weak self] in
+            guard let self,
+                  self.fileDragDeliveryGeneration == generation,
+                  self.fileDragDeliveryGate != nil,
+                  !self.filePromiseWriteStarted else { return }
+            self.fileDragDeliveryGate = nil
+            self.onFileDeliveryPendingChanged?(false)
+            self.onDragEnded?(false)
+        }
+    }
+
+    func uiTestResetDragSessionTrace() {
+        uiTestDragSessionWillBeginCount = 0
+        uiTestDragSessionMoveCount = 0
+        uiTestDragSessionEndCount = 0
+        uiTestDragSessionStartPoint = .zero
+        uiTestDragSessionMaxDistance = 0
+        Self.uiTestLastCompletedDragSessionTrace = [
+            "willBegin": 0,
+            "moves": 0,
+            "ended": 0,
+            "maxDistance": 0.0,
+        ]
+    }
+
+    var uiTestDragSessionTrace: [String: Any] {
+        [
+            "willBegin": uiTestDragSessionWillBeginCount,
+            "moves": uiTestDragSessionMoveCount,
+            "ended": uiTestDragSessionEndCount,
+            "maxDistance": Double(uiTestDragSessionMaxDistance),
+        ]
+    }
+
+    static var uiTestCompletedDragSessionTrace: [String: Any] {
+        uiTestLastCompletedDragSessionTrace
+    }
+
+    func cleanupDragResources() {
+        dragFileGeneration += 1
+        fileDragDeliveryGeneration += 1
+        fileDragDeliveryGate = nil
+        filePromiseWriteStarted = false
+        activeDragSession = nil
+        activeDragFileLease = nil
+        preparedDragFile = nil
+        dragArtifact = nil
+        onFileDeliveryPendingChanged?(false)
+    }
+
+    /// A URL drop may be accepted before the receiving app finishes opening the
+    /// source. Retain the private file for the same five-minute grace used by the
+    /// shared drag vault, then let its owner remove it.
+    private static func retainDeliveredFile(_ file: PreparedDragFile) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300) {
+            _ = file
         }
     }
 }
@@ -3552,31 +3862,63 @@ private final class OverlayImageFilePromiseDelegate: NSObject, NSFilePromiseProv
     private static let queue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "Krit.OverlayFilePromise"
-        queue.maxConcurrentOperationCount = 1
+        queue.maxConcurrentOperationCount = 4
         queue.qualityOfService = .userInitiated
         return queue
     }()
 
-    private let image: NSImage
+    private final class Completion: @unchecked Sendable {
+        let handler: (Error?) -> Void
 
-    init(image: NSImage) {
-        self.image = image
+        init(_ handler: @escaping (Error?) -> Void) {
+            self.handler = handler
+        }
+    }
+
+    private let artifact: CaptureArtifact
+    private let encoding: CaptureEncoding
+    private let fileExtension: String
+    private let fileType: String
+    private let onWriteStarted: (@Sendable () -> Void)?
+    private let onCompletion: (@Sendable (Bool) -> Void)?
+
+    init(
+        artifact: CaptureArtifact,
+        encoding: CaptureEncoding,
+        fileExtension: String,
+        fileType: String,
+        onWriteStarted: (@Sendable () -> Void)? = nil,
+        onCompletion: (@Sendable (Bool) -> Void)? = nil
+    ) {
+        self.artifact = artifact
+        self.encoding = encoding
+        self.fileExtension = fileExtension
+        self.fileType = fileType
+        self.onWriteStarted = onWriteStarted
+        self.onCompletion = onCompletion
     }
 
     func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
-        "\(ImageExporter.timestampedName).\(ImageExporter.preferredFormat().ext)"
+        "\(ImageExporter.timestampedName).\(fileExtension)"
     }
 
     func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler handler: @escaping (Error?) -> Void) {
-        do {
-            guard let export = ImageExporter.encodedForExport(image) else {
-                handler(ImageExporter.ExportError.encodingFailed(format: ImageExporter.preferredFormat().ext))
-                return
+        onWriteStarted?()
+        let completion = Completion(handler)
+        Task { [artifact, encoding, fileExtension, fileType, onCompletion] in
+            do {
+                guard let export = await artifact.encoded(as: encoding),
+                      export.ext == fileExtension,
+                      export.uti == fileType else {
+                    throw ImageExporter.ExportError.encodingFailed(format: fileExtension)
+                }
+                try export.data.write(to: url, options: .atomic)
+                completion.handler(nil)
+                onCompletion?(true)
+            } catch {
+                completion.handler(error)
+                onCompletion?(false)
             }
-            try export.data.write(to: url, options: .atomic)
-            handler(nil)
-        } catch {
-            handler(error)
         }
     }
 
@@ -3955,6 +4297,11 @@ extension QuickAccessOverlay {
         (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestSetHovered(hovered)
     }
 
+    @MainActor static func uiTestSetNewestFileDeliveryPending(_ pending: Bool) {
+        (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?
+            .uiTestSetFileDeliveryPending(pending)
+    }
+
     @MainActor static func uiTestMarkNewestPresentationReady() {
         (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?.uiTestMarkPresentationReady()
     }
@@ -3970,6 +4317,11 @@ extension QuickAccessOverlay {
             return ["error": "no card"]
         }
         return card.uiTestDragPrepProbe(forceInline: forceInline)
+    }
+
+    @MainActor static func uiTestInvalidatePreparedDragFile() {
+        (QuickAccessWindow.uiTestOpenWindows.last as? QuickAccessWindow)?
+            .uiTestInvalidatePreparedDragFile()
     }
 
     /// Origins (oldest→newest) of the visible stack on `screen`, for the conveyor
@@ -4028,11 +4380,29 @@ extension QuickAccessOverlay {
     @MainActor static func uiTestGestureBegin() {
         QuickAccessWindow.openWindows.last?.cardDragBegin()
     }
+    @MainActor static func uiTestGestureBegin(at point: NSPoint) {
+        QuickAccessWindow.openWindows.last?.cardDragBegin(startingAt: point)
+    }
+    @MainActor static func uiTestGestureUpdate(at point: NSPoint) {
+        QuickAccessWindow.openWindows.last?.cardDragUpdate(at: point)
+    }
+    @MainActor static func uiTestNewestFrameOrigin() -> NSPoint? {
+        QuickAccessWindow.openWindows.last?.frame.origin
+    }
     @MainActor static func uiTestGestureEnd() {
         QuickAccessWindow.openWindows.last?.cardDragEnd()
     }
     @MainActor static func uiTestGestureConvertToFileDrag() {
         QuickAccessWindow.openWindows.last?.uiTestGestureConvertToFileDrag()
+    }
+    @MainActor static func uiTestResetDragSessionTrace() {
+        QuickAccessWindow.openWindows.last?.uiTestResetDragSessionTrace()
+    }
+    @MainActor static func uiTestDragSessionTrace() -> [String: Any] {
+        let completed = DraggableImageView.uiTestCompletedDragSessionTrace
+        if completed["ended"] as? Int == 1 { return completed }
+        let current = QuickAccessWindow.openWindows.last?.uiTestDragSessionTrace()
+        return current ?? ["willBegin": 0, "moves": 0, "ended": 0, "maxDistance": 0.0]
     }
 }
 
@@ -4071,6 +4441,16 @@ private extension QuickAccessWindow {
     func uiTestDragPrepProbe(forceInline: Bool) -> [String: Any] {
         thumbView?.uiTestDragPrep(forceInline: forceInline) ?? ["error": "no thumb"]
     }
+    func uiTestInvalidatePreparedDragFile() {
+        thumbView?.uiTestInvalidatePreparedDragFile()
+    }
+    func uiTestResetDragSessionTrace() {
+        thumbView?.uiTestResetDragSessionTrace()
+    }
+    func uiTestDragSessionTrace() -> [String: Any] {
+        thumbView?.uiTestDragSessionTrace
+            ?? ["willBegin": 0, "moves": 0, "ended": 0, "maxDistance": 0.0]
+    }
     func uiTestHoverSnapshot() -> [String: Any] {
         [
             "exists": true,
@@ -4105,6 +4485,7 @@ private extension QuickAccessWindow {
         ]
     }
     func uiTestSetHovered(_ hovered: Bool) { setHovered(hovered) }
+    func uiTestSetFileDeliveryPending(_ pending: Bool) { setFileDeliveryPending(pending) }
     func uiTestMarkPresentationReady() {
         finishInitialPresentation()
     }

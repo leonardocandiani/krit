@@ -58,12 +58,14 @@ final class AnnotationChromeInteractionTests: XCTestCase {
     }
 
     func testBottomBarDragPillAcceptsFirstMouseAndUsesProfessionalHitArea() throws {
-        let pill = BottomBarDragPill(frame: NSRect(x: 0, y: 0, width: 116, height: 22))
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 180, height: 80))
+        let pill = BottomBarDragPill(frame: NSRect(x: 20, y: 20, width: 116, height: 22))
+        host.addSubview(pill)
         let event = try mouseEvent(type: .leftMouseDown, location: NSPoint(x: 58, y: 11))
 
         XCTAssertTrue(pill.acceptsFirstMouse(for: event))
         XCTAssertTrue(pill.mouseDownCanMoveWindow == false)
-        XCTAssertTrue(pill.hitTest(NSPoint(x: 58, y: -6)) === pill)
+        XCTAssertTrue(pill.hitTest(NSPoint(x: 78, y: 14)) === pill)
     }
 
     func testEditorOpensWithVisibleFullDragOutAffordance() throws {
@@ -80,6 +82,20 @@ final class AnnotationChromeInteractionTests: XCTestCase {
             return XCTFail("The editor has enough room for the labeled drag-out control")
         }
         XCTAssertEqual(pill.frame.width, BottomBarDragPill.fullWidth, accuracy: 0.5)
+
+        for localPoint in [
+            NSPoint(x: 8, y: pill.bounds.midY),
+            NSPoint(x: pill.bounds.midX, y: pill.bounds.midY),
+            NSPoint(x: pill.bounds.maxX - 8, y: pill.bounds.midY),
+        ] {
+            let pointInContent = pill.convert(localPoint, to: content)
+            let hit = content.hitTest(pointInContent)
+            let hitType = hit.map { String(describing: type(of: $0)) } ?? "none"
+            XCTAssertTrue(
+                hit === pill,
+                "Every visible Drag out point must hit the pill, got \(hitType) at \(localPoint)"
+            )
+        }
     }
 
     func testBottomBarDragPillUsesAnExplicitPlatformDragIcon() {
@@ -90,9 +106,9 @@ final class AnnotationChromeInteractionTests: XCTestCase {
     func testBottomBarDragPillDoesNotRequestImageBeforeDragThreshold() throws {
         let pill = BottomBarDragPill(frame: NSRect(x: 0, y: 0, width: 116, height: 22))
         var providerCalls = 0
-        pill.imageProvider = {
+        pill.exportSnapshotProvider = {
             providerCalls += 1
-            return NSImage(size: NSSize(width: 80, height: 40))
+            return nil
         }
 
         pill.mouseDown(with: try mouseEvent(type: .leftMouseDown, location: NSPoint(x: 10, y: 10)))
@@ -114,6 +130,127 @@ final class AnnotationChromeInteractionTests: XCTestCase {
         XCTAssertEqual(frame.size, tall)
         XCTAssertEqual(frame.midX, 20, accuracy: 0.001)
         XCTAssertEqual(frame.midY, 30, accuracy: 0.001)
+    }
+
+    func testBottomBarDragPayloadIsOneDeferredFilePromise() throws {
+        let delegate = EditorFilePromiseProbe()
+        let frame = NSRect(x: 10, y: 20, width: 80, height: 40)
+        let item = BottomBarDragPill.draggingItem(
+            fileType: "public.png",
+            delegate: delegate,
+            preview: NSImage(size: frame.size),
+            frame: frame
+        )
+
+        let writer = try XCTUnwrap(item.item as? NSFilePromiseProvider)
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("com.krit.tests.editor-drag.\(UUID().uuidString)")
+        )
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.writeObjects([writer]))
+
+        XCTAssertEqual(pasteboard.pasteboardItems?.count, 1)
+        XCTAssertNil(pasteboard.string(forType: .fileURL))
+        XCTAssertNotNil(pasteboard.propertyList(forType: NSPasteboard.PasteboardType(
+            "com.apple.pasteboard.promised-file-content-type"
+        )))
+        XCTAssertEqual(delegate.writeCount, 0, "Starting the drag must not materialize the export")
+        XCTAssertEqual(item.draggingFrame, frame)
+    }
+
+    func testCancelledEditorPromiseRejectsAReceiverThatStartsLate() throws {
+        let image = NSImage(size: NSSize(width: 32, height: 24))
+        image.lockFocus()
+        NSColor.systemOrange.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        image.unlockFocus()
+        let canvas = AnnotationCanvas(frame: NSRect(origin: .zero, size: image.size))
+        canvas.backgroundImage = image
+        let exportSnapshot = canvas.makeExportSnapshot()
+        let delegate = BottomBarFilePromiseDelegate(
+            exportSnapshot: exportSnapshot,
+            encoding: .png,
+            fileExtension: "png",
+            fileType: "public.png",
+            onWriteStarted: {},
+            onCompletion: { _ in }
+        )
+        let provider = RetainedFilePromiseProvider.make(
+            fileType: "public.png",
+            delegate: delegate
+        )
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-cancelled-editor-promise-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        XCTAssertTrue(delegate.cancelIfNotStarted())
+        XCTAssertFalse(delegate.cancelIfNotStarted())
+
+        let completion = expectation(description: "late receiver is rejected")
+        var completionError: Error?
+        delegate.filePromiseProvider(provider, writePromiseTo: outputURL) { error in
+            completionError = error
+            completion.fulfill()
+        }
+        wait(for: [completion], timeout: 1)
+
+        XCTAssertNotNil(completionError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outputURL.path))
+    }
+
+    func testEditorPromiseMaterializesTheFrozenSnapshotAfterCanvasChanges() throws {
+        let source = NSImage(size: NSSize(width: 64, height: 48))
+        source.lockFocus()
+        NSColor.black.setFill()
+        NSRect(origin: .zero, size: source.size).fill()
+        source.unlockFocus()
+
+        let canvas = AnnotationCanvas(frame: NSRect(origin: .zero, size: source.size))
+        canvas.backgroundImage = source
+        let marker = RectangleAnnotation(rect: CGRect(x: 8, y: 8, width: 36, height: 24))
+        marker.color = NSColor(srgbRed: 1, green: 0, blue: 1, alpha: 1)
+        marker.lineWidth = 8
+        canvas.objects = [marker]
+        let frozenSnapshot = canvas.makeExportSnapshot()
+        canvas.objects = []
+
+        let delegate = BottomBarFilePromiseDelegate(
+            exportSnapshot: frozenSnapshot,
+            encoding: .png,
+            fileExtension: "png",
+            fileType: "public.png",
+            onWriteStarted: {},
+            onCompletion: { _ in }
+        )
+        let provider = RetainedFilePromiseProvider.make(fileType: "public.png", delegate: delegate)
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-frozen-editor-promise-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        let completion = expectation(description: "frozen snapshot materializes")
+        var completionError: Error?
+        delegate.filePromiseProvider(provider, writePromiseTo: outputURL) { error in
+            completionError = error
+            completion.fulfill()
+        }
+        wait(for: [completion], timeout: 3)
+
+        XCTAssertNil(completionError)
+        let data = try Data(contentsOf: outputURL)
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: data))
+        var magentaPixels = 0
+        for y in 0..<bitmap.pixelsHigh {
+            for x in 0..<bitmap.pixelsWide {
+                guard let color = bitmap.colorAt(x: x, y: y) else { continue }
+                if color.redComponent > 0.8,
+                   color.greenComponent < 0.2,
+                   color.blueComponent > 0.8,
+                   color.alphaComponent > 0.8 {
+                    magentaPixels += 1
+                }
+            }
+        }
+        XCTAssertGreaterThan(magentaPixels, 100)
     }
 
     private func assertPointerFeedback(on view: NSView) {
@@ -142,5 +279,29 @@ final class AnnotationChromeInteractionTests: XCTestCase {
             clickCount: 1,
             pressure: 1
         ))
+    }
+}
+
+private final class EditorFilePromiseProbe: NSObject, NSFilePromiseProviderDelegate {
+    private(set) var writeCount = 0
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        fileNameForType fileType: String
+    ) -> String {
+        "capture.png"
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler handler: @escaping (Error?) -> Void
+    ) {
+        writeCount += 1
+        handler(nil)
+    }
+
+    func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {
+        OperationQueue()
     }
 }

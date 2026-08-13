@@ -4,6 +4,87 @@ import XCTest
 
 @MainActor
 final class QuickAccessDragHitTests: XCTestCase {
+    func testPromiseOnlyDeliveryWaitsForMaterializationBeforeClosing() {
+        var gate = FileDragDeliveryGate(requiresPromiseCompletion: true)
+
+        XCTAssertEqual(gate.noteDrop(accepted: true), .waiting)
+        XCTAssertEqual(gate.notePromiseCompletion(succeeded: true), .delivered)
+    }
+
+    func testPromiseOnlyDeliveryRecoversWhenMaterializationFails() {
+        var gate = FileDragDeliveryGate(requiresPromiseCompletion: true)
+
+        XCTAssertEqual(gate.notePromiseCompletion(succeeded: false), .waiting)
+        XCTAssertEqual(gate.noteDrop(accepted: true), .failed)
+    }
+
+    func testPromiseOnlyDeliveryHandlesCompletionBeforeAcceptedDrop() {
+        var gate = FileDragDeliveryGate(requiresPromiseCompletion: true)
+
+        XCTAssertEqual(gate.notePromiseCompletion(succeeded: true), .waiting)
+        XCTAssertEqual(gate.noteDrop(accepted: true), .delivered)
+    }
+
+    func testPromiseOnlyDeliveryHandlesFailureAfterAcceptedDrop() {
+        var gate = FileDragDeliveryGate(requiresPromiseCompletion: true)
+
+        XCTAssertEqual(gate.noteDrop(accepted: true), .waiting)
+        XCTAssertEqual(gate.notePromiseCompletion(succeeded: false), .failed)
+    }
+
+    func testConcreteFileDeliveryUsesTheDragOperationImmediately() {
+        var accepted = FileDragDeliveryGate(requiresPromiseCompletion: false)
+        var rejected = FileDragDeliveryGate(requiresPromiseCompletion: false)
+
+        XCTAssertEqual(accepted.noteDrop(accepted: true), .delivered)
+        XCTAssertEqual(rejected.noteDrop(accepted: false), .failed)
+    }
+
+    func testFileDragRoutingAcceptsHumanDiagonalsButKeepsClearStandby() {
+        XCTAssertTrue(
+            QuickAccessDragRouting.shouldBeginFileDrag(
+                intoScreen: 12,
+                downward: 0,
+                convertDistance: 10
+            )
+        )
+        XCTAssertTrue(
+            QuickAccessDragRouting.shouldBeginFileDrag(
+                intoScreen: 120,
+                downward: 120,
+                convertDistance: 10
+            )
+        )
+        XCTAssertTrue(
+            QuickAccessDragRouting.shouldBeginFileDrag(
+                intoScreen: 120,
+                downward: -120,
+                convertDistance: 10
+            )
+        )
+        XCTAssertFalse(
+            QuickAccessDragRouting.shouldBeginFileDrag(
+                intoScreen: 20,
+                downward: 60,
+                convertDistance: 10
+            )
+        )
+        XCTAssertFalse(
+            QuickAccessDragRouting.shouldBeginFileDrag(
+                intoScreen: 40,
+                downward: 60,
+                convertDistance: 10
+            )
+        )
+        XCTAssertFalse(
+            QuickAccessDragRouting.shouldBeginFileDrag(
+                intoScreen: 10,
+                downward: 0,
+                convertDistance: 10
+            )
+        )
+    }
+
     func testHitMapSeparatesThumbnailBackgroundFromInteractiveControls() throws {
         let originalSize = Settings.overlaySize
         Settings.overlaySize = .medium
@@ -48,11 +129,21 @@ final class QuickAccessDragHitTests: XCTestCase {
         let pillHit = try XCTUnwrap(content.hitTest(NSPoint(x: 87, y: 77)))
         let centerGapHit = try XCTUnwrap(content.hitTest(NSPoint(x: 120, y: 77)))
         let progressHit = try XCTUnwrap(content.hitTest(NSPoint(x: 120, y: 1)))
+        let topHighlightHit = try XCTUnwrap(content.hitTest(NSPoint(x: 120, y: content.bounds.maxY - 1)))
 
         XCTAssertEqual(String(describing: type(of: cornerHit)), "DraggableImageView")
         XCTAssertEqual(String(describing: type(of: pillHit)), "DraggableImageView")
         XCTAssertEqual(String(describing: type(of: centerGapHit)), "DraggableImageView")
         XCTAssertEqual(String(describing: type(of: progressHit)), "DraggableImageView")
+        XCTAssertEqual(String(describing: type(of: topHighlightHit)), "DraggableImageView")
+        XCTAssertEqual(
+            unroutablePoints(
+                in: content,
+                allowedClasses: ["DraggableImageView"]
+            ),
+            [],
+            "Every hidden-chrome pixel must route to the thumbnail drag source"
+        )
 
         QuickAccessOverlay.uiTestMarkNewestPresentationReady()
         QuickAccessOverlay.uiTestSetNewestHovered(true)
@@ -63,14 +154,147 @@ final class QuickAccessDragHitTests: XCTestCase {
         XCTAssertEqual(String(describing: type(of: visibleCornerHit)), "OverlayCornerButton")
         XCTAssertEqual(String(describing: type(of: visiblePillHit)), "OverlayPillButton")
         XCTAssertEqual(String(describing: type(of: visibleGapHit)), "DraggableImageView")
+        XCTAssertEqual(
+            unroutablePoints(
+                in: content,
+                allowedClasses: [
+                    "DraggableImageView",
+                    "OverlayCornerButton",
+                    "OverlayPillButton",
+                ]
+            ),
+            [],
+            "Every visible pixel must route either to the thumbnail or a drag-aware control"
+        )
 
         let accessibilityIDs = allSubviews(of: content).compactMap { $0.accessibilityIdentifier() }
         XCTAssertEqual(accessibilityIDs.filter { $0 == "quickAccess.corner.save" }.count, 1)
         XCTAssertEqual(accessibilityIDs.filter { $0 == "quickAccess.pill.save" }.count, 1)
 
+        QuickAccessOverlay.uiTestSetNewestFileDeliveryPending(true)
+        let pendingCornerHit = try XCTUnwrap(content.hitTest(NSPoint(x: 22, y: 24)))
+        XCTAssertEqual(String(describing: type(of: pendingCornerHit)), "DraggableImageView")
+        XCTAssertEqual(
+            unroutablePoints(in: content, allowedClasses: ["DraggableImageView"]),
+            [],
+            "A pending promise must remove every mutating control from the hit map"
+        )
+
+        QuickAccessOverlay.uiTestSetNewestFileDeliveryPending(false)
+        let restoredCornerHit = try XCTUnwrap(content.hitTest(NSPoint(x: 22, y: 24)))
+        XCTAssertEqual(String(describing: type(of: restoredCornerHit)), "OverlayCornerButton")
+
         QuickAccessOverlay.uiTestSetNewestHovered(false)
         let hiddenAgainHit = try XCTUnwrap(content.hitTest(NSPoint(x: 22, y: 24)))
         XCTAssertEqual(String(describing: type(of: hiddenAgainHit)), "DraggableImageView")
+    }
+
+    func testEveryOverlaySizeHasNoDeadDragPixels() throws {
+        let originalSize = Settings.overlaySize
+        let before = QuickAccessOverlay.uiTestWindows.count
+        defer {
+            Settings.overlaySize = originalSize
+            while QuickAccessOverlay.uiTestWindows.count > before {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+        }
+
+        for size in OverlaySize.allCases {
+            Settings.overlaySize = size
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("krit-hit-map-\(size.rawValue)-\(UUID().uuidString)", isDirectory: true)
+            let manager = HistoryManager(storageDir: directory)
+            let item = HistoryItem(
+                id: UUID(),
+                createdAt: Date(),
+                imagePath: directory.appendingPathComponent("capture.png").path,
+                thumbnailPath: directory.appendingPathComponent("capture-thumb.png").path,
+                captureRect: nil
+            )
+            defer { try? FileManager.default.removeItem(at: directory) }
+
+            QuickAccessOverlay.show(
+                image: makeImage(size: NSSize(width: 640, height: 360)),
+                historyItem: item,
+                historyManager: manager,
+                screen: NSScreen.main,
+                entrance: .slide
+            )
+
+            let content = try XCTUnwrap(QuickAccessOverlay.uiTestWindows.last?.contentView)
+            XCTAssertEqual(
+                unroutablePoints(in: content, allowedClasses: ["DraggableImageView"]),
+                [],
+                "Hidden chrome has dead drag pixels at overlay size \(size.rawValue)"
+            )
+
+            QuickAccessOverlay.uiTestMarkNewestPresentationReady()
+            QuickAccessOverlay.uiTestSetNewestHovered(true)
+            XCTAssertEqual(
+                unroutablePoints(
+                    in: content,
+                    allowedClasses: [
+                        "DraggableImageView",
+                        "OverlayCornerButton",
+                        "OverlayPillButton",
+                    ]
+                ),
+                [],
+                "Visible chrome has dead drag pixels at overlay size \(size.rawValue)"
+            )
+
+            QuickAccessOverlay.uiTestCloseNewest()
+        }
+    }
+
+    func testClosingCardReleasesItsPreparedDragFile() throws {
+        let originalFormat = Settings.screenshotFormat
+        Settings.screenshotFormat = "png"
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-prepared-file-cleanup-\(UUID().uuidString)", isDirectory: true)
+        let manager = HistoryManager(storageDir: directory)
+        let before = QuickAccessOverlay.uiTestWindows.count
+        defer {
+            Settings.screenshotFormat = originalFormat
+            while QuickAccessOverlay.uiTestWindows.count > before {
+                QuickAccessOverlay.uiTestCloseNewest()
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let item = HistoryItem(
+            id: UUID(),
+            createdAt: Date(),
+            imagePath: directory.appendingPathComponent("capture.png").path,
+            thumbnailPath: directory.appendingPathComponent("capture-thumb.png").path,
+            captureRect: nil
+        )
+        QuickAccessOverlay.show(
+            image: makeImage(size: NSSize(width: 640, height: 360)),
+            historyItem: item,
+            historyManager: manager,
+            screen: NSScreen.main,
+            entrance: .slide
+        )
+
+        let deadline = Date().addingTimeInterval(2)
+        var preparedPath: String?
+        repeat {
+            preparedPath = QuickAccessOverlay.uiTestDragPrep(forceInline: false)["path"] as? String
+            if preparedPath == nil {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            }
+        } while preparedPath == nil && Date() < deadline
+
+        let path = try XCTUnwrap(preparedPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+
+        QuickAccessOverlay.uiTestCloseNewest()
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: path),
+            "Closing a card must release its private pre-export immediately"
+        )
     }
 
     func testFileDragConversionResumesSiblingDismissCountdown() {
@@ -197,6 +421,24 @@ final class QuickAccessDragHitTests: XCTestCase {
 
     private func allSubviews(of root: NSView) -> [NSView] {
         [root] + root.subviews.flatMap(allSubviews(of:))
+    }
+
+    private func unroutablePoints(
+        in content: NSView,
+        allowedClasses: Set<String>
+    ) -> [String] {
+        var failures: [String] = []
+        for y in stride(from: CGFloat(0.5), to: content.bounds.height, by: 2) {
+            for x in stride(from: CGFloat(0.5), to: content.bounds.width, by: 2) {
+                let point = NSPoint(x: x, y: y)
+                let className = content.hitTest(point)
+                    .map { String(describing: type(of: $0)) } ?? "nil"
+                guard !allowedClasses.contains(className) else { continue }
+                failures.append("(\(x), \(y)): \(className)")
+                if failures.count == 20 { return failures }
+            }
+        }
+        return failures
     }
 
     private func makeDuplicateIdentifierWindow(

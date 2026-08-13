@@ -3351,6 +3351,49 @@ final class AnnotationCanvas: NSView {
     // downsamples a Retina capture. Geometry stays in points; the CTM scales it
     // to native pixels, keeping hairlines crisp at full resolution (D3).
 
+    /// Immutable editor document used by deferred exports. Copying the model is
+    /// cheap enough for the drag threshold event; full-resolution composition
+    /// stays deferred until a destination accepts the promised file. The copied
+    /// annotation objects and immutable source image keep that later render
+    /// independent from edits or window lifetime after the gesture begins.
+    final class ExportSnapshot: @unchecked Sendable {
+        private let objects: [any AnnotationObject]
+        private let backgroundImage: NSImage?
+        private let canvasSize: NSSize
+        private let options: ScreenshotBackgroundOptions
+
+        fileprivate init(
+            objects: [any AnnotationObject],
+            backgroundImage: NSImage?,
+            canvasSize: NSSize,
+            options: ScreenshotBackgroundOptions
+        ) {
+            self.objects = objects
+            self.backgroundImage = backgroundImage
+            self.canvasSize = canvasSize
+            self.options = options
+        }
+
+        @MainActor
+        func captureArtifact() -> CaptureArtifact? {
+            let canvas = AnnotationCanvas(frame: NSRect(origin: .zero, size: canvasSize))
+            canvas.backgroundOptions = options
+            canvas.backgroundImage = backgroundImage
+            canvas.objects = objects
+            return CaptureArtifact(image: canvas.flatten())
+        }
+    }
+
+    func makeExportSnapshot() -> ExportSnapshot {
+        commitTextField()
+        return ExportSnapshot(
+            objects: objects.map { $0.copy() },
+            backgroundImage: backgroundImage,
+            canvasSize: bounds.size,
+            options: backgroundOptions
+        )
+    }
+
     func flatten() -> NSImage {
         let pointSize = bounds.size
         guard pointSize.width > 0, pointSize.height > 0 else { return NSImage() }

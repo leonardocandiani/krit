@@ -3,6 +3,121 @@ import XCTest
 @testable import KritKit
 
 final class ScreenImageCaptureBackendTests: XCTestCase {
+    func testAsideWindowCaptureTrimsEmbeddedTransparentFraming() throws {
+        let source = try framedWindowImage(
+            size: CGSize(width: 100, height: 70),
+            contentRect: CGRect(x: 12, y: 9, width: 72, height: 52)
+        )
+
+        let result = WindowCaptureImageNormalizer.normalize(
+            source,
+            logicalSize: CGSize(width: 50, height: 35),
+            bundleIdentifier: "at.studio.AsideBrowser"
+        )
+
+        XCTAssertTrue(result.didCrop)
+        XCTAssertEqual(result.image.width, 72)
+        XCTAssertEqual(result.image.height, 52)
+        XCTAssertEqual(result.logicalSize, CGSize(width: 36, height: 26))
+    }
+
+    func testWindowCaptureNormalizerPreservesTransparentCanvasFromOtherApps() throws {
+        let source = try framedWindowImage(
+            size: CGSize(width: 100, height: 70),
+            contentRect: CGRect(x: 12, y: 9, width: 72, height: 52)
+        )
+
+        let result = WindowCaptureImageNormalizer.normalize(
+            source,
+            logicalSize: CGSize(width: 50, height: 35),
+            bundleIdentifier: "com.example.TransparentCanvas"
+        )
+
+        XCTAssertFalse(result.didCrop)
+        XCTAssertEqual(result.image.width, 100)
+        XCTAssertEqual(result.image.height, 70)
+        XCTAssertEqual(result.logicalSize, CGSize(width: 50, height: 35))
+    }
+
+    func testAsideWindowCaptureNormalizerLeavesAnEdgeToEdgeWindowUntouched() throws {
+        let source = try framedWindowImage(
+            size: CGSize(width: 100, height: 70),
+            contentRect: CGRect(x: 0, y: 0, width: 100, height: 70)
+        )
+
+        let result = WindowCaptureImageNormalizer.normalize(
+            source,
+            logicalSize: CGSize(width: 50, height: 35),
+            bundleIdentifier: "at.studio.AsideBrowser"
+        )
+
+        XCTAssertFalse(result.didCrop)
+        XCTAssertEqual(result.image.width, 100)
+        XCTAssertEqual(result.image.height, 70)
+    }
+
+    func testAsideWindowCaptureNormalizerPreservesFullyTranslucentContent() throws {
+        let source = try framedWindowImage(
+            size: CGSize(width: 100, height: 70),
+            contentRect: CGRect(x: 12, y: 9, width: 72, height: 52),
+            contentAlpha: 0.7
+        )
+
+        let result = WindowCaptureImageNormalizer.normalize(
+            source,
+            logicalSize: CGSize(width: 50, height: 35),
+            bundleIdentifier: "at.studio.AsideBrowser"
+        )
+
+        XCTAssertFalse(result.didCrop)
+        XCTAssertEqual(result.image.width, 100)
+        XCTAssertEqual(result.image.height, 70)
+    }
+
+    func testAsideWindowCaptureNormalizerKeepsAsymmetricVerticalEdges() throws {
+        let source = try framedWindowImage(
+            size: CGSize(width: 100, height: 70),
+            contentRect: CGRect(x: 12, y: 6, width: 72, height: 52)
+        )
+
+        let result = WindowCaptureImageNormalizer.normalize(
+            source,
+            logicalSize: CGSize(width: 50, height: 35),
+            bundleIdentifier: "at.studio.AsideBrowser"
+        )
+        let bitmap = NSBitmapImageRep(cgImage: result.image)
+
+        XCTAssertTrue(result.didCrop)
+        XCTAssertEqual(result.image.height, 52)
+        XCTAssertGreaterThan(bitmap.colorAt(x: 36, y: 0)?.alphaComponent ?? 0, 0.99)
+        XCTAssertGreaterThan(bitmap.colorAt(x: 36, y: 51)?.alphaComponent ?? 0, 0.99)
+    }
+
+    func testAsideWindowCaptureNormalizerReadsSupportedAlphaByteOrders() throws {
+        let bitmapInfos = [
+            CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue,
+            CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue,
+            CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ]
+
+        for bitmapInfo in bitmapInfos {
+            let source = try framedWindowImage(
+                size: CGSize(width: 100, height: 70),
+                contentRect: CGRect(x: 12, y: 9, width: 72, height: 52),
+                bitmapInfo: bitmapInfo
+            )
+            let result = WindowCaptureImageNormalizer.normalize(
+                source,
+                logicalSize: CGSize(width: 50, height: 35),
+                bundleIdentifier: "at.studio.AsideBrowser"
+            )
+
+            XCTAssertTrue(result.didCrop, "bitmapInfo=\(bitmapInfo)")
+            XCTAssertEqual(result.image.width, 72, "bitmapInfo=\(bitmapInfo)")
+            XCTAssertEqual(result.image.height, 52, "bitmapInfo=\(bitmapInfo)")
+        }
+    }
+
     func testWindowCaptureResolverSelectsTheRealWindowInsideAShadowHost() {
         let host = descriptor(
             id: 236,
@@ -250,5 +365,33 @@ final class ScreenImageCaptureBackendTests: XCTestCase {
             frame: frame,
             title: title
         )
+    }
+
+    private func framedWindowImage(
+        size: CGSize,
+        contentRect: CGRect,
+        contentAlpha: CGFloat = 1,
+        bitmapInfo: UInt32 = CGImageAlphaInfo.premultipliedLast.rawValue
+    ) throws -> CGImage {
+        let width = Int(size.width)
+        let height = Int(size.height)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let context = try XCTUnwrap(
+            CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo
+            )
+        )
+        context.clear(CGRect(origin: .zero, size: size))
+        context.setFillColor(NSColor.black.withAlphaComponent(0.2).cgColor)
+        context.fill(CGRect(x: 4, y: 4, width: size.width - 8, height: size.height - 8))
+        context.setFillColor(NSColor.systemBlue.withAlphaComponent(contentAlpha).cgColor)
+        context.fill(contentRect)
+        return try XCTUnwrap(context.makeImage())
     }
 }

@@ -69,10 +69,96 @@ final class AnnotationEditorStateTests: XCTestCase {
             controller.window?.contentView?.subviews.compactMap { $0 as? EditorBottomBar }.first
         )
 
-        _ = bar.onRequestDragImage?()
+        _ = try XCTUnwrap(bar.onCreateDragExportSnapshot?())
 
         XCTAssertEqual(text.text, "After")
         XCTAssertFalse(canvas.subviews.contains { $0 is NSTextView })
+    }
+
+    func testSuccessfulDragDeliveryMarksEditedDocumentCleanBeforeClosing() throws {
+        let controller = AnnotationWindowController(
+            image: makeSolidImage(size: NSSize(width: 320, height: 200)),
+            historyItem: nil,
+            historyManager: nil
+        )
+        controller.showWindow(nil)
+        let canvas = controller.uiTestCanvas
+        canvas.objects = [RectangleAnnotation(rect: CGRect(x: 20, y: 20, width: 80, height: 40))]
+        canvas.pushUndo()
+        XCTAssertTrue(controller.uiTestHasUnsavedChanges)
+
+        let bar = try XCTUnwrap(
+            controller.window?.contentView?.subviews.compactMap { $0 as? EditorBottomBar }.first
+        )
+        _ = try XCTUnwrap(bar.onCreateDragExportSnapshot?())
+        // Prevent the old close-warning path from entering a modal loop while
+        // this regression test inspects the delivery checkpoint itself.
+        controller.window?.delegate = nil
+        bar.onDragDelivered?()
+
+        XCTAssertFalse(controller.uiTestHasUnsavedChanges)
+        XCTAssertFalse(controller.window?.isVisible == true)
+    }
+
+    func testDragDeliveryKeepsLaterEditsOpenAndDirty() throws {
+        let controller = AnnotationWindowController(
+            image: makeSolidImage(size: NSSize(width: 320, height: 200)),
+            historyItem: nil,
+            historyManager: nil
+        )
+        controller.showWindow(nil)
+        defer { closeWithoutPrompt(controller.window) }
+
+        let bar = try XCTUnwrap(
+            controller.window?.contentView?.subviews.compactMap { $0 as? EditorBottomBar }.first
+        )
+        _ = try XCTUnwrap(bar.onCreateDragExportSnapshot?())
+
+        let laterEdit = RectangleAnnotation(rect: CGRect(x: 20, y: 20, width: 80, height: 40))
+        controller.uiTestCanvas.pushUndo()
+        controller.uiTestCanvas.objects.append(laterEdit)
+        XCTAssertTrue(controller.uiTestHasUnsavedChanges)
+
+        bar.onDragDelivered?()
+
+        XCTAssertTrue(controller.uiTestHasUnsavedChanges)
+        XCTAssertTrue(controller.window?.isVisible == true)
+    }
+
+    func testDragDeliveryCommitsPendingTextAndKeepsEditorOpen() throws {
+        let controller = AnnotationWindowController(
+            image: makeSolidImage(size: NSSize(width: 320, height: 200)),
+            historyItem: nil,
+            historyManager: nil
+        )
+        controller.showWindow(nil)
+        defer { closeWithoutPrompt(controller.window) }
+
+        let canvas = controller.uiTestCanvas
+        let bar = try XCTUnwrap(
+            controller.window?.contentView?.subviews.compactMap { $0 as? EditorBottomBar }.first
+        )
+        _ = try XCTUnwrap(bar.onCreateDragExportSnapshot?())
+
+        canvas.activeTool = .text
+        let textPoint = NSPoint(x: 30, y: 30)
+        canvas.mouseDown(with: try mouseEvent(
+            type: .leftMouseDown,
+            location: canvas.convert(textPoint, to: nil),
+            windowNumber: controller.window?.windowNumber ?? 0
+        ))
+        let editor = try XCTUnwrap(canvas.subviews.compactMap { $0 as? NSTextView }.first)
+        editor.string = "Typed after drag started"
+
+        bar.onDragDelivered?()
+
+        XCTAssertEqual(
+            canvas.objects.compactMap { ($0 as? TextAnnotation)?.text },
+            ["Typed after drag started"]
+        )
+        XCTAssertFalse(canvas.subviews.contains { $0 is NSTextView })
+        XCTAssertTrue(controller.uiTestHasUnsavedChanges)
+        XCTAssertTrue(controller.window?.isVisible == true)
     }
 
     func testSavedCheckpointTracksUndoDepthInsteadOfObjectPresence() {
@@ -160,6 +246,24 @@ final class AnnotationEditorStateTests: XCTestCase {
             charactersIgnoringModifiers: characters,
             isARepeat: false,
             keyCode: keyCode
+        ))
+    }
+
+    private func mouseEvent(
+        type: NSEvent.EventType,
+        location: NSPoint,
+        windowNumber: Int
+    ) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(
+            with: type,
+            location: location,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
         ))
     }
 

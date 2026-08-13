@@ -59,6 +59,8 @@ final class AnnotationWindowController: NSWindowController {
     private var hasUserBackgroundEdit = false
     private var hasUserCropEdit = false
     private var cleanUndoDepth = 0
+    private var documentRevision: UInt64 = 0
+    private var dragSnapshotRevision: UInt64?
     private var hasUnsavedChanges: Bool {
         canvas.undoDepth != cleanUndoDepth || hasUserBackgroundEdit || hasUserCropEdit
     }
@@ -381,9 +383,11 @@ final class AnnotationWindowController: NSWindowController {
         toolbar.onUndo            = { [weak self] in self?.canvas.performUndo() }
         toolbar.onRedo            = { [weak self] in self?.canvas.performRedo() }
         toolbar.onBackgroundOptionsChanged = { [weak self] options in
-            self?.hasUserBackgroundEdit = true
-            self?.pushBackgroundUndoIfNeeded()
-            self?.applyBackgroundOptions(options)
+            guard let self else { return }
+            self.documentRevision &+= 1
+            self.hasUserBackgroundEdit = true
+            self.pushBackgroundUndoIfNeeded()
+            self.applyBackgroundOptions(options)
         }
         toolbar.onBackgroundPanelToggle = { [weak self] in self?.toggleBackgroundSidebar() }
         toolbar.onSmartRedact = { [weak self] in self?.runSmartRedactFlow() }
@@ -434,6 +438,7 @@ final class AnnotationWindowController: NSWindowController {
         // (crop and background changes), then refit the window to it.
         canvas.onUndoStateChanged = { [weak self] canUndo, canRedo in
             guard let self else { return }
+            self.documentRevision &+= 1
             self.toolbar.setUndoRedoEnabled(canUndo: canUndo, canRedo: canRedo)
             if self.canvas.undoDepth == self.cleanUndoDepth {
                 self.hasUserBackgroundEdit = false
@@ -465,6 +470,7 @@ final class AnnotationWindowController: NSWindowController {
         sidebar.isHidden = true
         sidebar.onChange = { [weak self] options in
             guard let self else { return }
+            self.documentRevision &+= 1
             self.hasUserBackgroundEdit = true
             self.pushBackgroundUndoIfNeeded()
             self.toolbar.setBackgroundOptionsExternally(options)
@@ -507,8 +513,22 @@ final class AnnotationWindowController: NSWindowController {
                 self.toggleBackgroundSidebar()
             }
         }
-        bar.onRequestDragImage = { [weak self] in self?.exportImage() }
-        bar.onDragDelivered = { [weak self] in self?.window?.close() }
+        bar.onCreateDragExportSnapshot = { [weak self] in
+            guard let self else { return nil }
+            let snapshot = self.canvas.makeExportSnapshot()
+            self.dragSnapshotRevision = self.documentRevision
+            return snapshot
+        }
+        bar.onRequestDragPreview = { [weak self] in self?.image }
+        bar.onDragDelivered = { [weak self] in
+            guard let self else { return }
+            self.canvas.commitTextField()
+            let shouldClose = self.dragSnapshotRevision == self.documentRevision
+            self.dragSnapshotRevision = nil
+            guard shouldClose else { return }
+            self.markCurrentDocumentClean()
+            self.window?.performClose(nil)
+        }
         bar.onShare = { [weak self] in self?.shareFromBottomBar() }
         bar.onPin = { [weak self] in self?.pin() }
         bar.onCopy = { [weak self] in self?.copyToClipboard() }
@@ -1121,6 +1141,7 @@ final class AnnotationWindowController: NSWindowController {
         // background options so the composition re-renders at the new size,
         // and let the window follow the canvas (same R1 path as padding/ratio).
         guard let cropped = canvas.applyCrop() else { return }
+        documentRevision &+= 1
         hasUserCropEdit = true
         image = cropped
         canvas.backgroundImage = cropped
@@ -2456,7 +2477,8 @@ final class EditorBottomBar: NSView {
 
     var onZoomChanged: ((CGFloat) -> Void)?
     var onZoomFit: (() -> Void)?
-    var onRequestDragImage: (() -> NSImage?)?
+    var onCreateDragExportSnapshot: (() -> AnnotationCanvas.ExportSnapshot?)?
+    var onRequestDragPreview: (() -> NSImage?)?
     var onDragDelivered: (() -> Void)?
     var onShare: (() -> Void)?
     var onPin: (() -> Void)?
@@ -2548,7 +2570,8 @@ final class EditorBottomBar: NSView {
         row.addArrangedSubview(modeControl)
 
         let pill = BottomBarDragPill()
-        pill.imageProvider = { [weak self] in self?.onRequestDragImage?() }
+        pill.exportSnapshotProvider = { [weak self] in self?.onCreateDragExportSnapshot?() }
+        pill.previewProvider = { [weak self] in self?.onRequestDragPreview?() }
         pill.onDragDelivered = { [weak self] in self?.onDragDelivered?() }
         pill.translatesAutoresizingMaskIntoConstraints = false
         row.addArrangedSubview(pill)
@@ -2605,6 +2628,18 @@ final class EditorBottomBar: NSView {
         else if available >= BottomBarDragPill.compactWidth { newMode = .compact }
         else { newMode = .hidden }
         pill.setMode(newMode)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0 else { return nil }
+        if let pill = dragPill, !pill.isHidden {
+            let localPoint = superview.map { convert(point, from: $0) } ?? point
+            let pointInPill = pill.convert(localPoint, from: self)
+            if pill.containsHitPoint(pointInPill) {
+                return pill
+            }
+        }
+        return super.hitTest(point)
     }
 
     /// A borderless glyph button sized to the pill's control ruler. On glass the
@@ -2677,9 +2712,9 @@ final class EditorBottomBar: NSView {
 
 // MARK: - Bottom bar drag-out control (ES4)
 
-/// A pill that drags the edited flattened image out as a real file, reusing the
-/// proven overlay/HistoryPanel pattern: a plain file URL (Finder, most apps) plus
-/// an NSFilePromiseProvider fallback (Slack, Mail, browsers).
+/// A pill that drags the edited flattened image out as one promised file. The
+/// session begins before the expensive native-resolution flatten and encode;
+/// Finder asks the promise to materialize only after accepting the drop.
 ///
 /// The drag source lives inside the action glass beside Share and Pin. It uses
 /// the same white glyph and pointer-state wash as those controls instead of
@@ -2687,8 +2722,10 @@ final class EditorBottomBar: NSView {
 @MainActor
 final class BottomBarDragPill: NSView, NSDraggingSource {
 
-    var imageProvider: (() -> NSImage?)?
-    /// Fired when a drag-out lands on a real drop target (operation != []).
+    var exportSnapshotProvider: (() -> AnnotationCanvas.ExportSnapshot?)?
+    var previewProvider: (() -> NSImage?)?
+    /// Fired only after a real target accepts the drop and the promised file is
+    /// materialized successfully.
     var onDragDelivered: (() -> Void)?
 
     /// Graceful degradation under narrow windows (the Snapzy footer pattern):
@@ -2701,6 +2738,7 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
     static let compactWidth: CGFloat = EditorBottomBar.controlSize
     static let dragThreshold: CGFloat = 4
     static let previewMaxSize = NSSize(width: 120, height: 120)
+    private static let promiseWriteStartTimeout: TimeInterval = 5
     static let dragTitle = "Drag out"
     static var dragSymbolName: String? {
         ["cursorarrow.motionlines", "hand.point.up.left"].first {
@@ -2719,7 +2757,23 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
 
     private var widthConstraint: NSLayoutConstraint?
     private var dragOrigin: NSPoint?
-    private var activeDragFileURL: URL?
+    private var activeDragSession: NSDraggingSession?
+    private var fileDragDeliveryGeneration = 0
+    private var fileDragDeliveryGate: FileDragDeliveryGate?
+    private var activeFilePromiseDelegate: BottomBarFilePromiseDelegate?
+    private var filePromiseWriteStarted = false
+    private(set) var uiTestMouseDownCount = 0
+    private(set) var uiTestMouseDraggedCount = 0
+    private(set) var uiTestThresholdCrossCount = 0
+    private(set) var uiTestBeginSessionCount = 0
+    private(set) var uiTestSessionMoveCount = 0
+    private(set) var uiTestEndedSessionCount = 0
+    private(set) var uiTestLastDropAccepted = false
+    var uiTestOnDragSnapshotCreated: (() -> Void)?
+    private var uiTestSessionPasteboardTypes: [String] = []
+    private var uiTestLastSessionScreenPoint: NSPoint?
+    private var uiTestMouseDownAtUptime: TimeInterval?
+    private var uiTestBeginSessionAtUptime: TimeInterval?
     private var hovering = false { didSet { needsDisplay = true } }
     private var pressed = false { didSet { needsDisplay = true } }
     private var trackingArea: NSTrackingArea?
@@ -2728,6 +2782,10 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
 
     private var enlargedHitBounds: NSRect {
         bounds.insetBy(dx: -6, dy: -8)
+    }
+
+    func containsHitPoint(_ point: NSPoint) -> Bool {
+        !isHidden && enlargedHitBounds.contains(point)
     }
 
     static func exceedsDragThreshold(from origin: NSPoint, to current: NSPoint, threshold: CGFloat? = nil) -> Bool {
@@ -2751,6 +2809,18 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
             width: previewSize.width,
             height: previewSize.height
         )
+    }
+
+    static func draggingItem(
+        fileType: String,
+        delegate: NSFilePromiseProviderDelegate,
+        preview: NSImage,
+        frame: NSRect
+    ) -> NSDraggingItem {
+        let provider = RetainedFilePromiseProvider.make(fileType: fileType, delegate: delegate)
+        let item = NSDraggingItem(pasteboardWriter: provider)
+        item.setDraggingFrame(frame, contents: preview)
+        return item
     }
 
     override init(frame frameRect: NSRect) {
@@ -2785,13 +2855,14 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
 
     override func resetCursorRects() {
         discardCursorRects()
-        addCursorRect(bounds, cursor: pressed ? .closedHand : .openHand)
+        addCursorRect(enlargedHitBounds, cursor: pressed ? .closedHand : .openHand)
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard !isHidden, enlargedHitBounds.contains(point) else { return nil }
+        let localPoint = superview.map { convert(point, from: $0) } ?? point
+        guard containsHitPoint(localPoint) else { return nil }
         return self
     }
 
@@ -2846,6 +2917,11 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if KritTestHarness.isEnabled {
+            uiTestMouseDownCount += 1
+            uiTestMouseDownAtUptime = ProcessInfo.processInfo.systemUptime
+        }
+        guard activeDragSession == nil, fileDragDeliveryGate == nil else { return }
         pressed = true
         NSCursor.closedHand.set()
         window?.invalidateCursorRects(for: self)
@@ -2853,29 +2929,33 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if KritTestHarness.isEnabled { uiTestMouseDraggedCount += 1 }
         guard let origin = dragOrigin else { return }
         let current = event.locationInWindow
         guard Self.exceedsDragThreshold(from: origin, to: current) else { return }
+        if KritTestHarness.isEnabled { uiTestThresholdCrossCount += 1 }
         dragOrigin = nil
         pressed = false
         window?.invalidateCursorRects(for: self)
 
-        guard let dragImg = imageProvider?() else { return }
-
-        guard let export = ImageExporter.encodedForExport(dragImg),
-              let fileURL = DragFileVault.makeFile(data: export.data, ext: export.ext) else { return }
-        activeDragFileURL = fileURL
-
         // The drag preview reads as a file card, not a raw bitmap: rounded
         // corners and a hairline keep a dark screenshot from looking like a
         // broken black rectangle while it rides the cursor.
-        let previewSize = Self.previewSize(for: dragImg.size)
+        let previewSource = previewProvider?()
+        let previewSize = Self.previewSize(
+            for: previewSource?.size ?? NSSize(width: 120, height: 80)
+        )
         let preview = NSImage(size: previewSize)
         preview.lockFocus()
         let previewRect = NSRect(origin: .zero, size: preview.size)
         let previewClip = NSBezierPath(roundedRect: previewRect.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
         previewClip.addClip()
-        dragImg.draw(in: previewRect)
+        if let previewSource {
+            previewSource.draw(in: previewRect)
+        } else {
+            NSColor.windowBackgroundColor.setFill()
+            previewRect.fill()
+        }
         NSColor.white.withAlphaComponent(0.3).setStroke()
         previewClip.lineWidth = 1
         previewClip.stroke()
@@ -2883,13 +2963,51 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
 
         let localDragPoint = convert(event.locationInWindow, from: nil)
         let draggingFrame = Self.draggingFrame(centeredAt: localDragPoint, previewSize: preview.size)
-        let fileItem = NSDraggingItem(pasteboardWriter: fileURL as NSURL)
-        fileItem.setDraggingFrame(draggingFrame, contents: preview)
-        let promise = NSFilePromiseProvider(fileType: export.uti, delegate: BottomBarFilePromiseDelegate(image: dragImg))
-        let promiseItem = NSDraggingItem(pasteboardWriter: promise)
-        promiseItem.setDraggingFrame(draggingFrame, contents: preview)
+        let format = ImageExporter.preferredFormat()
+        let encoding = CaptureEncoding.fileFormat(
+            extension: format.ext,
+            jpegQuality: Settings.jpegQuality
+        )
+        guard let exportSnapshot = exportSnapshotProvider?() else { return }
+        if KritTestHarness.isEnabled {
+            uiTestOnDragSnapshotCreated?()
+        }
+        fileDragDeliveryGeneration += 1
+        let generation = fileDragDeliveryGeneration
+        filePromiseWriteStarted = false
+        fileDragDeliveryGate = FileDragDeliveryGate(requiresPromiseCompletion: true)
 
-        beginDraggingSession(with: [fileItem, promiseItem], event: event, source: self)
+        let writeStarted: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handlePromiseWriteStarted(generation: generation)
+            }
+        }
+        let completion: @Sendable (Bool) -> Void = { [weak self] succeeded in
+            Task { @MainActor [weak self] in
+                self?.handlePromiseCompletion(succeeded: succeeded, generation: generation)
+            }
+        }
+        let delegate = BottomBarFilePromiseDelegate(
+            exportSnapshot: exportSnapshot,
+            encoding: encoding,
+            fileExtension: format.ext,
+            fileType: format.uti,
+            onWriteStarted: writeStarted,
+            onCompletion: completion
+        )
+        activeFilePromiseDelegate = delegate
+        let item = Self.draggingItem(
+            fileType: format.uti,
+            delegate: delegate,
+            preview: preview,
+            frame: draggingFrame
+        )
+
+        if KritTestHarness.isEnabled {
+            uiTestBeginSessionCount += 1
+            uiTestBeginSessionAtUptime = ProcessInfo.processInfo.systemUptime
+        }
+        activeDragSession = beginDraggingSession(with: [item], event: event, source: self)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -2902,47 +3020,240 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
         .copy
     }
 
-    nonisolated func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+    nonisolated func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) {
+        let types = session.draggingPasteboard.types?.map(\.rawValue) ?? []
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if let url = self.activeDragFileURL {
-                self.activeDragFileURL = nil
-                DragFileVault.scheduleCleanup(url)
-            }
-            // A drop somewhere real means the user TOOK the result, the editor's
-            // job is done, so it closes (CleanShot behavior). A cancelled drag
-            // (operation == []) keeps editing.
-            if operation != [] { self.onDragDelivered?() }
+            guard let self, KritTestHarness.isEnabled else { return }
+            self.uiTestSessionPasteboardTypes = types
+            self.uiTestLastSessionScreenPoint = screenPoint
         }
     }
+
+    nonisolated func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, KritTestHarness.isEnabled else { return }
+            self.uiTestSessionMoveCount += 1
+            self.uiTestLastSessionScreenPoint = screenPoint
+        }
+    }
+
+    nonisolated func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        let accepted = operation != []
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if KritTestHarness.isEnabled {
+                self.uiTestEndedSessionCount += 1
+                self.uiTestLastDropAccepted = accepted
+            }
+            self.activeDragSession = nil
+            guard var gate = self.fileDragDeliveryGate else { return }
+            let outcome = gate.noteDrop(accepted: accepted)
+            self.fileDragDeliveryGate = gate
+            self.resolveFileDragDelivery(outcome)
+            if outcome == .waiting, accepted, !self.filePromiseWriteStarted {
+                self.schedulePromiseWriteStartTimeout(generation: self.fileDragDeliveryGeneration)
+            }
+        }
+    }
+
+    private func handlePromiseWriteStarted(generation: Int) {
+        guard generation == fileDragDeliveryGeneration,
+              fileDragDeliveryGate != nil else { return }
+        filePromiseWriteStarted = true
+    }
+
+    private func handlePromiseCompletion(succeeded: Bool, generation: Int) {
+        guard generation == fileDragDeliveryGeneration,
+              var gate = fileDragDeliveryGate else { return }
+        let outcome = gate.notePromiseCompletion(succeeded: succeeded)
+        fileDragDeliveryGate = gate
+        resolveFileDragDelivery(outcome)
+    }
+
+    private func resolveFileDragDelivery(_ outcome: FileDragDeliveryOutcome) {
+        switch outcome {
+        case .delivered:
+            fileDragDeliveryGate = nil
+            activeFilePromiseDelegate = nil
+            filePromiseWriteStarted = false
+            onDragDelivered?()
+        case .failed:
+            _ = activeFilePromiseDelegate?.cancelIfNotStarted()
+            fileDragDeliveryGate = nil
+            activeFilePromiseDelegate = nil
+            filePromiseWriteStarted = false
+        case .waiting:
+            break
+        }
+    }
+
+    private func schedulePromiseWriteStartTimeout(generation: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.promiseWriteStartTimeout) { [weak self] in
+            guard let self,
+                  generation == self.fileDragDeliveryGeneration,
+                  self.fileDragDeliveryGate != nil,
+                  !self.filePromiseWriteStarted,
+                  self.activeFilePromiseDelegate?.cancelIfNotStarted() == true else { return }
+            self.fileDragDeliveryGate = nil
+            self.activeFilePromiseDelegate = nil
+        }
+    }
+
+    func uiTestResetDragTrace() {
+        uiTestMouseDownCount = 0
+        uiTestMouseDraggedCount = 0
+        uiTestThresholdCrossCount = 0
+        uiTestBeginSessionCount = 0
+        uiTestSessionMoveCount = 0
+        uiTestEndedSessionCount = 0
+        uiTestLastDropAccepted = false
+        uiTestSessionPasteboardTypes = []
+        uiTestLastSessionScreenPoint = nil
+        uiTestMouseDownAtUptime = nil
+        uiTestBeginSessionAtUptime = nil
+    }
+
+    var uiTestDragTrace: [String: Any] {
+        let beginLatencyMs: Double
+        if let mouseDown = uiTestMouseDownAtUptime,
+           let begin = uiTestBeginSessionAtUptime {
+            beginLatencyMs = (begin - mouseDown) * 1000
+        } else {
+            beginLatencyMs = -1
+        }
+        return [
+            "mouseDown": uiTestMouseDownCount,
+            "mouseDragged": uiTestMouseDraggedCount,
+            "thresholdCross": uiTestThresholdCrossCount,
+            "beginSession": uiTestBeginSessionCount,
+            "sessionMoves": uiTestSessionMoveCount,
+            "endedSession": uiTestEndedSessionCount,
+            "dropAccepted": uiTestLastDropAccepted,
+            "pasteboardTypes": uiTestSessionPasteboardTypes,
+            "lastSessionScreenPoint": uiTestLastSessionScreenPoint.map(NSStringFromPoint) ?? "none",
+            "beginLatencyMs": beginLatencyMs,
+        ]
+    }
+
 }
 
-private final class BottomBarFilePromiseDelegate: NSObject, NSFilePromiseProviderDelegate, @unchecked Sendable {
+final class BottomBarFilePromiseDelegate: NSObject, NSFilePromiseProviderDelegate, @unchecked Sendable {
     private static let queue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "Krit.BottomBarFilePromise"
-        queue.maxConcurrentOperationCount = 1
+        queue.maxConcurrentOperationCount = 2
         queue.qualityOfService = .userInitiated
         return queue
     }()
 
-    private let image: NSImage
-    init(image: NSImage) { self.image = image }
+    private final class Completion: @unchecked Sendable {
+        let handler: (Error?) -> Void
 
-    func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
-        "\(ImageExporter.timestampedName).\(ImageExporter.preferredFormat().ext)"
+        init(_ handler: @escaping (Error?) -> Void) {
+            self.handler = handler
+        }
     }
 
-    func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler handler: @escaping (Error?) -> Void) {
-        do {
-            guard let export = ImageExporter.encodedForExport(image) else {
-                handler(ImageExporter.ExportError.encodingFailed(format: ImageExporter.preferredFormat().ext))
-                return
+    private enum WriteState: Equatable {
+        case waiting
+        case writing
+        case finished
+        case cancelled
+    }
+
+    private let stateLock = NSLock()
+    private var writeState: WriteState = .waiting
+    private let exportSnapshot: AnnotationCanvas.ExportSnapshot
+    private let encoding: CaptureEncoding
+    private let fileExtension: String
+    private let fileType: String
+    private let promisedFileName: String
+    private let onWriteStarted: @Sendable () -> Void
+    private let onCompletion: @Sendable (Bool) -> Void
+
+    @MainActor
+    init(
+        exportSnapshot: AnnotationCanvas.ExportSnapshot,
+        encoding: CaptureEncoding,
+        fileExtension: String,
+        fileType: String,
+        onWriteStarted: @escaping @Sendable () -> Void,
+        onCompletion: @escaping @Sendable (Bool) -> Void
+    ) {
+        self.exportSnapshot = exportSnapshot
+        self.encoding = encoding
+        self.fileExtension = fileExtension
+        self.fileType = fileType
+        promisedFileName = "\(ImageExporter.timestampedName).\(fileExtension)"
+        self.onWriteStarted = onWriteStarted
+        self.onCompletion = onCompletion
+    }
+
+    /// Invalidates a promise that no destination started consuming. A provider
+    /// may outlive the editor inside another process, so clearing UI state alone
+    /// is insufficient: a late receiver must get a cancellation error instead
+    /// of materializing a second, orphaned export.
+    func cancelIfNotStarted() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard writeState == .waiting else { return false }
+        writeState = .cancelled
+        return true
+    }
+
+    private func beginWriting() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard writeState == .waiting else { return false }
+        writeState = .writing
+        return true
+    }
+
+    private func finishWriting() {
+        stateLock.lock()
+        writeState = .finished
+        stateLock.unlock()
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        fileNameForType fileType: String
+    ) -> String {
+        promisedFileName
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler handler: @escaping (Error?) -> Void
+    ) {
+        guard beginWriting() else {
+            handler(CancellationError())
+            onCompletion(false)
+            return
+        }
+        onWriteStarted()
+        let completion = Completion(handler)
+        Task { [exportSnapshot, encoding, fileExtension, fileType, onCompletion] in
+            do {
+                guard let artifact = await exportSnapshot.captureArtifact(),
+                      let export = await artifact.encoded(as: encoding),
+                      export.ext == fileExtension,
+                      export.uti == fileType else {
+                    throw ImageExporter.ExportError.encodingFailed(format: fileExtension)
+                }
+                let data = export.data
+                try await Task.detached(priority: .userInitiated) {
+                    try data.write(to: url, options: .atomic)
+                }.value
+                self.finishWriting()
+                completion.handler(nil)
+                onCompletion(true)
+            } catch {
+                self.finishWriting()
+                completion.handler(error)
+                onCompletion(false)
             }
-            try export.data.write(to: url, options: .atomic)
-            handler(nil)
-        } catch {
-            handler(error)
         }
     }
 
