@@ -1,16 +1,25 @@
-version: 0.31.2
-KRIT 0.31.2 restores the editor's drag-out control and makes its purpose clear at a glance.
+version: 0.31.3
+KRIT 0.31.3 makes drag-and-drop dependable from both Quick Access and the editor, and fixes transparent framing in Aside window captures.
 
-## Editor
+## Drag and drop
 
-- Keeps the full Drag out control visible when the editor first opens.
-- Replaces the ambiguous grip-only treatment with an explicit cursor icon and label.
-- Matches the drag control's hover, pressed, contrast, and sizing behavior to the surrounding action pill.
+- Starts screenshot drags reliably from natural horizontal or diagonal pulls across the Quick Access card, including its controls and edges.
+- Prevents a previous snap-back animation from interfering with an immediate retry.
+- Delivers one stable file in the selected format and keeps the card available until the destination finishes writing it.
+- Makes Drag out in the editor start without waiting for a full-resolution render.
+- Preserves the exact edit state captured when the drag begins, while keeping later edits open in the editor.
+
+## Window capture
+
+- Removes the extra transparent rounded frame embedded in Aside Browser window captures without altering captures from other apps.
+
+## Interface
+
+- Aligns Settings sidebar icons consistently with the macOS window controls.
 
 ## Reliability
 
-- Removes the circular width measurement that could hide the drag source permanently.
-- Adds regression coverage for the initial editor layout and platform drag icon.
+- Adds regression coverage for file-promise lifetime, drag hit targets, accepted-drop delivery, editor state, and transparent window framing.
 
 ## Install
 
@@ -22,7 +31,7 @@ brew install --cask krit
 Or:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/v0.31.2/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/v0.31.3/install.sh | bash
 ```
 
 On first launch, grant Screen Recording permission in System Settings.
