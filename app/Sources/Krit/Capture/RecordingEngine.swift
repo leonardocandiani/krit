@@ -98,7 +98,10 @@ private struct PreparedRecording {
 @MainActor
 final class RecordingEngine: NSObject, RecordingResultActions {
 
-    static let maxCaptureEdge = ScreenCaptureDisplayGeometry.maxCaptureEdge
+    /// VideoToolbox's hardware H.264 path on Apple silicon is reliable through
+    /// 4096 pixels per edge. Larger capture buffers can select the software
+    /// encoder, multiplying memory pressure and startup latency on Retina screens.
+    nonisolated static let maxCaptureEdge = 4_096
 
     private let writerQueue = DispatchQueue(label: "com.krit.recording.writer", qos: .userInitiated)
     // start/stopRunning() block for hundreds of ms (hardware warm-up/teardown);
@@ -1328,7 +1331,7 @@ final class RecordingEngine: NSObject, RecordingResultActions {
         NSApp.restoreBackgroundOnlyActivationPolicyIfNeeded()
     }
 
-    private static func videoSettings(width: Int, height: Int, fps: Int, quality: RecordingQuality) -> [String: Any] {
+    static func videoSettings(width: Int, height: Int, fps: Int, quality: RecordingQuality) -> [String: Any] {
         [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
@@ -1337,7 +1340,6 @@ final class RecordingEngine: NSObject, RecordingResultActions {
                 AVVideoAverageBitRateKey: bitrate(width: width, height: height, fps: fps, quality: quality),
                 AVVideoExpectedSourceFrameRateKey: fps,
                 AVVideoMaxKeyFrameIntervalKey: fps,
-                AVVideoQualityKey: 1.0,
                 AVVideoAllowFrameReorderingKey: false,
                 AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
@@ -1607,7 +1609,7 @@ private struct RecordingConfiguration {
     }
 }
 
-private enum RecordingQuality: String {
+enum RecordingQuality: String {
     case balanced
     case high
     case max

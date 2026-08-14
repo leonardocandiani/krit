@@ -96,6 +96,7 @@ final class UITestRunner: NSObject {
             case "shadow-sweep": report = Self.runShadowSweep()
             case "window-editor": report = await Self.runWindowEditorSuite()
             case "record-smoke": report = await Self.runRecordSmoke()
+            case "record-smoke-fullscreen": report = await Self.runRecordSmoke(fullScreen: true)
             case "record-smoke-audio": report = await Self.runRecordSmoke(systemAudio: true)
             case "record-smoke-mic": report = await Self.runRecordSmoke(microphone: true)
             case "record-smoke-pause": report = await Self.runRecordSmoke(pauseMidway: true)
@@ -2873,9 +2874,9 @@ final class UITestRunner: NSObject {
         }
 
         // This marker exists only in the edited canvas, never in the source
-        // bitmap. Removing it just after the drag starts proves the promised
-        // bytes came from the frozen drag-start artifact instead of consulting
-        // the live editor when the receiver eventually asks for the file.
+        // bitmap. Prepare the same concrete export the editor keeps warm, then
+        // remove the marker after drag start to prove the URL carries that frozen
+        // revision rather than consulting the live editor at drop time.
         let frozenMarker = RectangleAnnotation(
             rect: CGRect(x: 300, y: 250, width: 600, height: 360)
         )
@@ -2883,6 +2884,13 @@ final class UITestRunner: NSObject {
         frozenMarker.lineWidth = 32
         controller.uiTestCanvas.objects.append(frozenMarker)
         controller.uiTestCanvas.needsDisplay = true
+        guard await dragPill.prepareConcreteDragFile() != nil else {
+            controller.uiTestMarkCurrentDocumentClean()
+            editorWindow.performClose(nil)
+            report["error"] = "editor did not prepare a concrete drag file"
+            report["allPass"] = false
+            return report
+        }
 
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("krit-editor-file-drop-\(UUID().uuidString)", isDirectory: true)
@@ -2916,7 +2924,7 @@ final class UITestRunner: NSObject {
         // Keep the receiver physically outside the editor instead of stacking a
         // higher-level panel over the source window. Same-app overlap can hold
         // AppKit in drag tracking even after a synthetic mouse-up, which tests
-        // panel z-order rather than the editor's file-promise contract.
+        // panel z-order rather than the editor's concrete-file contract.
         destinationWindow.level = .normal
         destinationWindow.isOpaque = false
         destinationWindow.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.16)
@@ -3099,7 +3107,7 @@ final class UITestRunner: NSObject {
             && frozenMarkerPixelCount > 1_000
         let editorClosed = !editorWindow.isVisible
         let immediateStartPass = beginSessionLatencyMs >= 0 && beginSessionLatencyMs < 250
-        let transportPass = probe.observedTransport == "file-promise"
+        let transportPass = probe.observedTransport == "file-url"
 
         report["beginSessionLatencyMs"] = beginSessionLatencyMs
         report["destinationEnterLatencyMs"] = destinationEnterLatencyMs
@@ -5308,7 +5316,8 @@ final class UITestRunner: NSObject {
     private static func runRecordSmoke(
         systemAudio: Bool = false,
         microphone: Bool = false,
-        pauseMidway: Bool = false
+        pauseMidway: Bool = false,
+        fullScreen: Bool = false
     ) async -> [String: Any] {
         var r: [String: Any] = [:]
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
@@ -5319,15 +5328,31 @@ final class UITestRunner: NSObject {
         // "sem áudio" e os resultados flip-flopavam). Restaura no final.
         let savedSystemAudio = Settings.recordingSystemAudio
         let savedMicrophone = Settings.recordingMicrophone
+        let savedFPS = Settings.recordingFPS
+        let savedQuality = Settings.recordingQuality
+        let savedWebcam = Settings.recordingWebcam
+        let savedClicks = Settings.recordingShowsClicks
+        let savedKeystrokes = Settings.recordingShowsKeystrokes
         Settings.recordingSystemAudio = systemAudio
         Settings.recordingMicrophone = microphone
+        Settings.recordingFPS = 30
+        Settings.recordingQuality = "high"
+        Settings.recordingWebcam = false
+        Settings.recordingShowsClicks = false
+        Settings.recordingShowsKeystrokes = false
         defer {
             Settings.recordingSystemAudio = savedSystemAudio
             Settings.recordingMicrophone = savedMicrophone
+            Settings.recordingFPS = savedFPS
+            Settings.recordingQuality = savedQuality
+            Settings.recordingWebcam = savedWebcam
+            Settings.recordingShowsClicks = savedClicks
+            Settings.recordingShowsKeystrokes = savedKeystrokes
         }
         r["systemAudioVariant"] = systemAudio
         r["microphoneVariant"] = microphone
         r["pauseMidway"] = pauseMidway
+        r["fullScreenVariant"] = fullScreen
         let engine = appDelegate.uiTestCaptureEngine
         guard !engine.recordingActive else {
             r["error"] = "a recording is already running"; return r
@@ -5335,7 +5360,10 @@ final class UITestRunner: NSObject {
         guard let screen = NSScreen.main else { r["error"] = "no screen"; return r }
 
         let vf = screen.visibleFrame
-        let rect = CGRect(x: vf.midX - 200, y: vf.midY - 150, width: 400, height: 300)
+        let rect = fullScreen
+            ? screen.frame
+            : CGRect(x: vf.midX - 200, y: vf.midY - 150, width: 400, height: 300)
+        r["requestedRect"] = NSStringFromRect(rect)
         let cardsBefore = QuickAccessOverlay.uiTestWindows.count
 
         await engine.uiTestStartRecording(rect: rect, on: screen)
@@ -5387,7 +5415,7 @@ final class UITestRunner: NSObject {
         r["durationPass"] = durationPass
 
         r["allPass"] = started
-            && (r["dimPanelCount"] as? Int ?? 0) >= 1
+            && (fullScreen || (r["dimPanelCount"] as? Int ?? 0) >= 1)
             && (cardsAfter > cardsBefore)
             && (engine.uiTestDimPanelCount == 0)
             && (!pauseMidway || (pauseEntered && pauseResumed && durationPass))

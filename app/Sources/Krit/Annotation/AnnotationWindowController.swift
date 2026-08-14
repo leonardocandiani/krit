@@ -59,8 +59,14 @@ final class AnnotationWindowController: NSWindowController {
     private var hasUserBackgroundEdit = false
     private var hasUserCropEdit = false
     private var cleanUndoDepth = 0
-    private var documentRevision: UInt64 = 0
+    private var documentRevision: UInt64 = 0 {
+        didSet {
+            bottomBar?.invalidatePreparedDragFile()
+            scheduleDragExportPreparation()
+        }
+    }
     private var dragSnapshotRevision: UInt64?
+    private var dragExportPreparationTask: Task<Void, Never>?
     private var hasUnsavedChanges: Bool {
         canvas.undoDepth != cleanUndoDepth || hasUserBackgroundEdit || hasUserCropEdit
     }
@@ -520,6 +526,7 @@ final class AnnotationWindowController: NSWindowController {
             return snapshot
         }
         bar.onRequestDragPreview = { [weak self] in self?.image }
+        bar.onRequestImmediateDragExport = { [weak self] in self?.exportImage() }
         bar.onDragDelivered = { [weak self] in
             guard let self else { return }
             self.canvas.commitTextField()
@@ -534,6 +541,7 @@ final class AnnotationWindowController: NSWindowController {
         bar.onCopy = { [weak self] in self?.copyToClipboard() }
         container.addSubview(bar)
         bottomBar = bar
+        scheduleDragExportPreparation()
 
         // ES7: keep the bottom-bar zoom label in sync when the user pinches/⌘± on
         // the canvas, so the popup always reflects the live magnification.
@@ -776,6 +784,16 @@ final class AnnotationWindowController: NSWindowController {
     private func exportImage() -> NSImage {
         canvas.commitTextField()
         return canvas.flatten()
+    }
+
+    private func scheduleDragExportPreparation() {
+        dragExportPreparationTask?.cancel()
+        guard bottomBar != nil else { return }
+        dragExportPreparationTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled, let self else { return }
+            _ = await self.bottomBar?.prepareConcreteDragFile()
+        }
     }
 
     /// ES5: the stage checkerboard shows only when no background is enabled.
@@ -2479,6 +2497,7 @@ final class EditorBottomBar: NSView {
     var onZoomFit: (() -> Void)?
     var onCreateDragExportSnapshot: (() -> AnnotationCanvas.ExportSnapshot?)?
     var onRequestDragPreview: (() -> NSImage?)?
+    var onRequestImmediateDragExport: (() -> NSImage?)?
     var onDragDelivered: (() -> Void)?
     var onShare: (() -> Void)?
     var onPin: (() -> Void)?
@@ -2572,6 +2591,7 @@ final class EditorBottomBar: NSView {
         let pill = BottomBarDragPill()
         pill.exportSnapshotProvider = { [weak self] in self?.onCreateDragExportSnapshot?() }
         pill.previewProvider = { [weak self] in self?.onRequestDragPreview?() }
+        pill.immediateExportImageProvider = { [weak self] in self?.onRequestImmediateDragExport?() }
         pill.onDragDelivered = { [weak self] in self?.onDragDelivered?() }
         pill.translatesAutoresizingMaskIntoConstraints = false
         row.addArrangedSubview(pill)
@@ -2701,6 +2721,15 @@ final class EditorBottomBar: NSView {
     @objc private func pinTapped()  { onPin?() }
     @objc private func copyTapped() { onCopy?() }
 
+    @discardableResult
+    func prepareConcreteDragFile() async -> URL? {
+        await dragPill?.prepareConcreteDragFile()
+    }
+
+    func invalidatePreparedDragFile() {
+        dragPill?.invalidatePreparedDragFile()
+    }
+
     /// Anchor for the share picker presented from the bar's Share button.
     func presentSharePicker(items: [Any]) {
         let anchor = shareButton ?? self
@@ -2712,9 +2741,40 @@ final class EditorBottomBar: NSView {
 
 // MARK: - Bottom bar drag-out control (ES4)
 
-/// A pill that drags the edited flattened image out as one promised file. The
-/// session begins before the expensive native-resolution flatten and encode;
-/// Finder asks the promise to materialize only after accepting the drop.
+private struct EditorDragExportDescriptor: Equatable, Sendable {
+    let encoding: CaptureEncoding
+    let preferredExtension: String
+
+    @MainActor
+    static func current() -> EditorDragExportDescriptor {
+        let format = ImageExporter.preferredFormat()
+        return EditorDragExportDescriptor(
+            encoding: CaptureEncoding.fileFormat(
+                extension: format.ext,
+                jpegQuality: Settings.jpegQuality
+            ),
+            preferredExtension: format.ext
+        )
+    }
+}
+
+private final class EditorPreparedDragFile: @unchecked Sendable {
+    let url: URL
+    let descriptor: EditorDragExportDescriptor
+
+    init(url: URL, descriptor: EditorDragExportDescriptor) {
+        self.url = url
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
+/// A pill that drags the edited flattened image out as one concrete file URL.
+/// The native-resolution export is prepared while the editor is idle, with a
+/// synchronous correctness fallback only when a gesture beats preparation.
 ///
 /// The drag source lives inside the action glass beside Share and Pin. It uses
 /// the same white glyph and pointer-state wash as those controls instead of
@@ -2724,8 +2784,8 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
 
     var exportSnapshotProvider: (() -> AnnotationCanvas.ExportSnapshot?)?
     var previewProvider: (() -> NSImage?)?
-    /// Fired only after a real target accepts the drop and the promised file is
-    /// materialized successfully.
+    var immediateExportImageProvider: (() -> NSImage?)?
+    /// Fired only after a real target accepts the concrete file drop.
     var onDragDelivered: (() -> Void)?
 
     /// Graceful degradation under narrow windows (the Snapzy footer pattern):
@@ -2758,6 +2818,9 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
     private var widthConstraint: NSLayoutConstraint?
     private var dragOrigin: NSPoint?
     private var activeDragSession: NSDraggingSession?
+    private var activeDragFileLease: EditorPreparedDragFile?
+    private var preparedDragFile: EditorPreparedDragFile?
+    private var dragFileGeneration = 0
     private var fileDragDeliveryGeneration = 0
     private var fileDragDeliveryGate: FileDragDeliveryGate?
     private var activeFilePromiseDelegate: BottomBarFilePromiseDelegate?
@@ -2809,6 +2872,97 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
             width: previewSize.width,
             height: previewSize.height
         )
+    }
+
+    static func draggingItem(
+        fileURL: URL,
+        preview: NSImage,
+        frame: NSRect
+    ) -> NSDraggingItem {
+        let item = NSDraggingItem(pasteboardWriter: fileURL as NSURL)
+        item.setDraggingFrame(frame, contents: preview)
+        return item
+    }
+
+    var preparedDragFileURL: URL? {
+        matchingPreparedDragFile()?.url
+    }
+
+    func invalidatePreparedDragFile() {
+        dragFileGeneration += 1
+        preparedDragFile = nil
+    }
+
+    @discardableResult
+    func prepareConcreteDragFile() async -> URL? {
+        dragFileGeneration += 1
+        let generation = dragFileGeneration
+        preparedDragFile = nil
+        let descriptor = EditorDragExportDescriptor.current()
+        guard let snapshot = exportSnapshotProvider?(),
+              let artifact = snapshot.captureArtifact(),
+              let export = await artifact.encoded(as: descriptor.encoding) else { return nil }
+
+        let filename = "\(ImageExporter.timestampedName)-\(UUID().uuidString.prefix(8)).\(export.ext)"
+        let url = await Task.detached(priority: .utility) {
+            Self.writeTemporaryDragFile(data: export.data, filename: filename)
+        }.value
+        guard let url else { return nil }
+        guard !Task.isCancelled, generation == dragFileGeneration else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+
+        let prepared = EditorPreparedDragFile(url: url, descriptor: descriptor)
+        preparedDragFile = prepared
+        return prepared.url
+    }
+
+    func concreteDragFileForCurrentDocument() -> URL? {
+        if let prepared = matchingPreparedDragFile() {
+            return prepared.url
+        }
+
+        dragFileGeneration += 1
+        _ = exportSnapshotProvider?()
+        let descriptor = EditorDragExportDescriptor.current()
+        guard let image = immediateExportImageProvider?(),
+              let export = ImageExporter.encodedForExport(image) else { return nil }
+        let filename = "\(ImageExporter.timestampedName)-\(UUID().uuidString.prefix(8)).\(export.ext)"
+        guard let url = Self.writeTemporaryDragFile(data: export.data, filename: filename) else { return nil }
+        let prepared = EditorPreparedDragFile(url: url, descriptor: descriptor)
+        preparedDragFile = prepared
+        return prepared.url
+    }
+
+    private func matchingPreparedDragFile() -> EditorPreparedDragFile? {
+        guard let preparedDragFile,
+              preparedDragFile.descriptor == EditorDragExportDescriptor.current(),
+              FileManager.default.fileExists(atPath: preparedDragFile.url.path) else {
+            preparedDragFile = nil
+            return nil
+        }
+        return preparedDragFile
+    }
+
+    nonisolated private static func writeTemporaryDragFile(data: Data, filename: String) -> URL? {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KritDrag", isDirectory: true)
+        let url = directory.appendingPathComponent(filename)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            print("[KRIT] Editor drag export failed at \(url.path): \(error)")
+            return nil
+        }
+    }
+
+    private static func retainDeliveredFile(_ file: EditorPreparedDragFile) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300) {
+            _ = file
+        }
     }
 
     static func draggingItem(
@@ -2963,42 +3117,17 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
 
         let localDragPoint = convert(event.locationInWindow, from: nil)
         let draggingFrame = Self.draggingFrame(centeredAt: localDragPoint, previewSize: preview.size)
-        let format = ImageExporter.preferredFormat()
-        let encoding = CaptureEncoding.fileFormat(
-            extension: format.ext,
-            jpegQuality: Settings.jpegQuality
-        )
-        guard let exportSnapshot = exportSnapshotProvider?() else { return }
+        guard let fileURL = concreteDragFileForCurrentDocument() else { return }
         if KritTestHarness.isEnabled {
             uiTestOnDragSnapshotCreated?()
         }
         fileDragDeliveryGeneration += 1
-        let generation = fileDragDeliveryGeneration
         filePromiseWriteStarted = false
-        fileDragDeliveryGate = FileDragDeliveryGate(requiresPromiseCompletion: true)
-
-        let writeStarted: @Sendable () -> Void = { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.handlePromiseWriteStarted(generation: generation)
-            }
-        }
-        let completion: @Sendable (Bool) -> Void = { [weak self] succeeded in
-            Task { @MainActor [weak self] in
-                self?.handlePromiseCompletion(succeeded: succeeded, generation: generation)
-            }
-        }
-        let delegate = BottomBarFilePromiseDelegate(
-            exportSnapshot: exportSnapshot,
-            encoding: encoding,
-            fileExtension: format.ext,
-            fileType: format.uti,
-            onWriteStarted: writeStarted,
-            onCompletion: completion
-        )
-        activeFilePromiseDelegate = delegate
+        fileDragDeliveryGate = FileDragDeliveryGate(requiresPromiseCompletion: false)
+        activeFilePromiseDelegate = nil
+        activeDragFileLease = preparedDragFile
         let item = Self.draggingItem(
-            fileType: format.uti,
-            delegate: delegate,
+            fileURL: fileURL,
             preview: preview,
             frame: draggingFrame
         )
@@ -3046,6 +3175,11 @@ final class BottomBarDragPill: NSView, NSDraggingSource {
                 self.uiTestLastDropAccepted = accepted
             }
             self.activeDragSession = nil
+            let completedFileLease = self.activeDragFileLease
+            self.activeDragFileLease = nil
+            if accepted, let completedFileLease {
+                Self.retainDeliveredFile(completedFileLease)
+            }
             guard var gate = self.fileDragDeliveryGate else { return }
             let outcome = gate.noteDrop(accepted: accepted)
             self.fileDragDeliveryGate = gate

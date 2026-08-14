@@ -132,17 +132,19 @@ final class AnnotationChromeInteractionTests: XCTestCase {
         XCTAssertEqual(frame.midY, 30, accuracy: 0.001)
     }
 
-    func testBottomBarDragPayloadIsOneDeferredFilePromise() throws {
-        let delegate = EditorFilePromiseProbe()
+    func testBottomBarDragPayloadIsOneConcreteFileURL() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("krit-editor-drag-\(UUID().uuidString).png")
+        try Data("krit-editor-file".utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
         let frame = NSRect(x: 10, y: 20, width: 80, height: 40)
         let item = BottomBarDragPill.draggingItem(
-            fileType: "public.png",
-            delegate: delegate,
+            fileURL: fileURL,
             preview: NSImage(size: frame.size),
             frame: frame
         )
 
-        let writer = try XCTUnwrap(item.item as? NSFilePromiseProvider)
+        let writer = try XCTUnwrap(item.item as? NSURL)
         let pasteboard = NSPasteboard(
             name: NSPasteboard.Name("com.krit.tests.editor-drag.\(UUID().uuidString)")
         )
@@ -150,12 +152,93 @@ final class AnnotationChromeInteractionTests: XCTestCase {
         XCTAssertTrue(pasteboard.writeObjects([writer]))
 
         XCTAssertEqual(pasteboard.pasteboardItems?.count, 1)
-        XCTAssertNil(pasteboard.string(forType: .fileURL))
-        XCTAssertNotNil(pasteboard.propertyList(forType: NSPasteboard.PasteboardType(
+        XCTAssertEqual(pasteboard.string(forType: .fileURL), fileURL.absoluteString)
+        XCTAssertNil(pasteboard.propertyList(forType: NSPasteboard.PasteboardType(
             "com.apple.pasteboard.promised-file-content-type"
         )))
-        XCTAssertEqual(delegate.writeCount, 0, "Starting the drag must not materialize the export")
         XCTAssertEqual(item.draggingFrame, frame)
+    }
+
+    func testBottomBarPreparesConcreteFileBeforeTheGesture() async throws {
+        let originalFormat = Settings.screenshotFormat
+        Settings.screenshotFormat = "png"
+        defer { Settings.screenshotFormat = originalFormat }
+
+        let image = NSImage(size: NSSize(width: 64, height: 48))
+        image.lockFocus()
+        NSColor.systemPurple.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        image.unlockFocus()
+        let canvas = AnnotationCanvas(frame: NSRect(origin: .zero, size: image.size))
+        canvas.backgroundImage = image
+        let pill = BottomBarDragPill(frame: NSRect(x: 0, y: 0, width: 96, height: 32))
+        pill.exportSnapshotProvider = { canvas.makeExportSnapshot() }
+
+        let preparedURL = await pill.prepareConcreteDragFile()
+        let url = try XCTUnwrap(preparedURL)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertEqual(pill.preparedDragFileURL, url)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try Data(contentsOf: url).prefix(8), Data([137, 80, 78, 71, 13, 10, 26, 10]))
+    }
+
+    func testBottomBarMaterializesConcreteFallbackWhenPreparationIsNotReady() throws {
+        let originalFormat = Settings.screenshotFormat
+        Settings.screenshotFormat = "png"
+        defer { Settings.screenshotFormat = originalFormat }
+
+        let image = NSImage(size: NSSize(width: 48, height: 32))
+        image.lockFocus()
+        NSColor.systemOrange.setFill()
+        NSRect(origin: .zero, size: image.size).fill()
+        image.unlockFocus()
+        let pill = BottomBarDragPill(frame: NSRect(x: 0, y: 0, width: 96, height: 32))
+        pill.immediateExportImageProvider = { image }
+
+        let url = try XCTUnwrap(pill.concreteDragFileForCurrentDocument())
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertEqual(pill.preparedDragFileURL, url)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testBottomBarInvalidatesPreparedFileBeforeAnImmediatePostEditDrag() async throws {
+        let originalFormat = Settings.screenshotFormat
+        Settings.screenshotFormat = "png"
+        defer { Settings.screenshotFormat = originalFormat }
+
+        let beforeEdit = NSImage(size: NSSize(width: 48, height: 32))
+        beforeEdit.lockFocus()
+        NSColor.systemPurple.setFill()
+        NSRect(origin: .zero, size: beforeEdit.size).fill()
+        beforeEdit.unlockFocus()
+        let afterEdit = NSImage(size: beforeEdit.size)
+        afterEdit.lockFocus()
+        NSColor.systemOrange.setFill()
+        NSRect(origin: .zero, size: afterEdit.size).fill()
+        afterEdit.unlockFocus()
+        let beforeCanvas = AnnotationCanvas(frame: NSRect(origin: .zero, size: beforeEdit.size))
+        beforeCanvas.backgroundImage = beforeEdit
+        let pill = BottomBarDragPill(frame: NSRect(x: 0, y: 0, width: 96, height: 32))
+        pill.exportSnapshotProvider = { beforeCanvas.makeExportSnapshot() }
+        pill.immediateExportImageProvider = { afterEdit }
+
+        let preparedBeforeEditURL = await pill.prepareConcreteDragFile()
+        let preparedBeforeEdit = try XCTUnwrap(preparedBeforeEditURL)
+        let preparedBeforeEditData = try Data(contentsOf: preparedBeforeEdit)
+        pill.invalidatePreparedDragFile()
+        let draggedImmediatelyAfterEdit = try XCTUnwrap(pill.concreteDragFileForCurrentDocument())
+        defer {
+            try? FileManager.default.removeItem(at: preparedBeforeEdit)
+            try? FileManager.default.removeItem(at: draggedImmediatelyAfterEdit)
+        }
+
+        XCTAssertNotEqual(draggedImmediatelyAfterEdit, preparedBeforeEdit)
+        XCTAssertNotEqual(
+            try Data(contentsOf: draggedImmediatelyAfterEdit),
+            preparedBeforeEditData
+        )
     }
 
     func testCancelledEditorPromiseRejectsAReceiverThatStartsLate() throws {

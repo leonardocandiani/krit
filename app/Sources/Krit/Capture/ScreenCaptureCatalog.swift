@@ -270,13 +270,9 @@ struct ScreenCaptureDisplayGeometry: Equatable, Sendable {
 
         let rawPixelWidth = max(1, Int((logicalWidth * backingScale).rounded()))
         let rawPixelHeight = max(1, Int((logicalHeight * backingScale).rounded()))
-        let pixelWidth = Self.boundedDimension(
-            rawPixelWidth,
-            even: evenPixelDimensions,
-            maxEdge: maxEdge
-        )
-        let pixelHeight = Self.boundedDimension(
-            rawPixelHeight,
+        let pixelSize = Self.boundedPixelSize(
+            width: rawPixelWidth,
+            height: rawPixelHeight,
             even: evenPixelDimensions,
             maxEdge: maxEdge
         )
@@ -284,8 +280,8 @@ struct ScreenCaptureDisplayGeometry: Equatable, Sendable {
         return ScreenCaptureRegion(
             appKitRect: appKitRect,
             sourceRect: sourceRect,
-            pixelWidth: pixelWidth,
-            pixelHeight: pixelHeight
+            pixelWidth: pixelSize.width,
+            pixelHeight: pixelSize.height
         )
     }
 
@@ -317,5 +313,28 @@ struct ScreenCaptureDisplayGeometry: Equatable, Sendable {
             result = result < maxEdge ? result + 1 : max(2, result - 1)
         }
         return result
+    }
+
+    private static func boundedPixelSize(
+        width: Int,
+        height: Int,
+        even: Bool,
+        maxEdge: Int
+    ) -> (width: Int, height: Int) {
+        guard width > maxEdge || height > maxEdge else {
+            return (
+                boundedDimension(width, even: even, maxEdge: maxEdge),
+                boundedDimension(height, even: even, maxEdge: maxEdge)
+            )
+        }
+
+        let scale = min(Double(maxEdge) / Double(width), Double(maxEdge) / Double(height))
+        var scaledWidth = max(1, Int((Double(width) * scale).rounded()))
+        var scaledHeight = max(1, Int((Double(height) * scale).rounded()))
+        if even {
+            if !scaledWidth.isMultiple(of: 2) { scaledWidth = max(2, scaledWidth - 1) }
+            if !scaledHeight.isMultiple(of: 2) { scaledHeight = max(2, scaledHeight - 1) }
+        }
+        return (min(scaledWidth, maxEdge), min(scaledHeight, maxEdge))
     }
 }

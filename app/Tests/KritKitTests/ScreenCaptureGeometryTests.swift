@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import KritKit
 
@@ -54,7 +55,7 @@ final class ScreenCaptureGeometryTests: XCTestCase {
         XCTAssertEqual(region.pixelHeight, 101)
     }
 
-    func testRecordingUsesTheSharedTextureLimitAndKeepsClampedPixelsEven() throws {
+    func testTextureLimitPreservesAspectRatioAndKeepsClampedPixelsEven() throws {
         let geometry = ScreenCaptureDisplayGeometry(
             displayID: 8,
             appKitFrame: CGRect(x: 0, y: 0, width: 12_000, height: 10_000),
@@ -71,9 +72,45 @@ final class ScreenCaptureGeometryTests: XCTestCase {
         )
 
         XCTAssertEqual(region.pixelWidth, 16_384)
-        XCTAssertEqual(region.pixelHeight, 16_384)
+        XCTAssertEqual(region.pixelHeight, 14_912)
         XCTAssertTrue(region.pixelWidth.isMultiple(of: 2))
         XCTAssertTrue(region.pixelHeight.isMultiple(of: 2))
+    }
+
+    func testRecordingCapsLargeRetinaDisplayAtHardwareH264Edge() throws {
+        let geometry = ScreenCaptureDisplayGeometry(
+            displayID: 10,
+            appKitFrame: CGRect(x: 0, y: 0, width: 3_008, height: 1_692),
+            coreGraphicsFrame: CGRect(x: 0, y: 0, width: 6_016, height: 3_384),
+            backingScale: 2
+        )
+
+        XCTAssertEqual(RecordingEngine.maxCaptureEdge, 4_096)
+
+        let region = try geometry.sourceRegion(
+            for: geometry.appKitFrame,
+            evenPixelDimensions: true,
+            maxEdge: RecordingEngine.maxCaptureEdge
+        )
+
+        XCTAssertEqual(region.pixelWidth, 4_096)
+        XCTAssertEqual(region.pixelHeight, 2_304)
+    }
+
+    @MainActor
+    func testH264SettingsDoNotContainStillImageQualityKey() throws {
+        let settings = RecordingEngine.videoSettings(
+            width: 4_096,
+            height: 2_304,
+            fps: 30,
+            quality: .high
+        )
+        let compression = try XCTUnwrap(
+            settings[AVVideoCompressionPropertiesKey] as? [String: Any]
+        )
+
+        XCTAssertNil(compression[AVVideoQualityKey])
+        XCTAssertNotNil(compression[AVVideoAverageBitRateKey])
     }
 
     func testWindowFrameRoundTripsAcrossMixedGlobalCoordinateSpaces() {
