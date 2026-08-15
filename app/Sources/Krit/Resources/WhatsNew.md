@@ -1,25 +1,24 @@
-version: 0.31.3
-KRIT 0.31.3 makes drag-and-drop dependable from both Quick Access and the editor, and fixes transparent framing in Aside window captures.
+version: 0.31.4
+KRIT 0.31.4 makes editor drag-out compatible with destinations that require a real file and stabilizes recording on high-resolution displays.
 
-## Drag and drop
+## Editor drag and drop
 
-- Starts screenshot drags reliably from natural horizontal or diagonal pulls across the Quick Access card, including its controls and edges.
-- Prevents a previous snap-back animation from interfering with an immediate retry.
-- Delivers one stable file in the selected format and keeps the card available until the destination finishes writing it.
-- Makes Drag out in the editor start without waiting for a full-resolution render.
-- Preserves the exact edit state captured when the drag begins, while keeping later edits open in the editor.
+- Delivers one concrete file URL from Drag out so Finder, browsers, upload fields, and other apps can accept the edited image directly.
+- Prepares the full-resolution export while the editor is idle, keeping normal drag gestures responsive.
+- Falls back to an immediate export when a drag starts before background preparation finishes.
+- Invalidates prepared files as soon as the document changes, preventing an immediate post-edit drag from exporting an older revision.
+- Keeps the exported file alive through accepted-drop delivery and closes the editor only when the delivered revision is still current.
 
-## Window capture
+## Screen recording
 
-- Removes the extra transparent rounded frame embedded in Aside Browser window captures without altering captures from other apps.
-
-## Interface
-
-- Aligns Settings sidebar icons consistently with the macOS window controls.
+- Prevents H.264 writer setup failures on large Retina and high-resolution displays.
+- Keeps recording dimensions within the 4096-pixel hardware encoder boundary while preserving the captured display's aspect ratio.
+- Removes a still-image-only quality property from H.264 compression settings.
 
 ## Reliability
 
-- Adds regression coverage for file-promise lifetime, drag hit targets, accepted-drop delivery, editor state, and transparent window framing.
+- Adds regression coverage for concrete editor file URLs, prepared-export invalidation, large-display scaling, and H.264 settings.
+- Adds full-screen recording and physical editor drag scenarios to the local runtime harness.
 
 ## Install
 
@@ -31,7 +30,7 @@ brew install --cask krit
 Or:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/v0.31.3/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/leonardocandiani/krit/v0.31.4/install.sh | bash
 ```
 
 On first launch, grant Screen Recording permission in System Settings.
