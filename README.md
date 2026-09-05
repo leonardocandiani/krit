@@ -1,39 +1,38 @@
+<!-- Banner -->
+<div align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:0d1117,50:1a1a2e,100:00d9ff&height=200&section=header&text=KRIT&fontSize=54&fontColor=ffffff&animation=fadeIn&fontAlignY=36&desc=Native%20macOS%20screenshot%20studio&descAlignY=58&descSize=16" alt="KRIT" width="100%" />
+</div>
+
 <div align="center">
 
-<h1>KRIT</h1>
+  <br>
+  <img src="app/assets/screenshots/hero-window-shot.png" alt="KRIT editor with a window shot composed over the desktop wallpaper" width="820" />
+  <br><br>
 
-<p><strong>Native macOS screenshot studio. Capture, annotate, record, all from the menu bar.</strong></p>
+  <p><strong>Capture, annotate, record, all from the menu bar.</strong></p>
 
-<p>
-  Built with
-  <a href="https://developer.apple.com/documentation/appkit">AppKit</a>,
-  <a href="https://developer.apple.com/xcode/swiftui/">SwiftUI</a>,
-  <a href="https://developer.apple.com/documentation/screencapturekit">ScreenCaptureKit</a>, and
-  <a href="https://developer.apple.com/documentation/vision">Vision</a>.
-</p>
+  <p>Built with <a href="https://developer.apple.com/documentation/appkit">AppKit</a>, <a href="https://developer.apple.com/xcode/swiftui/">SwiftUI</a>, <a href="https://developer.apple.com/documentation/screencapturekit">ScreenCaptureKit</a> and <a href="https://developer.apple.com/documentation/vision">Vision</a>.</p>
 
-<p>
+  <p>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-00d9ff?style=for-the-badge" alt="License: MIT" /></a>
+    <img src="https://img.shields.io/badge/macOS-13%2B-1a1a2e?style=for-the-badge&logo=apple&logoColor=white" alt="macOS: 13+" />
+    <a href="https://github.com/leonardocandiani/krit/releases"><img src="https://img.shields.io/github/v/release/leonardocandiani/krit?display_name=tag&style=for-the-badge&color=00d9ff&labelColor=1a1a2e" alt="Release" /></a>
+    <a href="https://github.com/leonardocandiani/krit/pulls"><img src="https://img.shields.io/badge/PRs-welcome-1a1a2e?style=for-the-badge" alt="PRs: welcome" /></a>
+  </p>
+
+  <p>
   <a href="#features">Features</a> •
   <a href="#install">Install</a> •
   <a href="#shortcuts">Shortcuts</a> •
   <a href="#automation">Automation</a> •
-  <a href="#build-from-source">Build</a> •
+  <a href="#build-from-source">Build from source</a> •
   <a href="#permissions">Permissions</a> •
   <a href="#acknowledgments">Acknowledgments</a> •
   <a href="#license">License</a>
-</p>
-
-<p>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg" /></a>
-  <img alt="Platform: macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-black.svg" />
-  <a href="https://github.com/leonardocandiani/krit/releases"><img alt="Release" src="https://img.shields.io/github/v/release/leonardocandiani/krit?display_name=tag" /></a>
-</p>
-
-<br />
-
-<img src="app/assets/screenshots/hero-window-shot.png" alt="KRIT editor with a window shot composed over the desktop wallpaper" width="820" />
-
+  </p>
 </div>
+
+<br>
 
 KRIT takes a shot, drops you into an editor, and stays out of the way. It runs
 from the menu bar, has no account and no cloud, and nothing you capture leaves
@@ -153,7 +152,7 @@ the result locally with Vision), and `inspect_ui`.
 
 ## Build from source
 
-Building requires a full **Xcode 26 or later** — not the bare Command Line Tools —
+Building requires a full **Xcode 26 or later** (not the bare Command Line Tools)
 on two counts: the app compiles against the **macOS 26 SDK** (it uses Liquid Glass
 symbols like `NSGlassEffectView`, gated at runtime by `#available(macOS 26, *)`),
 and `build-app.sh` produces a **universal binary** (arm64 + x86_64) via
@@ -180,7 +179,7 @@ assembles the `.app`, ad-hoc signs it, and installs it. It fails loudly if any
 shipped binary is missing an arch slice. To package a DMG, run `./make-dmg.sh`
 afterward.
 
-To build a single arch (faster local iteration — still needs full Xcode, since
+To build a single arch (faster local iteration, still needs full Xcode, since
 the macOS 26 SDK is required either way):
 
 ```bash
@@ -216,3 +215,29 @@ are listed in [THIRD_PARTY_NOTICES.md](app/THIRD_PARTY_NOTICES.md).
 ## License
 
 [MIT](LICENSE) © Leonardo Candiani
+
+<br>
+
+---
+
+<div align="center">
+  <p><strong>Built by <a href="https://github.com/leonardocandiani">Leonardo Candiani</a></strong> · More projects at <a href="https://github.com/leonardocandiani?tab=repositories">github.com/leonardocandiani</a></p>
+  <a href="https://leonardocandiani.com.br">
+    <img src="https://img.shields.io/badge/-Website-0d1117?style=for-the-badge&logo=safari&logoColor=00d9ff" alt="Website" />
+  </a>
+  <a href="https://github.com/leonardocandiani">
+    <img src="https://img.shields.io/badge/-GitHub-0d1117?style=for-the-badge&logo=github&logoColor=00d9ff" alt="GitHub" />
+  </a>
+  <a href="https://instagram.com/leonardocandiani">
+    <img src="https://img.shields.io/badge/-Instagram-E4405F?style=for-the-badge&logo=instagram&logoColor=white" alt="Instagram" />
+  </a>
+  <a href="https://youtube.com/@oleonardocandiani">
+    <img src="https://img.shields.io/badge/-YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube" />
+  </a>
+</div>
+
+<br>
+
+<div align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:00d9ff,50:1a1a2e,100:0d1117&height=120&section=footer&text=Thanks%20for%20stopping%20by&fontSize=18&fontColor=ffffff&fontAlignY=72" alt="Thanks for stopping by" width="100%" />
+</div>
